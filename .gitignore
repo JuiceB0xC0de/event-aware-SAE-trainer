@@ -1,0 +1,30 @@
+# Trained SAE weights / checkpoints
+*.npz
+*.pt
+*.safetensors
+checkpoint*.pt
+
+# Data, activations, corpora
+*.json
+*.jsonl
+*.parquet
+rollcache/
+atlas_download/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+.env
+*.token

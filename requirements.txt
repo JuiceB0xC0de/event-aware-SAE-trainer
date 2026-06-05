@@ -1,0 +1,18 @@
+# Core
+torch>=2.5.0
+transformers>=4.51.0
+accelerate
+datasets>=2.20.0
+numpy
+tqdm
+
+# Tokenizer backends for gemma-4-E2B-it
+sentencepiece
+protobuf
+
+# Hub upload + faster downloads
+huggingface_hub
+hf_transfer
+
+# Optional: metrics logging (training runs fine without it; gated on WANDB_API_KEY)
+wandb
