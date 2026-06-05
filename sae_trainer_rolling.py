@@ -6,7 +6,7 @@ each running a full forward 0->L every step, this loads the model ONCE and walks
 layers 0..14 in order. For each layer L it runs ONLY block L (proven bit-exact in
 validate_rolling_cache.py -- the "b2" mechanism) over the cached residual stream
 produced by block L-1, then trains the SAE on those cached activations with ZERO
-transformer in the SAE hot loop.
+transformer in the SAE hot loop
 
 SCOPE: layers 0..14 ONLY. HARD STOP at 15 -- layers 15-34 use cross-layer KV
 sharing (num_kv_shared_layers=20) whose interaction with the SAE pipeline is being
