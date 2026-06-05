@@ -1,42 +1,44 @@
 # event-aware-sae-trainer
 
-Train sparse autoencoders (SAEs) on the residual stream of **`google/gemma-4-E2B-it`**,
-one SAE per decoder layer, with an *event-aware* adaptive scheduler that watches the
-training signal and reacts to it instead of following a fixed LR/sparsity curve.
+Train a sparse autoencoder (SAE) on **every decoder layer of any Hugging Face language
+model — in a single, unattended run.** No per-layer hyperparameter retuning, no
+restart-and-retune loop. The scheduler watches the training signal and adjusts itself.
 
-JumpReLU architecture (Rajamanoharan et al., [2407.14435](https://arxiv.org/abs/2407.14435)),
-a **rolling single-block activation cache** that trains with zero transformer in the SAE hot
-loop, and a dual-loop **AECS scheduler** that tunes the learning rate and the L0 sparsity
-penalty (λ) online via an adaptive-Lagrangian integrator. Built for a single H100/A100.
+## The point: a self-tuning scheduler
 
-## What makes it different
+DeepMind's Gemma Scope reported the usual SAE-training pain: sparsity/LR had to be retuned
+per layer and runs repeated until they landed. This trainer removes that loop.
 
-- **Rolling single-block cache.** Instead of running a full `0 → L` forward every step for
-  every layer, the model is loaded once and layers `0..14` are walked in order. For layer L,
-  only block L runs over the residual stream cached from block L−1 (bit-exact, validated),
-  then the SAE trains on those cached activations — **no transformer in the SAE step**. This
-  is the dominant cost saving over a naïve per-layer trainer.
-- **Event-aware scheduler.** `sae_scheduler.py` detects events in the training signal
-  (dead-feature emergencies, EV stalls, gradient-norm anomalies) and adjusts LR and λ in
-  response, rather than running open-loop.
-- **Adaptive-Lagrangian sparsity.** λ is driven by an integrator toward a target L0 instead
-  of being hand-set, so sparsity converges to spec without manual tuning per layer.
-- **Peak-EV early stop.** The best-EV SAE state is held in memory and flushed to disk once EV
-  declines past the peak, so each layer ships its best checkpoint without burning the rest of
-  the step budget.
+`sae_scheduler.py` is an **event-aware controller** — an AECS mode machine plus an
+**Augmented-Lagrangian L0 integrator**. You set an L0 target and walk away:
 
-## Scope
+1. λ starts at 0; the SAE overshoots the target (L0 too high).
+2. The dual integrator raises λ in proportion to the constraint violation.
+3. L0 falls, oscillates around the target, and **converges** as close as the model allows — λ plateaus when it gets there, relaxes if it overshoots into being too sparse.
+4. Throughout, dead features are held **≈0** (aux-loss revival + threshold reset + resampling + a dead-feature emergency mode).
 
-Layers **0–14** (hard stop at 15). Residual width is constant (`d_in = 1536`) across this
-range; layers 15+ use cross-layer KV sharing whose interaction with the rolling cache is out
-of scope here.
+So one process sweeps all layers, each converging on its own. That self-tuning convergence
+is the product — everything else is plumbing around it.
+
+## Model-agnostic by construction
+
+The scheduler and training loop never touch model internals — they consume a stream of
+activation batches. **How activations are captured is pluggable (`--capture`):**
+
+| Mode | Works on | Cost | Notes |
+|------|----------|------|-------|
+| `auto` *(default)* | **any `AutoModelForCausalLM`** (+ multimodal text path) | 1 pool of disk, N× forward | Forward-hooks the residual stream. **Correct by construction** — observes the real forward, no reconstruction. |
+| `rolling` | Gemma-3n/4 family | 1 pool of disk, ~1 forward total | Single-block walk: run only block L over the residual cached from block L−1. VRAM/compute-optimized; uses Gemma-specific internals (PLE, attention types, KV sharing → layers 0–14 only). |
+
+`d_in` and layer count are auto-detected from the model config; the SAE dictionary is
+`expansion × d_in` (default 32×).
 
 ## Files
 
 | File | Role |
 |------|------|
-| `sae_trainer_rolling.py` | The trainer — SAE arch, datasets, rolling cache, training loop, CLI. Self-contained. |
-| `sae_scheduler.py`       | AECS dual-loop scheduler (LR controller + adaptive-Lagrangian λ integrator). |
+| `sae_trainer_rolling.py` | The trainer — scheduler-driven training loop, SAE arch, datasets, both capture backends, CLI. |
+| `sae_scheduler.py`       | The event-aware scheduler (AECS modes + Augmented-Lagrangian λ control). |
 | `examples/configs.py`    | Example expansion / sparsity configs. |
 
 ## Install
@@ -45,49 +47,63 @@ of scope here.
 pip install -r requirements.txt
 ```
 
-Requires a CUDA GPU (H100/A100 target). Set credentials in the environment:
+Requires a CUDA GPU (H100/A100 target). Configuration is via flags or environment:
 
 ```bash
-export HF_TOKEN=hf_...          # required (model + corpus access, SAE upload)
-export WANDB_API_KEY=...        # optional (metrics logging; training runs fine without it)
-export SAE_DATA_DIR=./data      # optional (default ./data) — where SAEs/pools are written
-export SAE_SCRATCH_DIR=/mnt/nvme/rollcache  # optional — fast disk for ephemeral activation pools
+export HF_TOKEN=hf_...            # model + corpus access (and upload, if used)
+export SAE_DATA_DIR=./data        # where SAEs/pools are written (default ./data)
+export SAE_SCRATCH_DIR=/mnt/nvme  # optional: fast disk for ephemeral activation pools
+# SAE_MODEL_ID / SAE_HUB_ID / WANDB_PROJECT also settable via env
 ```
+
+No HF org, wandb project, or upload target is baked in: a clone-and-run **trains locally and
+pushes nowhere** unless you pass `--hub-id` (and `--wandb-project` for logging).
 
 ## Run
 
 ```bash
-# hot zone (layers 0–8)
-python sae_trainer_rolling.py
+# any causal LM, model-agnostic capture, layers 0–16
+python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B --end-layer 16
 
-# full 0–14
-python sae_trainer_rolling.py --end-layer 15
+# Gemma fast path (single-block, layers 0–14)
+python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it --capture rolling --end-layer 15
 
-# a slice, live tokenization, no Hub upload (smoke test)
-python sae_trainer_rolling.py --start-layer 0 --end-layer 2 --max-steps 500 --no-pretok --no-push
+# publish + log
+python sae_trainer_rolling.py --model-id Qwen/Qwen2.5-1.5B --hub-id me/qwen-saes --wandb-project run1
+
+# fast smoke test: 2 layers, few steps, live tokenization, no upload
+python sae_trainer_rolling.py --start-layer 0 --end-layer 2 --max-steps 500 --no-pretok
 ```
 
-`python sae_trainer_rolling.py --help` lists all flags.
+`python sae_trainer_rolling.py --help` lists every flag.
 
-## Key hyperparameters (`sae_trainer_rolling.py`)
+## Key hyperparameters
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| `N_FEATURES`  | `32 * 1536 = 49152` | 32× expansion over the 1536-d residual stream |
-| `K`           | `500` | target L0 (natural L0 ≈ 550 at 32× — λ stays slightly positive) |
-| `BATCH_TOKENS`| `32_768` | tokens per SAE step |
-| `SEQ_LEN`     | `2_048` | sequence length into the model (attention is O(seq²)) |
-| `AUX_K`       | `128` | top-k dead features revived per token via the aux loss |
-| `POOL_BATCHES_DEFAULT` | `4000` | activation batches cached per layer |
+| `--expansion` | `32` | SAE dict size = `expansion × d_in` |
+| `K` (target L0) | `500` | the constraint the scheduler converges to |
+| `BATCH_TOKENS` | `32_768` | tokens per SAE step |
+| `SEQ_LEN` | `2_048` | sequence length into the model |
+| `AUX_K` | `128` | dead features revived per token via the aux loss |
+| `--pool-batches` | `4000` | activation batches cached per layer |
 
-## Performance notes
+`d_in` is **not** a hyperparameter — it's read from the model config.
 
-- **Ghost-feature aux loss is sparse and guarded.** Dead-feature revival operates only on the
-  dead columns (`[B, n_dead]`) and is skipped entirely when nothing is dead — instead of
-  allocating two full `[B, n_features]` tensors and running a dense matmul over a
-  ~0.3%-nonzero tensor every step.
-- The rolling cache trades disk for compute: activation pools are large and ephemeral, deleted
-  incrementally so peak disk stays at ~one pool. Point `SAE_SCRATCH_DIR` at your fastest disk.
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+CPU-only, no GPU/network/token needed. Covers the SAE arch, pool I/O, dataset dispatch, the
+scheduler's λ integrator (climb/clamp/floor), the CLI, and the model-agnostic hook capture —
+including an exact match against a manual forward. Two further guards run when their deps are
+present and skip otherwise: a CUDA smoke test (`-m gpu`), and a **bit-exactness check** that
+hooked capture equals a real model's own `output_hidden_states` (needs network). That second
+test is the one that keeps the atlas trustworthy — it proves capture returns the *actual*
+residual stream, not a subtly wrong copy.
 
 ## License
 

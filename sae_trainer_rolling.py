@@ -1,29 +1,36 @@
 """
-Rolling single-block SAE atlas trainer -- gemma-4-e2b, layers 0-14.
-====================================================================
-Cheapest+fastest path for the FIRST HALF of the atlas. Instead of 35 containers
-each running a full forward 0->L every step, this loads the model ONCE and walks
-layers 0..14 in order. For each layer L it runs ONLY block L (proven bit-exact in
-validate_rolling_cache.py -- the "b2" mechanism) over the cached residual stream
-produced by block L-1, then trains the SAE on those cached activations with ZERO
-transformer in the SAE hot loop
+Event-aware SAE trainer -- train one sparse autoencoder per decoder layer, unattended.
+======================================================================================
+THE POINT of this trainer is the event-aware scheduler (sae_scheduler.py): an AECS
+mode controller plus an Augmented-Lagrangian L0 integrator that makes training
+*self-tuning*. You set an L0 target; the scheduler overshoots it, then the dual
+integrator pulls lambda back, L0 oscillates and converges as close to target as the
+model allows, while dead features are held ~0 (aux-loss revival + threshold reset +
+resampling + a dead-feature emergency mode). It sweeps every layer in a single run
+with no per-layer hyperparameter retuning and no babysitting -- the failure mode that
+forces restart-and-retune loops in fixed-schedule SAE trainers.
 
-SCOPE: layers 0..14 ONLY. HARD STOP at 15 -- layers 15-34 use cross-layer KV
-sharing (num_kv_shared_layers=20) whose interaction with the SAE pipeline is being
-resolved separately. d_in = 1536 at every layer in this range (residual width is
-constant; the "L15 boundary" is the KV-share boundary, not a width change).
+The scheduler and the training loop are MODEL-AGNOSTIC: they consume a stream of
+activation batches from a provider and never touch model internals. How activations
+are produced is pluggable (`--capture`):
 
-Because no layer in 0..14 *reads* shared_kv_states (only 15+ do), the rolling cache
-here carries only the residual stream + per-layer-input (PLE, recomputed from cached
-tokens). No shared-KV persistence required.
+  auto     (default) -- forward-hook the residual stream of any AutoModelForCausalLM.
+                        Correct by construction (observes the real forward). Re-runs a
+                        (truncated) forward per layer: 1 pool of disk, N x compute.
+  rolling  (opt-in)  -- single-block walk: load the model once, run only block L over
+                        the residual cached from block L-1. 1 pool of disk AND ~1
+                        forward total -- a big VRAM/compute win, but its block-
+                        invocation machinery is Gemma-3n/4-family specific (per-layer
+                        embeddings, sliding/full attention types, KV sharing -> the
+                        layers-0..14 HARD_STOP). Guarded by a bit-exactness test.
 
 Run (plain Python, expects a CUDA GPU; H100/A100 target):
-    python sae_trainer_rolling.py                          # layers 0-8 (hot zone)
-    python sae_trainer_rolling.py --end-layer 15           # full 0-14
-    python sae_trainer_rolling.py --start-layer 0 --end-layer 9
+    python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B --end-layer 16
+    python sae_trainer_rolling.py --capture rolling --end-layer 15      # Gemma fast path
+    python sae_trainer_rolling.py --hub-id me/my-saes --wandb-project my-run
 
-Data lives under $SAE_DATA_DIR (default ./data); HF_TOKEN / WANDB_API_KEY are
-read from the environment. Optional pre-tokenized shards: see pretokenize step.
+Config: $SAE_DATA_DIR (default ./data), $SAE_MODEL_ID, $SAE_HUB_ID, $WANDB_PROJECT,
+$SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
@@ -36,14 +43,26 @@ try:
 except ImportError:                      # torch may be absent at import-time on a control host
     IterableDataset = object
 
-MODEL_ID   = "google/gemma-4-E2B-it"
-SAE_HUB_ID = "juiceb0xc0de/gemma-4-e2b-saes-rolling"
+def _slug(model_id: str) -> str:
+    """Filesystem-safe tag from a HF model id ('google/gemma-4-E2B-it' ->
+    'google_gemma-4-e2b-it'). Keeps outputs from different models separate."""
+    return model_id.strip("/").replace("/", "_").replace(" ", "_").lower()
+
+
+# Default model -- override per-run with --model-id / $SAE_MODEL_ID. Nothing below is
+# hardcoded to a model family except the opt-in 'rolling' capture path.
+MODEL_ID   = os.environ.get("SAE_MODEL_ID", "google/gemma-4-E2B-it")
+# HF upload target. NO default org: push happens only when set explicitly (--hub-id /
+# $SAE_HUB_ID), so a clone-and-run can never push somewhere unintended or fail on perms.
+SAE_HUB_ID = os.environ.get("SAE_HUB_ID")
+# wandb project. Off unless set (--wandb-project / $WANDB_PROJECT), independent of any key.
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT")
 
 # -- Local data layout (replaces the Modal /data volume) --------------------
 # Everything reads/writes under $SAE_DATA_DIR (default ./data). Activation pools
 # can be redirected to fast scratch via $SAE_SCRATCH_DIR (defaults under DATA_DIR).
 DATA_DIR   = Path(os.environ.get("SAE_DATA_DIR", "./data")).expanduser()
-SAE_DIR    = str(DATA_DIR / "saes" / "gemma4-e2b-rolling")   # persistent SAE outputs
+SAE_DIR    = str(DATA_DIR / "saes" / _slug(MODEL_ID))        # persistent SAE outputs (per-model)
 PRETOK_DIR = str(DATA_DIR / "pretok" / "fineweb-edu")        # optional pre-tokenized shards
 # Activation pools are large and ephemeral -- point this at the fastest local disk
 # you have. Pools are deleted incrementally during a run (we hold ~one pool at a time).
@@ -51,8 +70,9 @@ ROLLCACHE  = os.environ.get("SAE_SCRATCH_DIR", str(DATA_DIR / "rollcache"))
 HARD_STOP_LAYER = 15                       # exclusive upper bound; never touch 15+
 
 # -- Hyperparameters --------------------------------------------------------
-D_IN          = 1536        # L0-L14 residual width (constant across this range)
-N_FEATURES    = 32 * 1536   # 49152 -- 32x expansion (Llama-Scope-class config)
+D_IN          = 1536        # fallback residual width; auto-detected from the model config at run time
+EXPANSION     = 32          # SAE dictionary size = EXPANSION * d_in (Llama-Scope-class config)
+N_FEATURES    = EXPANSION * D_IN   # 49152 at d_in=1536; recomputed for the detected d_in
 K             = 500         # FINAL target L0. Natural L0 settles ~550 at 32x; target<natural keeps lambda slightly positive.
 K_INIT        = 500         # Curriculum disabled (== K)
 K_CURRICULUM_STEPS = 1      # effectively disabled (target_l0 = K from step 1)
@@ -462,11 +482,64 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
 
 
 # ===========================================================================
-#  Pool production  (run block L over pool[L-1] -> pool[L])
+#  Pool production  (capture activations -> pool[L] shards)
+#  Two backends, both writing the same shard format the provider reads:
+#    _produce_pool_hooked  -- model-agnostic forward-hook capture (default)
+#    _produce_pool         -- Gemma-3n/4 single-block walk (opt-in, --capture rolling)
 # ===========================================================================
 
+class _EarlyExit(Exception):
+    """Raised inside a forward hook to abort the forward once the target layer's
+    residual has been captured -- skips the remaining layers + LM head."""
+
+
+def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device):
+    """Model-agnostic capture: run the model forward over the token pool with a
+    forward hook on decoder block `layer`, recording its residual-stream output.
+    Works for any AutoModelForCausalLM (and text-only forwards of multimodal models).
+
+    Correct by construction -- it observes the real forward, so there is no bit-exact
+    risk. The hook raises _EarlyExit so layers after `layer` and the LM head are
+    skipped. Each layer is captured independently (one forward per layer), so disk
+    stays at one pool while compute is N_layers x a (truncated) forward."""
+    import torch
+    import time
+
+    tok_paths = _shard_paths(tok_dir)
+    n = len(tok_paths)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if len(_shard_paths(dst_dir)) >= n:
+        print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
+        return
+
+    cap = {}
+
+    def _hook(_module, _inp, out):
+        cap["h"] = (out[0] if isinstance(out, tuple) else out).detach()
+        raise _EarlyExit
+
+    handle = decoder_layers[layer].register_forward_hook(_hook)
+    print(f"  [produce L{layer}] hook capture over {n} batches ...")
+    t0 = time.time()
+    try:
+        for i in range(n):
+            ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
+            try:
+                with torch.no_grad():
+                    model(input_ids=ids, use_cache=False)
+            except _EarlyExit:
+                pass
+            _write_shard(dst_dir, i, cap["h"])
+            if (i + 1) % 500 == 0:
+                tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
+                print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
+    finally:
+        handle.remove()
+    print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
+
+
 def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_dir, dst_dir, device):
-    """Produce pool[layer] (block-L output for every batch).
+    """Gemma-3n/4 single-block walk. Produce pool[layer] (block-L output for every batch).
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
     Tokens are always needed for per_layer_inputs (PLE)."""
@@ -606,7 +679,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # -- wandb ----------------------------------------------------------------
     use_wandb = False
     wandb = None
-    if os.environ.get("WANDB_API_KEY"):
+    # Off unless a project is configured (--wandb-project / $WANDB_PROJECT) AND a key
+    # is present. Never auto-init to a named project.
+    if WANDB_PROJECT and os.environ.get("WANDB_API_KEY"):
         try:
             import wandb as _wandb
             try:
@@ -614,11 +689,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     _wandb.finish(exit_code=1)
             except Exception:
                 pass
-            _wandb.init(project="gemma4-e2b-saes-rolling", name=f"L{layer:02d}_s{seed}",
+            _wandb.init(project=WANDB_PROJECT, name=f"L{layer:02d}_s{seed}",
                         reinit="finish_previous",
                         config={"layer": layer, "seed": seed, "model_id": MODEL_ID,
                                 "n_features": N_FEATURES, "k": K, "batch_tokens": BATCH_TOKENS,
-                                "lr": LR, "n_steps": N_STEPS, "tier": tier, "path": "rolling"})
+                                "lr": LR, "n_steps": N_STEPS, "tier": tier})
             wandb = _wandb
             use_wandb = True
             print(f"  WandB: {wandb.run.url}")
@@ -910,7 +985,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         json.dump(meta, f, indent=2)
     print(f"Saved: {out_dir}/sae.pt + meta.json")
 
-    if push:
+    if push and SAE_HUB_ID:
         from huggingface_hub import HfApi
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         api = HfApi(token=hf_token)
@@ -921,6 +996,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         api.upload_folder(folder_path=str(out_dir), repo_id=SAE_HUB_ID,
                           path_in_repo=f"layer_{layer:02d}_s{seed}", repo_type="model")
         print(f"Pushed layer_{layer:02d}_s{seed} -> {SAE_HUB_ID}")
+    elif push and not SAE_HUB_ID:
+        print(f"  [push skipped] no --hub-id / $SAE_HUB_ID set -- SAE saved locally only")
     else:
         print(f"  [push disabled] skipped HF upload for layer {layer}")
 
@@ -936,109 +1013,136 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
 
 # ===========================================================================
-#  Orchestrator  (single container, layers 0..14)
+#  Orchestrator  (load model once, sweep layers, train one SAE each)
 # ===========================================================================
 
 def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFAULT_SEED,
                       pool_batches: int = POOL_BATCHES_DEFAULT, use_pretok: bool = True,
                       max_steps: int = N_STEPS, bdec_batches: int = BDEC_INIT_BATCHES,
-                      push: bool = True):
-    """Train SAEs for layers [start_layer, end_layer) via the rolling single-block cache.
-    HARD STOP at layer 15 -- this range is 0..14 only.
-    max_steps/bdec_batches/push: cap work + skip upload for smoke tests (defaults = full run)."""
+                      push: bool = True, capture: str = "auto", model_id: str = None,
+                      hub_id: str = None, wandb_project: str = None, expansion: int = None):
+    """Train one SAE per decoder layer in [start_layer, end_layer).
+
+    capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
+             "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized).
+    model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
+    max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
     import time
     import torch
-    import torch.nn as nn
-    from transformers import AutoTokenizer, AutoModelForImageTextToText
 
-    if end_layer > HARD_STOP_LAYER:
-        print(f"  [scope] clamping end_layer {end_layer} -> {HARD_STOP_LAYER} (deep layers deferred)")
+    # -- config bus: thread runtime overrides into the module globals that the rest of
+    #    the code (train_sae_on_activations, dataset builder, paths) already reads ------
+    global MODEL_ID, SAE_DIR, SAE_HUB_ID, WANDB_PROJECT, EXPANSION, N_FEATURES
+    if model_id:
+        MODEL_ID = model_id
+        SAE_DIR = str(DATA_DIR / "saes" / _slug(MODEL_ID))
+    if expansion:
+        EXPANSION = int(expansion)
+    if hub_id is not None:
+        SAE_HUB_ID = hub_id
+    if wandb_project is not None:
+        WANDB_PROJECT = wandb_project
+
+    assert capture in ("auto", "rolling"), f"unknown --capture {capture!r}"
+    if capture == "rolling" and end_layer > HARD_STOP_LAYER:
+        print(f"  [scope] rolling clamps end_layer {end_layer} -> {HARD_STOP_LAYER} "
+              f"(Gemma KV-share boundary)")
         end_layer = HARD_STOP_LAYER
-    assert start_layer >= 0 and end_layer <= HARD_STOP_LAYER, "rolling trainer is 0..14 only"
-    layers = list(range(start_layer, end_layer))
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     device = torch.device("cuda")
     torch.manual_seed(seed)
 
-    print(f"\n{'#'*60}\n  ROLLING ATLAS  layers={layers}  seed={seed}  "
-          f"pool_batches={pool_batches}\n{'#'*60}\n")
-
-    # -- disk sizing note (we hold ~ONE pool at a time via incremental src-delete) --
-    # NOTE: ROLLCACHE is the container overlay fs; statvfs reports a 2^63 sentinel for
-    # it, so .free is NOT trustworthy here. The real guard is incremental src-deletion
-    # in _produce_pool, which caps peak at ~one pool. The overlay empirically holds at
-    # least ~510GB (pool[0] of 404GB wrote fine), so one pool fits with headroom.
-    import shutil
-    os.makedirs(ROLLCACHE, exist_ok=True)
-    shard_gb = (BATCH_TOKENS // SEQ_LEN) * SEQ_LEN * D_IN * 2 / 1e9   # bf16 [n_seqs,SEQ_LEN,d]
-    peak_gb = pool_batches * shard_gb * 1.1 + 2                       # ~one pool + slack
-    free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
-    sentinel = free_gb > 1e6                                          # overlay -> unreliable
-    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB (one pool of {pool_batches} x "
-          f"{shard_gb*1e3:.0f}MB); free={'(overlay: unknown)' if sentinel else f'{free_gb:.0f}GB'}")
-    if not sentinel:
-        assert free_gb > peak_gb, (
-            f"insufficient disk at {ROLLCACHE}: {free_gb:.0f}GB free < {peak_gb:.0f}GB peak. "
-            f"Lower --pool-batches.")
-    elif peak_gb > 480:
-        print(f"  [disk] WARNING: peak {peak_gb:.0f}GB may exceed the ~510GB overlay cap; "
-              f"consider --pool-batches <= 4400 (4000 verified OK).")
-
-    # -- load model ONCE ------------------------------------------------------
+    # -- load model ONCE (generic loader: CausalLM, multimodal fallback) -------
     print(f"Loading {MODEL_ID} ...")
+    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
     bos_token_id = tokenizer.bos_token_id or 2
-    model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID, token=hf_token, dtype=torch.bfloat16, device_map="cpu")
+    try:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID, token=hf_token, dtype=torch.bfloat16, device_map="cpu")
+    except (ValueError, KeyError, OSError) as e:
+        # Multimodal checkpoints (e.g. Gemma-4) aren't plain CausalLM -- fall back.
+        print(f"  CausalLM load failed ({type(e).__name__}); using image-text-to-text loader")
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            MODEL_ID, token=hf_token, dtype=torch.bfloat16, device_map="cpu")
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
     cfg = model.config
     tcfg = getattr(cfg, "text_config", cfg)
-    n_layers = tcfg.num_hidden_layers
+    n_layers = int(tcfg.num_hidden_layers)
+    d_in = int(getattr(tcfg, "hidden_size", D_IN))
+    N_FEATURES = EXPANSION * d_in              # SAE dict scales with the detected width
     text_model, attr_name, decoder_layers = _find_text_model(model, n_layers)
     model.to(device)
-    print(f"  text model={type(text_model).__name__}  blocks={len(decoder_layers)}")
 
-    # -- token pool (once) ----------------------------------------------------
+    end_layer = min(end_layer, n_layers)
+    assert 0 <= start_layer < end_layer <= n_layers, \
+        f"bad layer range [{start_layer},{end_layer}) for a {n_layers}-layer model"
+    layers = list(range(start_layer, end_layer))
+    print(f"  model={type(model).__name__}  blocks={len(decoder_layers)}  d_in={d_in}  "
+          f"n_features={N_FEATURES} ({EXPANSION}x)  capture={capture}")
+    if capture == "rolling" and d_in != D_IN:
+        print(f"  [warn] rolling capture was tuned at d_in={D_IN}; model reports {d_in}")
+
+    print(f"\n{'#'*60}\n  SAE ATLAS  model={_slug(MODEL_ID)}  layers={layers}  seed={seed}  "
+          f"capture={capture}\n{'#'*60}\n")
+
+    # -- disk sizing (we hold ~ONE activation pool at a time) -----------------
+    import shutil
+    os.makedirs(ROLLCACHE, exist_ok=True)
+    shard_gb = (BATCH_TOKENS // SEQ_LEN) * SEQ_LEN * d_in * 2 / 1e9   # bf16 [n_seqs,SEQ_LEN,d]
+    peak_gb = pool_batches * shard_gb * 1.1 + 2                       # ~one pool + slack
+    free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
+    sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
+    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB (one pool of {pool_batches} x "
+          f"{shard_gb*1e3:.0f}MB); free={'(overlay: unknown)' if sentinel else f'{free_gb:.0f}GB'}")
+    if not sentinel:
+        assert free_gb > peak_gb, (
+            f"insufficient disk at {ROLLCACHE}: {free_gb:.0f}GB free < {peak_gb:.0f}GB peak. "
+            f"Lower --pool-batches or set $SAE_SCRATCH_DIR to a bigger disk.")
+
+    # -- token pool (once -- same tokens flow through every layer) ------------
     tok_dir = _pool_dir(f"tokens_s{seed}")
     _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir, bos_token_id)
 
-    # -- layer-boundary marker ------------------------------------------------
-    marker_path = Path(SAE_DIR) / f"rolling_marker_s{seed}.json"
+    marker_path = Path(SAE_DIR) / f"atlas_marker_s{seed}.json"
     marker_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Per-layer pool dirs (pool_L02_s0). Unambiguous: a dir only ever holds its own
-    # layer's activations, so the "skip if present" resume-guard is safe. We keep at
-    # most two pools (L-1 source + L just produced) and delete L-1 once L exists.
     def pool_dir_for(L):
         return _pool_dir(f"pool_L{L:02d}_s{seed}")
 
     results = {}
     t0 = time.time()
-    # We must walk from layer 0 to build the residual chain even if start_layer>0;
-    # but for layers < start_layer we only PRODUCE the pool (skip SAE training).
-    walk_start = 0
+    # rolling must walk from 0 to build the residual chain; hook capture is independent
+    # per layer, so it starts at start_layer.
+    walk_start = 0 if capture == "rolling" else start_layer
     for L in range(walk_start, end_layer):
-        src_dir = pool_dir_for(L - 1) if L >= 1 else None
         dst_dir = pool_dir_for(L)
-        _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir, dst_dir, device)
-        # pool[L-1] was only needed to produce pool[L]; SAE_{L-1} already trained on it.
-        if src_dir is not None:
-            _rm_pool(src_dir)
-
-        if L < start_layer:
-            print(f"  [skip-train] L{L} pool produced; below start_layer={start_layer}")
-            continue
+        if capture == "rolling":
+            src_dir = pool_dir_for(L - 1) if L >= 1 else None
+            _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir, dst_dir, device)
+            if src_dir is not None:                       # consumed -> free now
+                _rm_pool(src_dir)
+            if L < start_layer:
+                print(f"  [skip-train] L{L} pool produced; below start_layer={start_layer}")
+                continue
+        else:
+            _produce_pool_hooked(model, decoder_layers, L, tok_dir, dst_dir, device)
 
         provider = RollingActivationProvider(dst_dir, device, seed=seed)
         try:
-            res = train_sae_on_activations(L, D_IN, seed, provider,
+            res = train_sae_on_activations(L, d_in, seed, provider,
                                            max_steps=max_steps, bdec_batches=bdec_batches, push=push)
         finally:
             provider.close()
         results[f"layer_{L:02d}"] = res
+
+        if capture == "auto":                             # independent capture -> free now
+            _rm_pool(dst_dir)
 
         import json
         with open(marker_path, "w") as f:
@@ -1047,7 +1151,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         elapsed = (time.time() - t0) / 60
         print(f"  [ok] L{L} done: {res}  | elapsed {elapsed:.1f}min")
 
-    print(f"\n{'#'*60}\n  ROLLING ATLAS COMPLETE  layers={layers}  "
+    print(f"\n{'#'*60}\n  SAE ATLAS COMPLETE  layers={layers}  "
           f"wall={ (time.time()-t0)/60:.1f}min\n{'#'*60}")
     return results
 
@@ -1055,24 +1159,39 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 def main():
     import argparse
     p = argparse.ArgumentParser(
-        description="Rolling single-block SAE trainer for gemma-4-E2B-it, layers 0-14.")
+        description="Event-aware SAE trainer: one self-tuning SAE per decoder layer, "
+                    "model-agnostic. The scheduler converges L0 to target with no per-layer "
+                    "retuning. Default capture works on any AutoModelForCausalLM.")
+    p.add_argument("--model-id", default=None,
+                   help=f"HF model id to train SAEs on (default {MODEL_ID})")
+    p.add_argument("--capture", choices=["auto", "rolling"], default="auto",
+                   help="auto=model-agnostic forward-hook (default); rolling=Gemma single-block fast path")
     p.add_argument("--start-layer", type=int, default=0)
-    p.add_argument("--end-layer", type=int, default=9, help="exclusive; clamped to 15")
+    p.add_argument("--end-layer", type=int, default=9,
+                   help="exclusive; clamped to model depth (and to 15 under --capture rolling)")
+    p.add_argument("--expansion", type=int, default=None,
+                   help=f"SAE dict = expansion * d_in (default {EXPANSION})")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--pool-batches", type=int, default=POOL_BATCHES_DEFAULT)
     p.add_argument("--no-pretok", dest="use_pretok", action="store_false",
                    help="stream + tokenize FineWeb-Edu live instead of using pre-tokenized shards")
     p.add_argument("--max-steps", type=int, default=N_STEPS, help="cap steps (smoke tests)")
     p.add_argument("--bdec-batches", type=int, default=BDEC_INIT_BATCHES)
+    p.add_argument("--hub-id", default=None,
+                   help="HF repo to upload SAEs to. No default -- upload is skipped unless set.")
+    p.add_argument("--wandb-project", default=None,
+                   help="wandb project name. Off unless set (also needs WANDB_API_KEY).")
     p.add_argument("--no-push", dest="push", action="store_false",
-                   help="skip the HuggingFace upload of trained SAEs")
+                   help="skip the HuggingFace upload even if --hub-id is set")
     p.set_defaults(use_pretok=True, push=True)
     args = p.parse_args()
 
     res = run_atlas_rolling(
         start_layer=args.start_layer, end_layer=args.end_layer, seed=args.seed,
         pool_batches=args.pool_batches, use_pretok=args.use_pretok,
-        max_steps=args.max_steps, bdec_batches=args.bdec_batches, push=args.push)
+        max_steps=args.max_steps, bdec_batches=args.bdec_batches, push=args.push,
+        capture=args.capture, model_id=args.model_id, hub_id=args.hub_id,
+        wandb_project=args.wandb_project, expansion=args.expansion)
     print(f"\nDone. {res}")
 
 

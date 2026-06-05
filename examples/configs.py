@@ -1,42 +1,51 @@
 """
-Example SAE training configs.
+Example run configurations.
 
-These mirror the module-level constants at the top of ``sae_trainer_rolling.py``.
-To use one, edit those constants (they are module globals), or adapt the trainer
-to read from a dict like the ones below.
-
-All configs target google/gemma-4-E2B-it, layers 0-14, on a single H100/A100.
+These mirror the CLI flags of sae_trainer_rolling.py. The trainer is model-agnostic:
+d_in and layer count are auto-detected from the model, so configs only carry the knobs
+you actually choose. Nothing pushes anywhere unless `hub_id` is set.
 """
 
-# Default — matches sae_trainer_rolling.py as shipped. 32x expansion, the
-# high-quality config used for the full layer atlas.
+# Default — model-agnostic hook capture, 32x dictionary, no upload.
 DEFAULT = {
-    "d_in": 1536,
-    "n_features": 32 * 1536,   # 49152
-    "k": 500,                  # target L0
-    "batch_tokens": 32_768,
-    "seq_len": 2_048,
-    "aux_k": 128,
+    "model_id": "google/gemma-4-E2B-it",   # any AutoModelForCausalLM works
+    "capture": "auto",
+    "start_layer": 0,
+    "end_layer": 9,
+    "expansion": 32,
     "pool_batches": 4000,
+    "use_pretok": True,
+    "hub_id": None,                        # set to "me/my-saes" to publish
+    "wandb_project": None,                 # set + WANDB_API_KEY to log
 }
 
-# Faster / cheaper sweep — smaller dictionary. NOTE: this is a DIFFERENT
-# experiment, not a free speedup. Fewer features means a different (coarser)
-# feature basis, not the same atlas at lower cost. Use for quick iteration.
+# Gemma fast path — single-block capture (VRAM/compute-optimized, Gemma-3n/4 only,
+# layers 0-14). Same SAEs, much cheaper to produce activations for.
+GEMMA_ROLLING = {
+    **DEFAULT,
+    "capture": "rolling",
+    "end_layer": 15,
+}
+
+# A different model entirely — proves there's nothing Gemma-specific in the core.
+LLAMA_3_2_1B = {
+    **DEFAULT,
+    "model_id": "meta-llama/Llama-3.2-1B",
+    "capture": "auto",
+    "end_layer": 16,
+}
+
+# Smaller dictionary for quick iteration. NOTE: a different basis, not a free speedup.
 SMALL_8X = {
     **DEFAULT,
-    "n_features": 8 * 1536,    # 12288
-    "k": 200,
+    "expansion": 8,
 }
 
-# Smoke test — a couple of layers, few steps, live tokenization, no Hub upload.
-# Mirrors: python sae_trainer_rolling.py --start-layer 0 --end-layer 2 \
-#              --max-steps 500 --no-pretok --no-push
+# Smoke test — two layers, few steps, live tokenization, no upload.
 SMOKE = {
     **DEFAULT,
     "start_layer": 0,
     "end_layer": 2,
     "max_steps": 500,
     "use_pretok": False,
-    "push": False,
 }
