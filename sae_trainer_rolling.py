@@ -22,7 +22,8 @@ are produced is pluggable (`--capture`):
                         forward total -- a big VRAM/compute win, but its block-
                         invocation machinery is Gemma-3n/4-family specific (per-layer
                         embeddings, sliding/full attention types, KV sharing -> the
-                        layers-0..14 HARD_STOP). Guarded by a bit-exactness test.
+                        layers-0..14 HARD_STOP). Guarded by validate_rolling_cache.py,
+                        which checks this single-block path bit-exact vs a full forward.
 
 Run (plain Python, expects a CUDA GPU; H100/A100 target):
     python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B --end-layer 16

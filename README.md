@@ -105,6 +105,15 @@ hooked capture equals a real model's own `output_hidden_states` (needs network).
 test is the one that keeps the atlas trustworthy — it proves capture returns the *actual*
 residual stream, not a subtly wrong copy.
 
+For the `rolling` backend specifically, `validate_rolling_cache.py` is a standalone gate:
+it imports the shipped `_make_invariants`/`_run_block` and checks, per layer, that the
+single-block reconstruction matches a true full forward to tolerance — and demonstrates the
+expected divergence at/above `HARD_STOP_LAYER` that scopes rolling to layers 0–14.
+
+```bash
+python validate_rolling_cache.py --model-id google/gemma-4-E2B-it
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
