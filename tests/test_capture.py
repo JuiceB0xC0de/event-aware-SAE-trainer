@@ -115,6 +115,8 @@ def test_hooked_capture_equals_hf_hidden_states(tmp_path):
 
     model.eval()
     n_layers = model.config.num_hidden_layers
+    if n_layers < 2:
+        pytest.skip("need >= 2 layers to compare a non-final block")
     _, _, decoder_layers = t._find_text_model(model, n_layers)
 
     ids = torch.randint(0, model.config.vocab_size, (2, 6))
@@ -122,14 +124,19 @@ def test_hooked_capture_equals_hf_hidden_states(tmp_path):
     tok.mkdir()
     torch.save(ids, tok / "shard_00000.pt")
 
-    L = min(1, n_layers - 1)
+    # Capture a NON-final block. HF's output_hidden_states applies the final norm to
+    # its LAST entry (hidden_states[n_layers]); only hidden_states[i] for i < n_layers
+    # is the raw residual stream out of block i-1. _produce_pool_hooked captures the
+    # raw (pre-norm) residual, which is what SAE training needs -- so the reference
+    # must be a non-final block to compare like with like.
+    L = min(1, n_layers - 2)                      # 0 for a 2-layer model, else 1; never the last
     dst = Path(tmp_path) / "pool"
     t._produce_pool_hooked(model, decoder_layers, L, tok, dst, torch.device("cpu"))
     captured = t._read_shard(dst, 0).float()
 
     with torch.no_grad():
         out = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-    expected = out.hidden_states[L + 1].float()   # hidden_states[0]=embeds, [L+1]=block L output
+    expected = out.hidden_states[L + 1].float()   # raw output of block L (L+1 < n_layers)
 
     assert captured.shape == expected.shape
     torch.testing.assert_close(
