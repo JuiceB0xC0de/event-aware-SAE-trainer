@@ -30,7 +30,7 @@ def load_sae(sae_dir: str):
         meta = json.load(f)
 
     # Load SAE weights saved by the trainer
-    state = torch.load(sae_dir / "sae.pt", map_location="cpu")
+    state = torch.load(sae_dir / "sae.pt", map_location="cpu", weights_only=True)
 
     d_in = meta["d_in"]
     n_features = meta["n_features"]
