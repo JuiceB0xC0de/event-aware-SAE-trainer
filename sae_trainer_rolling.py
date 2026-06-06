@@ -596,7 +596,7 @@ class RollingActivationProvider:
     shard cursor and consumed shards so training can resume at the exact position.
     """
 
-    def __init__(self, pool_dir: Path, device, seed=0, queue_size=4):
+    def __init__(self, pool_dir: Path, device, seed=0, queue_size=8):
         import threading, queue as _queue
         self.paths = sorted(_shard_paths(pool_dir))
         if not self.paths:
@@ -628,12 +628,16 @@ class RollingActivationProvider:
                 self._cursor += 1
                 self._consumed.add(idx)
             path = self.paths[idx]
-            t = torch.load(path, map_location="cpu", weights_only=True)  # [n_seqs,SEQ_LEN,d] bf16
-            t = t.reshape(-1, t.shape[-1]).pin_memory()
-            self._q.put(t)
+            # Load with mmap for faster IO, reshape, keep on CPU but pinned
+            t = torch.load(path, map_location="cpu", weights_only=True, mmap=True)  # [n_seqs,SEQ_LEN,d] bf16
+            t = t.reshape(-1, t.shape[-1])  # flatten to [total_tokens, d_in]
+            # Pin memory for faster GPU transfer
+            if not t.is_pinned():
+                t = t.pin_memory()
+            self._q.put(t, timeout=5)
 
     def next_batch(self):
-        t = self._q.get()
+        t = self._q.get(timeout=5)
         return t.to(self.device, non_blocking=True)        # [BATCH_TOKENS, D_IN] bf16
 
     def get_state(self):
@@ -748,6 +752,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True  # Critical for H100
     torch.set_float32_matmul_precision("high")
 
     # -- LAMBDA tier (layers 0-14 only -> hot/trough/mid) ---------------------
@@ -807,6 +812,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     sae = _make_sae(d_in, N_FEATURES, seed).to(device)
     if frozen_decoder:
         sae.W_dec.weight.requires_grad_(False)
+
+    # Compile for H100 speedup (fuse kernels, reduce launch overhead)
+    sae = torch.compile(sae, mode="reduce-overhead")
 
     optimizer = torch.optim.Adam(
         [{"params": sae.W_enc.parameters(), "weight_decay": 0},
@@ -1211,18 +1219,28 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # -- load model ONCE (generic loader: CausalLM, multimodal fallback) -------
     print(f"Loading {MODEL_ID} ...")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=hf_token)
+    # Detect if MODEL_ID is a local path
+    import os
+    is_local = os.path.isdir(MODEL_ID)
+    tokenizer_kwargs = {"token": hf_token} if not is_local else {}
+    if is_local:
+        tokenizer_kwargs["local_files_only"] = True
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
     bos_token_id = tokenizer.bos_token_id or 2
     try:
         from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID, token=hf_token, dtype=torch.bfloat16, device_map="cpu")
+        model_kwargs = {"token": hf_token, "dtype": torch.bfloat16, "device_map": "cpu"}
+        if is_local:
+            model_kwargs["local_files_only"] = True
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
     except (ValueError, KeyError, OSError) as e:
         # Multimodal checkpoints (e.g. Gemma-4) aren't plain CausalLM -- fall back.
         print(f"  CausalLM load failed ({type(e).__name__}); using image-text-to-text loader")
         from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(
-            MODEL_ID, token=hf_token, dtype=torch.bfloat16, device_map="cpu")
+        model_kwargs = {"token": hf_token, "dtype": torch.bfloat16, "device_map": "cpu"}
+        if is_local:
+            model_kwargs["local_files_only"] = True
+        model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **model_kwargs)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
