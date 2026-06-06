@@ -30,7 +30,7 @@ def load_sae(sae_dir: str):
         meta = json.load(f)
 
     # Load SAE weights saved by the trainer
-    state = torch.load(sae_dir / "sae.pt", map_location="cpu")
+    state = torch.load(sae_dir / "sae.pt", map_location="cpu", weights_only=True)
 
     d_in = meta["d_in"]
     n_features = meta["n_features"]
@@ -81,10 +81,13 @@ def get_top_features(feature_acts: torch.Tensor, k: int = 10) -> list:
     # Sum over sequence dimension if present
     if feature_acts.dim() > 2:
         summed = feature_acts.sum(dim=tuple(range(feature_acts.dim() - 1)))
-    else:
+    elif feature_acts.dim() == 2:
         summed = feature_acts.sum(dim=0)
+    else:
+        summed = feature_acts
 
-    top_vals, top_indices = torch.topk(summed, k=k)
+    k_actual = min(k, summed.size(0))
+    top_vals, top_indices = torch.topk(summed, k=k_actual)
 
     return [
         {"feature": idx.item(), "activation": val.item()}
