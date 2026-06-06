@@ -29,6 +29,9 @@ def test_no_org_pii_defaults():
 def test_slug():
     assert t._slug("google/gemma-4-E2B-it") == "google_gemma-4-e2b-it"
     assert t._slug("meta-llama/Llama-3.2-1B") == "meta-llama_llama-3.2-1b"
+    assert t._slug("a/b/c") == "a_b_c"
+    assert t._slug("NOSLASH") == "noslash"
+    assert t._slug("") == ""
 
 
 def test_sae_dir_composes_under_data_dir():
