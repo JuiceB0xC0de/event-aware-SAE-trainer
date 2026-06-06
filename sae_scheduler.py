@@ -716,10 +716,3 @@ class SAEEventControlScheduler:
             "ev_above_floor": self._ev_above_floor_count,
             "recent_transitions": self.transition_log[-5:],
         }
-
-    def log_summary(self):
-        """Print scheduler state summary."""
-        s = self.summary()
-        print(f"  [Scheduler] mode={s['mode']} lambda={s['lambda_l0']:.2e} "
-              f"transitions={s['transitions']} ev_below={s['ev_below_floor']} "
-              f"ev_above={s['ev_above_floor']}")
