@@ -933,6 +933,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 + 0.5 * sae_cfg.al_mu * slack * slack
             ) / accum_steps
 
+            # Pre-compute dead feature parameters for the aux loss to avoid doing this per microbatch
+            dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
+            n_dead = int(dead_mask_aux.sum().item())
+            if n_dead > 0:
+                dead_indices = torch.where(dead_mask_aux)[0]
+                eff_k = min(AUX_K, n_dead)
+
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
             end_idx = start_idx + microbatch_size
@@ -949,12 +956,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 sparsity_loss = sparsity_loss_full
 
                 # Aux loss for dead features (scaled by accum_steps)
-                dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
-                n_dead = int(dead_mask_aux.sum().item())
                 if n_dead > 0:
-                    dead_indices = torch.where(dead_mask_aux)[0]
                     pre_dead = pre[:, dead_indices].relu()
-                    eff_k = min(AUX_K, n_dead)
                     topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
                     aux_acts = torch.zeros_like(pre_dead)
                     aux_acts.scatter_(-1, topk_idx, topk_vals)
@@ -969,10 +972,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
             loss.backward()
 
-            accum_recon_loss += recon_loss.detach().item() * accum_steps
-            accum_l0 += l0_full.detach().item()
-            accum_sparsity_loss += sparsity_loss.detach().item() * accum_steps
-            accum_aux_loss += aux_loss.detach().item() * accum_steps
+            accum_recon_loss += recon_loss.detach()
+            accum_l0 += l0_full.detach()
+            accum_sparsity_loss += sparsity_loss.detach()
+            accum_aux_loss += aux_loss.detach()
+
+        # Extract values for logging once after the microbatch loop
+        # We also compute the average L0 directly rather than sum and divide by accum_steps for accum_l0
+        # since L0 does not multiply by accum_steps like others
+        accum_recon_loss = accum_recon_loss.item() * accum_steps if isinstance(accum_recon_loss, torch.Tensor) else 0.0
+        accum_l0 = accum_l0.item() if isinstance(accum_l0, torch.Tensor) else 0.0
+        accum_sparsity_loss = accum_sparsity_loss.item() * accum_steps if isinstance(accum_sparsity_loss, torch.Tensor) else 0.0
+        accum_aux_loss = accum_aux_loss.item() * accum_steps if isinstance(accum_aux_loss, torch.Tensor) else 0.0
 
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
