@@ -492,11 +492,6 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
 #    _produce_pool         -- Gemma-3n/4 single-block walk (opt-in, --capture rolling)
 # ===========================================================================
 
-class _EarlyExit(Exception):
-    """Raised inside a forward hook to abort the forward once the target layer's
-    residual has been captured -- skips the remaining layers + LM head."""
-
-
 def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device):
     """Model-agnostic capture: run the model forward over the token pool with a
     forward hook on decoder block `layer`, recording its residual-stream output.
@@ -508,6 +503,11 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
     stays at one pool while compute is N_layers x a (truncated) forward."""
     import torch
     import time
+
+    class _EarlyExit(Exception):
+        """Raised inside a forward hook to abort the forward once the target layer's
+        residual has been captured -- skips the remaining layers + LM head."""
+        pass
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
