@@ -84,3 +84,23 @@ def test_legacy_pcontroller_path_runs():
     for _ in range(5):
         sched.step(_sig(l0=600.0))
     assert sched.lambda_l0 >= 0.0
+
+
+def test_ev_delta_edge_cases():
+    import math
+    buf = s.SAESignalBuffer(window=10)
+
+    # Empty buffer
+    assert buf.ev_delta() == 0.0
+
+    # Single item
+    buf.push_sae(ev=0.5)
+    assert buf.ev_delta() == 0.0
+
+    # Two items
+    buf.push_sae(ev=0.7)
+    assert math.isclose(buf.ev_delta(), 0.2)
+
+    # Three items
+    buf.push_sae(ev=0.6)
+    assert math.isclose(buf.ev_delta(), -0.1)
