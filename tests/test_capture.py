@@ -80,6 +80,34 @@ def test_hooked_capture_matches_manual_forward(tmp_path):
     assert torch.allclose(captured, expected.to(torch.bfloat16).float(), atol=1e-3)
 
 
+def test_produce_pool_hooked_catches_early_exit(tmp_path, monkeypatch):
+    """Verify that _produce_pool_hooked catches _EarlyExit and halts the forward pass early."""
+    d = 8
+    model = _FakeModel(3, d).eval()
+
+    tok = Path(tmp_path) / "tok"
+    dst = Path(tmp_path) / "poolL0"
+    _write_token_shards(tok, n_shards=1, n_seqs=2, seq=4)
+
+    forward_completed = False
+    original_forward = model.forward
+
+    def spy_forward(*args, **kwargs):
+        nonlocal forward_completed
+        res = original_forward(*args, **kwargs)
+        forward_completed = True
+        return res
+
+    monkeypatch.setattr(model, "forward", spy_forward)
+
+    # Should succeed without raising the exception to the top level,
+    # because _produce_pool_hooked catches _EarlyExit.
+    t._produce_pool_hooked(model, model.layers, 0, tok, dst, torch.device("cpu"))
+
+    assert not forward_completed, "Model forward should have been interrupted by _EarlyExit"
+    assert len(t._shard_paths(dst)) == 1
+
+
 def test_early_exit_skips_later_layers(tmp_path):
     # capturing layer 0 must not require layers 1+ to run -- prove it by tripping a
     # layer that would error if executed.

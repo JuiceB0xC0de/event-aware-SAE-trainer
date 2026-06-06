@@ -169,6 +169,10 @@ def validate(layers_csv: str = "1,8,13,14,15,19", n_seqs: int = 2, seq_len: int 
 
         max_abs, min_cos = 0.0, 1.0
         in_shape = out_shape = None
+
+        class _EarlyExit(Exception):
+            pass
+
         for bi, ids in enumerate(batches):
             # -- Ground truth: real forward, capture block L-1 (= input to L) and block L
             cap = {}
@@ -178,14 +182,14 @@ def validate(layers_csv: str = "1,8,13,14,15,19", n_seqs: int = 2, seq_len: int 
 
             def hook_tgt(_m, _i, o):
                 cap["tgt"] = _out(o).detach()
-                raise base._EarlyExit
+                raise _EarlyExit
 
             hp = decoder_layers[L - 1].register_forward_hook(hook_prev)
             ht = decoder_layers[L].register_forward_hook(hook_tgt)
             try:
                 with torch.no_grad():
                     model(input_ids=ids, use_cache=False)
-            except base._EarlyExit:
+            except _EarlyExit:
                 pass
             finally:
                 hp.remove()
