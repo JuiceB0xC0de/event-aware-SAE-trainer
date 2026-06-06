@@ -81,10 +81,13 @@ def get_top_features(feature_acts: torch.Tensor, k: int = 10) -> list:
     # Sum over sequence dimension if present
     if feature_acts.dim() > 2:
         summed = feature_acts.sum(dim=tuple(range(feature_acts.dim() - 1)))
-    else:
+    elif feature_acts.dim() == 2:
         summed = feature_acts.sum(dim=0)
+    else:
+        summed = feature_acts
 
-    top_vals, top_indices = torch.topk(summed, k=k)
+    k_actual = min(k, summed.size(0))
+    top_vals, top_indices = torch.topk(summed, k=k_actual)
 
     return [
         {"feature": idx.item(), "activation": val.item()}
