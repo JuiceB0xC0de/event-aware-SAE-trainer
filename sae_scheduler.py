@@ -210,16 +210,6 @@ class SAESignalBuffer:
                 break
         return count
 
-    def ev_above_floor_count(self, floor: float) -> int:
-        """Count consecutive log-windows EV has been above floor."""
-        count = 0
-        for v in reversed(list(self.ev_values)):
-            if v >= floor:
-                count += 1
-            else:
-                break
-        return count
-
 
 class SAEEventControlScheduler:
     """
