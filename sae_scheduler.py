@@ -187,9 +187,6 @@ class SAESignalBuffer:
             return 0.0
         return sum(list(self.l0_values)[-window:]) / window
 
-    def ev_last(self) -> float:
-        return self.ev_values[-1] if self.ev_values else 0.0
-
     def ev_delta(self) -> float:
         if len(self.ev_values) < 2:
             return 0.0
