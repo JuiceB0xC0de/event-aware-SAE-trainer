@@ -170,10 +170,6 @@ class SAESignalBuffer:
         vals = list(self.ev_values)
         return vals[-1] - vals[-2]
 
-    def l0_error(self, target: float) -> float:
-        """L0 - target (positive = above target, negative = below target)."""
-        return self.l0_mean(window=3) - target if self.l0_values else 0.0
-
     def ev_below_floor_count(self, floor: float) -> int:
         """Count consecutive log-windows EV has been below floor."""
         count = 0
