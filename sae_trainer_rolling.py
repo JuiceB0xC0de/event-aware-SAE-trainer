@@ -141,25 +141,6 @@ def _make_sae(d_in: int, n_features: int, seed: int = 0):
             grad_log_threshold = grad_threshold * threshold
             return grad_pre, grad_log_threshold, None
 
-    class _L0Indicator(torch.autograd.Function):
-        """Step function H(pre - theta) with STE for L0 sparsity loss."""
-        @staticmethod
-        def forward(ctx, pre, log_threshold, bandwidth):
-            threshold = log_threshold.exp()
-            ctx.save_for_backward(pre, threshold)
-            ctx.bandwidth = bandwidth
-            return (pre > threshold).to(pre.dtype)
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            pre, threshold = ctx.saved_tensors
-            eps = ctx.bandwidth
-            in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
-            sum_dims = tuple(range(grad_output.ndim - 1))
-            grad_threshold = -(in_band * grad_output).sum(dim=sum_dims)
-            grad_log_threshold = grad_threshold * threshold
-            return None, grad_log_threshold, None
-
     class JumpReLUSAE(nn.Module):
         def __init__(self):
             super().__init__()
@@ -197,7 +178,7 @@ def _make_sae(d_in: int, n_features: int, seed: int = 0):
             return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
 
         def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _L0Indicator.apply(pre, self.log_threshold, STE_BANDWIDTH)
+            return (pre > self.log_threshold.exp()).to(pre.dtype)
 
         def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
             return self.W_dec(acts) + self.b_dec
