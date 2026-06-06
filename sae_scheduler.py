@@ -174,14 +174,6 @@ class SAESignalBuffer:
     def instability_score(self) -> float:
         return self.grad_norm_zscore()
 
-    def l0_std(self, window: int = 3) -> float:
-        if len(self.l0_values) < window:
-            return float('inf')
-        vals = list(self.l0_values)[-window:]
-        mean = sum(vals) / len(vals)
-        variance = sum((x - mean) ** 2 for x in vals) / len(vals)
-        return math.sqrt(variance)
-
     def l0_mean(self, window: int = 3) -> float:
         if len(self.l0_values) < window:
             return 0.0
