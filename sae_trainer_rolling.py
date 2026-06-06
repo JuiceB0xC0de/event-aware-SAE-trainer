@@ -768,7 +768,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         base_lr=LR, warmup_steps=min(LR_WARMUP_STEPS, max(1, n_steps // 5)), total_steps=n_steps,
         event_warmup_steps=5_000, instability_z_thresh=10.0,
         loss_spike_ratio=3.0, loss_spike_min_recent=50,
-        redundancy_thresh=0.98, plateau_grad_norm_thresh=1e-4,
+        plateau_grad_norm_thresh=1e-4,
         recovery_lr_factor=0.7, recovery_momentum_factor=0.5, explore_lr_factor=1.5,
         cooldown_steps=250, event_persistence=3, mode_verbose=True,
         target_l0=float(K_INIT), l0_tolerance=0.20,
