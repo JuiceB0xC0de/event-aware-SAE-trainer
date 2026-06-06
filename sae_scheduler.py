@@ -153,8 +153,11 @@ class SAESignalBuffer:
         mean = sum(vals) / len(vals)
         return sum((x - mean) ** 2 for x in vals) / len(vals)
 
-    def instability_score(self) -> float:
-        return self.grad_norm_zscore()
+    def redundancy_score(self) -> float:
+        if len(self.grad_cosines) < max(1, self.grad_cosines.maxlen // 2):
+            return 0.0
+        vals = list(self.grad_cosines)
+        return sum(vals) / len(vals)
 
     def l0_mean(self, window: int = 3) -> float:
         if len(self.l0_values) < window:
