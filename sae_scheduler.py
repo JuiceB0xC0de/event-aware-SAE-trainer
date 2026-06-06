@@ -36,11 +36,9 @@ class SAEAECSConfig:
     total_steps: int = 60000
     loss_window: int = 50
     grad_window: int = 50
-    redundancy_window: int = 20
     instability_z_thresh: float = 10.0
     loss_spike_ratio: float = 1.5          # was 1.15 -- too tight for SAE training where per-batch recon naturally bounces 20-40% in early epochs
     loss_spike_min_recent: int = 50        # window for recent_min; was hardcoded 10, too noisy at this batch size
-    redundancy_thresh: float = 0.98
     plateau_grad_norm_thresh: float = 1e-4
     recovery_lr_factor: float = 0.3
     recovery_momentum_factor: float = 0.5
@@ -105,13 +103,11 @@ class SAESignalBuffer:
     def __init__(self, window: int = 50):
         self.losses: deque = deque(maxlen=window)
         self.grad_norms: deque = deque(maxlen=window)
-        self.grad_cosines: deque = deque(maxlen=window)
         self.layer_grad_norms: deque = deque(maxlen=window)
         self.l0_values: deque = deque(maxlen=window)
         self.ev_values: deque = deque(maxlen=window)
         self.dead_pcts: deque = deque(maxlen=window)
         self.steps: int = 0
-        self._prev_grad_flat: Optional[torch.Tensor] = None
 
     def push_base(self, loss: float, grad_norm: float, layer_grad_norms=None):
         self.losses.append(loss)
@@ -126,14 +122,6 @@ class SAESignalBuffer:
             self.ev_values.append(ev)
         if dead_pct is not None:
             self.dead_pcts.append(dead_pct)
-
-    def push_grad_cosine(self, grad_flat: torch.Tensor):
-        if self._prev_grad_flat is not None:
-            cos = torch.nn.functional.cosine_similarity(
-                grad_flat, self._prev_grad_flat, dim=0
-            ).item()
-            self.grad_cosines.append(cos)
-        self._prev_grad_flat = grad_flat.clone()
 
     def loss_min_recent(self, n: int = 10) -> float:
         if len(self.losses) == 0:
@@ -164,12 +152,6 @@ class SAESignalBuffer:
         vals = list(self.grad_norms)
         mean = sum(vals) / len(vals)
         return sum((x - mean) ** 2 for x in vals) / len(vals)
-
-    def redundancy_score(self) -> float:
-        if len(self.grad_cosines) < max(1, self.grad_cosines.maxlen // 2):
-            return 0.0
-        vals = list(self.grad_cosines)
-        return sum(vals) / len(vals)
 
     def instability_score(self) -> float:
         return self.grad_norm_zscore()
@@ -554,10 +536,6 @@ class SAEEventControlScheduler:
         if recent_min > 0 and buf.losses[-1] > recent_min * cfg.loss_spike_ratio:
             return "LOSS_SPIKE"
 
-        redundancy = buf.redundancy_score()
-        if redundancy > cfg.redundancy_thresh:
-            return "REDUNDANT"
-
         if buf.grad_norm_variance() > cfg.reentry_grad_norm_tol:
             return "UNSTABLE"
 
@@ -619,7 +597,6 @@ class SAEEventControlScheduler:
             "GRADIENT_SPIKE": "RECOVERY",
             "LOSS_SPIKE": "RECOVERY",
             "UNSTABLE": "STABILIZE",
-            "REDUNDANT": "EXPLORE",
             "PLATEAU": "EXPLORE",
             "DEAD_EMERGENCY": "STABILIZE",
         }
