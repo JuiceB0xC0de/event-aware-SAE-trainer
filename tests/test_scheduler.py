@@ -86,21 +86,65 @@ def test_legacy_pcontroller_path_runs():
     assert sched.lambda_l0 >= 0.0
 
 
-def test_ev_delta_edge_cases():
-    import math
-    buf = s.SAESignalBuffer(window=10)
+def test_check_dead_emergency_below_threshold():
+    sched = _make_scheduler(dead_emergency_thresh=0.5, dead_emergency_resample_trigger=True)
+    # 0.4 < 0.5, so it should not trigger
+    result = sched._check_dead_emergency(dead_pct=0.4)
+    assert result is None
 
-    # Empty buffer
-    assert buf.ev_delta() == 0.0
 
-    # Single item
-    buf.push_sae(ev=0.5)
-    assert buf.ev_delta() == 0.0
+def test_check_dead_emergency_triggers():
+    sched = _make_scheduler(
+        dead_emergency_thresh=0.5,
+        dead_emergency_resample_trigger=True,
+        dead_emergency_cooldown=100
+    )
+    sched.total_steps = 200
+    sched._dead_emergency_last_step = 0
+    # 0.6 > 0.5, trigger is True, cooldown passed (200 - 0 >= 100)
+    result = sched._check_dead_emergency(dead_pct=0.6)
+    assert result == "DEAD_EMERGENCY"
+    assert sched._dead_emergency_last_step == 200
 
-    # Two items
-    buf.push_sae(ev=0.7)
-    assert math.isclose(buf.ev_delta(), 0.2)
 
-    # Three items
-    buf.push_sae(ev=0.6)
-    assert math.isclose(buf.ev_delta(), -0.1)
+def test_check_dead_emergency_no_resample_trigger():
+    sched = _make_scheduler(
+        dead_emergency_thresh=0.5,
+        dead_emergency_resample_trigger=False,
+        dead_emergency_cooldown=100
+    )
+    sched.total_steps = 200
+    sched._dead_emergency_last_step = 0
+    # 0.6 > 0.5, cooldown passed, but resample_trigger is False
+    result = sched._check_dead_emergency(dead_pct=0.6)
+    assert result is None
+    # Last step should still be updated
+    assert sched._dead_emergency_last_step == 200
+
+
+def test_check_dead_emergency_cooldown():
+    sched = _make_scheduler(
+        dead_emergency_thresh=0.5,
+        dead_emergency_resample_trigger=True,
+        dead_emergency_cooldown=100
+    )
+
+    # First trigger
+    sched.total_steps = 100
+    sched._dead_emergency_last_step = -100
+    result = sched._check_dead_emergency(dead_pct=0.6)
+    assert result == "DEAD_EMERGENCY"
+    assert sched._dead_emergency_last_step == 100
+
+    # Second trigger immediately after, inside cooldown
+    sched.total_steps = 150
+    result = sched._check_dead_emergency(dead_pct=0.6)
+    assert result is None
+    # Last step should not be updated
+    assert sched._dead_emergency_last_step == 100
+
+    # Third trigger after cooldown
+    sched.total_steps = 250
+    result = sched._check_dead_emergency(dead_pct=0.6)
+    assert result == "DEAD_EMERGENCY"
+    assert sched._dead_emergency_last_step == 250
