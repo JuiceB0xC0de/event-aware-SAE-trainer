@@ -11,7 +11,6 @@ Usage:
 """
 import modal
 from modal import Image, Volume
-from modal.mount import Mount
 
 # =============================================================================
 # Image definition
@@ -33,6 +32,18 @@ image = (
         "hf_transfer",
         "kagglehub",
         "wandb",
+    )
+    # Bake the local trainer modules into the image so the container
+    # always sees the working tree (Modal 1.4 dropped cls-level mounts).
+    .add_local_file(
+        "/Users/chiggy/event-aware-SAE-trainer/sae_trainer_rolling.py",
+        "/opt/sae-trainer/sae_trainer_rolling.py",
+        copy=True,
+    )
+    .add_local_file(
+        "/Users/chiggy/event-aware-SAE-trainer/sae_scheduler.py",
+        "/opt/sae-trainer/sae_scheduler.py",
+        copy=True,
     )
     .env({"SAE_DATA_DIR": "/data", "SAE_SCRATCH_DIR": "/scratch"})
 )
@@ -60,13 +71,6 @@ scratch_volume = Volume.from_name("sae-training-scratch", create_if_missing=True
 
 app = modal.App("gemma4-sae-train", image=image)
 
-
-# Mount the local trainer so container uses your updated code (with local_files_only fix)
-trainer_mount = Mount._from_local_dir(
-    local_path="/Users/chiggy/event-aware-SAE-trainer",
-    remote_path="/opt/sae-trainer",
-    condition=lambda p: p.endswith(".py"),
-)
 
 @app.cls(
     gpu="H100",
@@ -130,11 +134,14 @@ class SAETainer:
         """
         import os
         import sys
-        sys.path.insert(0, "/opt/sae-trainer")
+        import subprocess
 
+        # The trainer modules are baked into the image at /opt/sae-trainer
+        # (see Image.add_local_file above). No need to clone or patch.
+        sys.path.insert(0, "/opt/sae-trainer")
         start, end = map(int, layer_range.split(","))
 
-        # Import trainer module (mounted from local directory)
+        # Import trainer module
         from sae_trainer_rolling import run_atlas_rolling
 
         print(f"\n{'='*60}")
@@ -166,7 +173,6 @@ class SAETainer:
         )
 
         # Commit volumes
-        import subprocess
         subprocess.run(["sync"])
 
         return {"status": "complete", "layers": list(range(start, end)), "results": results}

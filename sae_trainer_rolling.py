@@ -1220,7 +1220,6 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     print(f"Loading {MODEL_ID} ...")
     from transformers import AutoTokenizer
     # Detect if MODEL_ID is a local path
-    import os
     is_local = os.path.isdir(MODEL_ID)
     tokenizer_kwargs = {"token": hf_token} if not is_local else {}
     if is_local:
