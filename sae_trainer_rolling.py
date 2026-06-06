@@ -35,6 +35,8 @@ $SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
+__version__ = "0.1.0"
+
 import math
 import os
 from pathlib import Path
@@ -77,7 +79,8 @@ N_FEATURES    = EXPANSION * D_IN   # 49152 at d_in=1536; recomputed for the dete
 K             = 500         # FINAL target L0. Natural L0 settles ~550 at 32x; target<natural keeps lambda slightly positive.
 K_INIT        = 500         # Curriculum disabled (== K)
 K_CURRICULUM_STEPS = 1      # effectively disabled (target_l0 = K from step 1)
-BATCH_TOKENS  = 32_768      # total tokens per SAE step
+BATCH_TOKENS  = 32_768      # total tokens per SAE step (accumulated across microbatches if --accum-steps > 1)
+MICROBATCH_TOKENS = 32_768  # tokens per microbatch for gradient accumulation; default = no accumulation
 SEQ_LEN       = 2_048       # length passed to the model (attention is O(seq^2))
 N_STEPS       = 15_000      # peak-EV early-stop usually fires well before this
 LR            = 2e-4
@@ -586,12 +589,16 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
 # ===========================================================================
 
 class RollingActivationProvider:
-    """Yields [BATCH_TOKENS, D_IN] float activations on device from pool[L] shards.
-    Background thread prefetches the next shard so the SAE hot loop never waits."""
+    """Yields [BATCH_TOKENS, D_IN] bf16 activations on device from pool[L] shards.
+    Background thread prefetches the next shard so the SAE hot loop never waits.
+
+    Supports checkpoint resume via get_state()/restore_state() -- tracks the current
+    shard cursor and consumed shards so training can resume at the exact position.
+    """
 
     def __init__(self, pool_dir: Path, device, seed=0, queue_size=4):
         import threading, queue as _queue
-        self.paths = _shard_paths(pool_dir)
+        self.paths = sorted(_shard_paths(pool_dir))
         if not self.paths:
             raise RuntimeError(f"No pool shards in {pool_dir}")
         self.device = device
@@ -600,24 +607,50 @@ class RollingActivationProvider:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
+        # State for resume: current position in the shuffled order
+        self._current_order = list(range(len(self.paths)))
+        self._cursor = 0
+        self._consumed = set()
+        self._lock = threading.Lock()
 
     def _worker(self):
         import random as _random
         import torch
         rng = _random.Random(self.seed * 7919)
-        order = list(range(len(self.paths)))
         while not self._stop.is_set():
-            rng.shuffle(order)
-            for idx in order:
-                if self._stop.is_set():
-                    return
-                t = torch.load(self.paths[idx], map_location="cpu", weights_only=True)  # [n_seqs,SEQ_LEN,d] bf16
-                t = t.reshape(-1, t.shape[-1]).pin_memory()
-                self._q.put(t)
+            with self._lock:
+                if self._cursor >= len(self.paths):
+                    # Reshuffle for a new epoch
+                    rng.shuffle(self._current_order)
+                    self._cursor = 0
+                    self._consumed.clear()
+                idx = self._current_order[self._cursor]
+                self._cursor += 1
+                self._consumed.add(idx)
+            path = self.paths[idx]
+            t = torch.load(path, map_location="cpu", weights_only=True)  # [n_seqs,SEQ_LEN,d] bf16
+            t = t.reshape(-1, t.shape[-1]).pin_memory()
+            self._q.put(t)
 
     def next_batch(self):
         t = self._q.get()
-        return t.to(self.device, non_blocking=True).float()        # [BATCH_TOKENS, D_IN]
+        return t.to(self.device, non_blocking=True)        # [BATCH_TOKENS, D_IN] bf16
+
+    def get_state(self):
+        """Return provider state for checkpoint resume."""
+        with self._lock:
+            return {
+                "current_order": self._current_order.copy(),
+                "cursor": self._cursor,
+                "consumed": list(self._consumed),
+            }
+
+    def restore_state(self, state):
+        """Restore provider state from a checkpoint."""
+        with self._lock:
+            self._current_order = state.get("current_order", list(range(len(self.paths))))
+            self._cursor = state.get("cursor", 0)
+            self._consumed = set(state.get("consumed", []))
 
     def close(self):
         self._stop.set()
@@ -632,19 +665,84 @@ class RollingActivationProvider:
 #  SAE training body  (trains one JumpReLU SAE on cached activations)
 # ===========================================================================
 
-def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=False,
-                             max_steps=N_STEPS, bdec_batches=BDEC_INIT_BATCHES, push=True):
-    """Train one JumpReLU SAE on activations supplied by `provider` (which yields
-    pre-extracted [BATCH_TOKENS, d_in] batches). Faithful port of the legacy loop
-    minus the in-loop transformer forward. Returns final metrics dict.
+def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
+                          feature_fire_counts, steps_since_fired, provider_state):
+    """Save a complete checkpoint: model, optimizer, scheduler, RNG, dead-feature stats."""
+    import torch
+    ckpt = {
+        "step": step,
+        "sae_state": {k: v.cpu().clone() for k, v in sae.state_dict().items()},
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": {
+            "lambda_l0": scheduler.lambda_l0,
+            "mode": scheduler.mode,
+            "mode_steps": scheduler.mode_steps,
+            "total_steps": scheduler.total_steps,
+            "event_counter": scheduler.event_counter,
+            "transition_log": scheduler.transition_log[-100:],  # last 100 transitions
+            "_lambda_history": scheduler._lambda_history,
+        },
+        "rng_state": rng_states,
+        "feature_fire_counts": feature_fire_counts.cpu().clone(),
+        "steps_since_fired": steps_since_fired.cpu().clone(),
+        "provider_state": provider_state,
+    }
+    ckpt_path = out_dir / "checkpoint_full.pt"
+    torch.save(ckpt, ckpt_path)
+    return ckpt_path
 
-    max_steps: cap training steps (default N_STEPS); used for smoke tests."""
+
+def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
+    """Load a full checkpoint, returning (step, rng_states, feature_fire_counts,
+    steps_since_fired, provider_state) or None if loading fails."""
+    import torch
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        sae.load_state_dict({k: v.to(device) for k, v in ckpt["sae_state"].items()})
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        sched_state = ckpt["scheduler_state"]
+        scheduler.lambda_l0 = sched_state["lambda_l0"]
+        scheduler.mode = sched_state["mode"]
+        scheduler.mode_steps = sched_state["mode_steps"]
+        scheduler.total_steps = sched_state["total_steps"]
+        scheduler.event_counter = sched_state["event_counter"]
+        scheduler.transition_log = sched_state["transition_log"]
+        scheduler._lambda_history = sched_state.get("_lambda_history", [])
+        return {
+            "step": ckpt["step"],
+            "rng_state": ckpt["rng_state"],
+            "feature_fire_counts": ckpt["feature_fire_counts"].to(device),
+            "steps_since_fired": ckpt["steps_since_fired"].to(device),
+            "provider_state": ckpt.get("provider_state"),
+        }
+    except Exception as e:
+        print(f"  WARNING: checkpoint load failed ({e})")
+        return None
+
+
+def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=False,
+                             max_steps=N_STEPS, bdec_batches=BDEC_INIT_BATCHES,
+                             microbatch_tokens=MICROBATCH_TOKENS,
+                             resume_from=None, push=True):
+    """Train one JumpReLU SAE on activations supplied by `provider`.
+
+    Gradient accumulation: if `microbatch_tokens < BATCH_TOKENS`, accumulate gradients
+    over `BATCH_TOKENS // microbatch_tokens` microbatches before stepping.
+
+    Resume: if `resume_from` points to a `checkpoint_full.pt`, restore model,
+    optimizer, scheduler, RNG, and dead-feature stats.
+
+    bf16 path: activations are kept in bf16 through the forward; loss/reductions in fp32.
+    """
     import json, math, time, threading
     import torch
     import torch.nn as nn
     from sae_scheduler import SAEAECSConfig, SAEEventControlScheduler
 
     n_steps = int(min(max_steps, N_STEPS))
+    accum_steps = BATCH_TOKENS // microbatch_tokens
+    assert BATCH_TOKENS % microbatch_tokens == 0, \
+        f"BATCH_TOKENS ({BATCH_TOKENS}) must be divisible by microbatch_tokens ({microbatch_tokens})"
 
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -680,8 +778,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # -- wandb ----------------------------------------------------------------
     use_wandb = False
     wandb = None
-    # Off unless a project is configured (--wandb-project / $WANDB_PROJECT) AND a key
-    # is present. Never auto-init to a named project.
     if WANDB_PROJECT and os.environ.get("WANDB_API_KEY"):
         try:
             import wandb as _wandb
@@ -694,14 +790,19 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         reinit="finish_previous",
                         config={"layer": layer, "seed": seed, "model_id": MODEL_ID,
                                 "n_features": N_FEATURES, "k": K, "batch_tokens": BATCH_TOKENS,
-                                "lr": LR, "n_steps": N_STEPS, "tier": tier})
+                                "microbatch_tokens": microbatch_tokens, "accum_steps": accum_steps,
+                                "lr": LR, "n_steps": N_STEPS, "tier": tier, "resume_from": resume_from})
             wandb = _wandb
             use_wandb = True
             print(f"  WandB: {wandb.run.url}")
         except Exception as e:
             print(f"  WARNING: wandb init failed ({e})")
 
-    print(f"\n{'='*60}\nROLLING SAE  layer={layer}  seed={seed}  tier={tier}  d_in={d_in}\n{'='*60}")
+    print(f"\n{'='*60}\nROLLING SAE  layer={layer}  seed={seed}  tier={tier}  d_in={d_in}")
+    print(f"  accum_steps={accum_steps} (microbatch={microbatch_tokens//1024}k tokens)")
+    if resume_from:
+        print(f"  resume_from={resume_from}")
+    print(f"{'='*60}")
 
     sae = _make_sae(d_in, N_FEATURES, seed).to(device)
     if frozen_decoder:
@@ -715,24 +816,44 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         lr=LR, betas=(0.9, 0.999), fused=True)
     scheduler = SAEEventControlScheduler(optimizer, sae_cfg, mode_label=f"L{layer:02d}")
 
-    # -- b_dec init from provider activations ---------------------------------
-    print(f"Estimating b_dec from {bdec_batches} batches ...")
-    acc = torch.zeros(d_in, device=device, dtype=torch.float32)
-    n_acc = 0
-    for _ in range(bdec_batches):
-        a = provider.next_batch()
-        acc += a.sum(dim=0)
-        n_acc += a.shape[0]
-    if n_acc > 0:
-        with torch.no_grad():
-            sae.b_dec.copy_(acc / n_acc)
-        print(f"  b_dec set from {n_acc} tokens, ||b_dec||={sae.b_dec.norm().item():.4f}")
+    # -- Resume from checkpoint -----------------------------------------------
+    start_step = 1
+    feature_fire_counts = torch.zeros(N_FEATURES, device=device, dtype=torch.long)
+    steps_since_fired = torch.zeros(N_FEATURES, device=device, dtype=torch.long)
+    err_buffer = []
+
+    if resume_from and Path(resume_from).exists():
+        loaded = _load_full_checkpoint(resume_from, sae, optimizer, scheduler, device)
+        if loaded:
+            start_step = loaded["step"] + 1
+            feature_fire_counts = loaded["feature_fire_counts"]
+            steps_since_fired = loaded["steps_since_fired"]
+            # Restore RNG states
+            if "cuda" in loaded["rng_state"]:
+                torch.cuda.set_rng_state(loaded["rng_state"]["cuda"])
+            if "cpu" in loaded["rng_state"]:
+                torch.set_rng_state(loaded["rng_state"]["cpu"])
+            print(f"  Resumed from step {start_step}, lambda={scheduler.lambda_l0:.3e}, mode={scheduler.mode}")
+            # Tell provider to resume at the right cursor if it supports it
+            if loaded.get("provider_state"):
+                provider.restore_state(loaded["provider_state"])
+
+    # -- b_dec init from provider activations (skip if resumed) ---------------
+    if start_step == 1:
+        print(f"Estimating b_dec from {bdec_batches} batches ...")
+        acc = torch.zeros(d_in, device=device, dtype=torch.float32)
+        n_acc = 0
+        for _ in range(bdec_batches):
+            a = provider.next_batch()
+            acc += a.sum(dim=0)
+            n_acc += a.shape[0]
+        if n_acc > 0:
+            with torch.no_grad():
+                sae.b_dec.copy_(acc / n_acc)
+            print(f"  b_dec set from {n_acc} tokens, ||b_dec||={sae.b_dec.norm().item():.4f}")
 
     metrics = {"recon_loss": [], "mean_l0": [], "dead_pct": [], "resampled": [],
                "ev": [], "nonlinear_err": [], "linear_err": []}
-    steps_since_fired = torch.zeros(N_FEATURES, device=device, dtype=torch.long)
-    feature_fire_counts = torch.zeros(N_FEATURES, device=device, dtype=torch.long)
-    err_buffer = []
     total_resampled = 0
     log_window_start = time.time()
     log_window_tokens = 0
@@ -781,41 +902,71 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         sae_cfg.target_l0 = float(K)  # curriculum disabled (K_INIT==K)
 
-        acts = provider.next_batch()   # [BATCH_TOKENS, d_in] float, on device
-
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pre = sae.encode_pre(acts)
-            feat_acts = sae.apply_jumprelu(pre)
-            x_hat = sae.decode(feat_acts)
-            recon_loss = (acts.float() - x_hat.float()).pow(2).mean()
-            gate = sae.l0_indicator(pre)
-            l0 = gate.sum(dim=-1).float().mean()
-            slack = (l0 - sae_cfg.target_l0).clamp(min=0.0)
-            sparsity_loss = scheduler.lambda_l0 * slack + 0.5 * sae_cfg.al_mu * slack * slack
-
-            # Sparse + guarded aux loss: aux tensors restricted to dead columns only
-            # ([B, n_dead] not [B, n_features]); matmul scales with dead count, not the
-            # full dictionary. Skipped entirely when no features are dead. See v2 for notes.
-            dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
-            n_dead = int(dead_mask_aux.sum().item())
-            if n_dead > 0:
-                dead_indices = torch.where(dead_mask_aux)[0]               # [n_dead]
-                pre_dead = pre[:, dead_indices].relu()                    # [B, n_dead]
-                eff_k = min(AUX_K, n_dead)
-                topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
-                aux_acts = torch.zeros_like(pre_dead)
-                aux_acts.scatter_(-1, topk_idx, topk_vals)
-                W_dec_dead = sae.W_dec.weight.t()[dead_indices]           # [n_dead, d_in]
-                x_aux = aux_acts @ W_dec_dead                             # [B, d_in]
-                residual_target = acts.float() - x_hat.detach().float()
-                aux_loss = (residual_target - x_aux.float()).pow(2).mean()
-            else:
-                aux_loss = torch.zeros((), device=acts.device, dtype=torch.float32)
-
-            loss = recon_loss + sparsity_loss + AUX_COEFF * aux_loss
-
+        # Gradient accumulation: accumulate over microbatches before stepping
         optimizer.zero_grad()
-        loss.backward()
+        accum_recon_loss = 0.0
+        accum_l0 = 0.0
+        accum_sparsity_loss = 0.0
+        accum_aux_loss = 0.0
+
+        # Get full batch and split into microbatches for accumulation
+        full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16
+        full_batch_device = full_batch.to(device)
+        microbatch_size = microbatch_tokens  # tokens per microbatch
+
+        # Compute a single full-batch L0 and sparsity penalty for the whole accumulation
+        with torch.no_grad():
+            full_pre = sae.encode_pre(full_batch_device)
+            full_gate = sae.l0_indicator(full_pre)
+            l0_full = full_gate.sum(dim=-1).float().mean()
+            slack = (l0_full - sae_cfg.target_l0).clamp(min=0.0)
+            sparsity_loss_full = (
+                scheduler.lambda_l0 * slack
+                + 0.5 * sae_cfg.al_mu * slack * slack
+            ) / accum_steps
+
+        for accum_idx in range(accum_steps):
+            start_idx = accum_idx * microbatch_size
+            end_idx = start_idx + microbatch_size
+            acts_mb = full_batch_device[start_idx:end_idx]  # bf16, [microbatch_tokens, d_in]
+
+            # bf16 forward: keep activations in bf16, cast only for loss computation
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pre = sae.encode_pre(acts_mb)
+                feat_acts = sae.apply_jumprelu(pre)
+                x_hat = sae.decode(feat_acts)
+
+                # Cast to fp32 only for loss computation (numerical stability)
+                recon_loss = (acts_mb.float() - x_hat.float()).pow(2).mean() / accum_steps
+                sparsity_loss = sparsity_loss_full
+
+                # Aux loss for dead features (scaled by accum_steps)
+                dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
+                n_dead = int(dead_mask_aux.sum().item())
+                if n_dead > 0:
+                    dead_indices = torch.where(dead_mask_aux)[0]
+                    pre_dead = pre[:, dead_indices].relu()
+                    eff_k = min(AUX_K, n_dead)
+                    topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
+                    aux_acts = torch.zeros_like(pre_dead)
+                    aux_acts.scatter_(-1, topk_idx, topk_vals)
+                    W_dec_dead = sae.W_dec.weight.t()[dead_indices]
+                    x_aux = aux_acts @ W_dec_dead
+                    residual_target = acts_mb.float() - x_hat.detach().float()
+                    aux_loss = ((residual_target - x_aux.float()).pow(2).mean() * AUX_COEFF) / accum_steps
+                else:
+                    aux_loss = torch.zeros((), device=acts_mb.device, dtype=torch.float32)
+
+                loss = recon_loss + sparsity_loss + aux_loss
+
+            loss.backward()
+
+            accum_recon_loss += recon_loss.detach().item() * accum_steps
+            accum_l0 += l0_full.detach().item()
+            accum_sparsity_loss += sparsity_loss.detach().item() * accum_steps
+            accum_aux_loss += aux_loss.detach().item() * accum_steps
+
+        # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
         optimizer.step()
         if not frozen_decoder:
@@ -824,8 +975,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             enc_norms = sae.W_enc.weight.norm(dim=1, keepdim=True).clamp(min=1e-8)
             sae.W_enc.weight.div_(enc_norms)
 
+        # Use accumulated values for logging
+        recon_loss = torch.tensor(accum_recon_loss / accum_steps, device=device)
+        l0 = torch.tensor(accum_l0 / accum_steps, device=device)  # average L0 across microbatches
+
         with torch.no_grad():
-            fired = (feat_acts > 0).any(dim=0)
+            # Compute fired features across the full accumulated batch
+            full_pre = sae.encode_pre(full_batch.to(device))
+            full_feat = sae.apply_jumprelu(full_pre)
+            fired = (full_feat > 0).any(dim=0)
             steps_since_fired += 1
             steps_since_fired[fired] = 0
             feature_fire_counts += fired.long()
@@ -846,9 +1004,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         next_resample_step = min((s for s in RESAMPLE_STEPS if s >= step), default=None)
         if next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64:
             with torch.no_grad():
-                per_token_err = (acts.float() - x_hat.detach().float()).pow(2).sum(dim=-1)
+                per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
                 top_err_idx = per_token_err.topk(min(64, len(per_token_err))).indices
-                err_buffer.append(acts[top_err_idx].detach().cpu())
+                err_buffer.append(full_batch[top_err_idx].detach().cpu())
                 if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
                     err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
 
@@ -867,36 +1025,21 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             print(f"  [RESAMPLE @ {step}] reinit {n_res}/{n_dead} dead")
             err_buffer = []
 
-        metrics_t = torch.stack([recon_loss.detach(), grad_norm_t, l0.detach()])
-        recon_val, grad_norm_val, l0_val = metrics_t.tolist()
+        recon_val = recon_loss.detach().item()
+        grad_norm_val = grad_norm_t.item()
+        l0_val = l0.detach().item()
 
         is_log_step = (step % LOG_EVERY == 0)
         if is_log_step:
             dead = (steps_since_fired >= LOG_EVERY).float().mean().item() * 100
             with torch.no_grad():
-                acts_f = acts.float()
-                total_var = (acts_f - acts_f.mean(dim=0, keepdim=True)).pow(2).mean().item()
+                total_var = full_batch.float().var()
                 ev = 1.0 - (recon_val / total_var) if total_var > 0 else 0.0
         else:
             dead = None; ev = None
 
         scheduler.step({"loss": recon_val, "grad_norm": grad_norm_val,
                         "l0": l0_val, "ev": ev, "dead_pct": dead})
-
-        if step % CHECKPOINT_EVERY == 0 and step > 0:
-            ckpt_dir = Path(SAE_DIR) / f"layer_{layer:02d}_s{seed}{out_suffix}_latest"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            payload = {"step": step,
-                       "sae_state": {k: v.detach().cpu() for k, v in sae.state_dict().items()},
-                       "lambda_l0": scheduler.lambda_l0, "layer": layer, "seed": seed,
-                       "tier": tier, "d_in": d_in, "n_features": N_FEATURES,
-                       "target_l0_final": K, "total_tokens": step * BATCH_TOKENS,
-                       "path": "rolling"}
-            def _save(p, path):
-                torch.save(p, path)
-            threading.Thread(target=_save, args=(payload, ckpt_dir / "checkpoint.pt"),
-                             daemon=True).start()
-            print(f"  [CKPT @ {step}] -> {ckpt_dir}/checkpoint.pt")
 
         if step % LOG_EVERY == 0:
             with torch.no_grad():
@@ -984,7 +1127,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             "training_curve": metrics}
     with open(out_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"Saved: {out_dir}/sae.pt + meta.json")
+
+    # Save full checkpoint at layer completion (for resume if interrupted between layers)
+    rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
+    provider_state = provider.get_state() if hasattr(provider, "get_state") else None
+    _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
+                          feature_fire_counts.clone(), steps_since_fired.clone(), provider_state)
+
+    print(f"Saved: {out_dir}/sae.pt + meta.json + checkpoint_full.pt")
 
     if push and SAE_HUB_ID:
         from huggingface_hub import HfApi
@@ -1018,14 +1168,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 # ===========================================================================
 
 def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFAULT_SEED,
-                      pool_batches: int = POOL_BATCHES_DEFAULT, use_pretok: bool = True,
-                      max_steps: int = N_STEPS, bdec_batches: int = BDEC_INIT_BATCHES,
+                      pool_batches: int = POOL_BATCHES_DEFAULT, microbatch_tokens: int = None,
+                      use_pretok: bool = True, max_steps: int = N_STEPS,
+                      bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
                       hub_id: str = None, wandb_project: str = None, expansion: int = None):
     """Train one SAE per decoder layer in [start_layer, end_layer).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
              "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized).
+    pool_batches: activation batches cached per layer (default 4000; use 500-1000 for limited disk)
+    microbatch_tokens: tokens per microbatch for gradient accumulation (default = no accum)
+    resume_from: path to checkpoint_full.pt to resume from
     model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
     max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
     import time
@@ -1136,8 +1290,15 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
         provider = RollingActivationProvider(dst_dir, device, seed=seed)
         try:
+            # Determine resume checkpoint for this layer
+            layer_resume = None
+            if resume_from:
+                # Check if the checkpoint is for this specific layer
+                layer_resume = resume_from
             res = train_sae_on_activations(L, d_in, seed, provider,
-                                           max_steps=max_steps, bdec_batches=bdec_batches, push=push)
+                                           max_steps=max_steps, bdec_batches=bdec_batches,
+                                           microbatch_tokens=microbatch_tokens or MICROBATCH_TOKENS,
+                                           resume_from=layer_resume, push=push)
         finally:
             provider.close()
         results[f"layer_{L:02d}"] = res
@@ -1173,7 +1334,12 @@ def main():
     p.add_argument("--expansion", type=int, default=None,
                    help=f"SAE dict = expansion * d_in (default {EXPANSION})")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    p.add_argument("--pool-batches", type=int, default=POOL_BATCHES_DEFAULT)
+    p.add_argument("--pool-batches", type=int, default=POOL_BATCHES_DEFAULT,
+                   help="Activation batches cached per layer. Default=4000 (~400GB). Use 500-1000 for limited disk (~50-100GB).")
+    p.add_argument("--microbatch-tokens", type=int, default=MICROBATCH_TOKENS,
+                   help=f"Tokens per microbatch for gradient accumulation. Default={MICROBATCH_TOKENS//1024}k (no accum). Use 8192 for 4x VRAM savings.")
+    p.add_argument("--resume-from", type=str, default=None,
+                   help="Path to checkpoint_full.pt to resume training from.")
     p.add_argument("--no-pretok", dest="use_pretok", action="store_false",
                    help="stream + tokenize FineWeb-Edu live instead of using pre-tokenized shards")
     p.add_argument("--max-steps", type=int, default=N_STEPS, help="cap steps (smoke tests)")
@@ -1189,10 +1355,11 @@ def main():
 
     res = run_atlas_rolling(
         start_layer=args.start_layer, end_layer=args.end_layer, seed=args.seed,
-        pool_batches=args.pool_batches, use_pretok=args.use_pretok,
-        max_steps=args.max_steps, bdec_batches=args.bdec_batches, push=args.push,
-        capture=args.capture, model_id=args.model_id, hub_id=args.hub_id,
-        wandb_project=args.wandb_project, expansion=args.expansion)
+        pool_batches=args.pool_batches, microbatch_tokens=args.microbatch_tokens,
+        use_pretok=args.use_pretok, max_steps=args.max_steps, bdec_batches=args.bdec_batches,
+        resume_from=args.resume_from, push=args.push, capture=args.capture,
+        model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
+        expansion=args.expansion)
     print(f"\nDone. {res}")
 
 

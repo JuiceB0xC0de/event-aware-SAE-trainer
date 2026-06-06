@@ -12,8 +12,9 @@ SAE extension: LAMBDA_L0 as a second actuator, responding to:
 
 Two control loops, one event detection engine.
 """
-
 from __future__ import annotations
+
+__version__ = "0.1.0"
 
 import math
 from collections import deque

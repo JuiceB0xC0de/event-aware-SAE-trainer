@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-aware-sae-trainer"
+version = "0.1.0"
+description = "Self-tuning sparse autoencoder trainer for language model interpretability research"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Rick", email = "rick@example.com" }
+]
+keywords = [
+    "sparse-autoencoder",
+    "interpretability",
+    "language-models",
+    "pytorch",
+    "huggingface",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.5.0",
+    "transformers>=4.51.0",
+    "accelerate",
+    "datasets>=2.20.0",
+    "numpy",
+    "tqdm",
+    "sentencepiece",
+    "protobuf",
+    "huggingface_hub",
+    "hf_transfer",
+    "wandb",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+sae-train = "sae_trainer_rolling:main"
+
+[project.urls]
+Homepage = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
+Repository = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
+
+[tool.setuptools]
+py-modules = ["sae_trainer_rolling", "sae_scheduler", "operator_atoms"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: marks tests as requiring CUDA GPU",
+    "slow: marks tests as slow (may require network/model download)",
+]

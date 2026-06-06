@@ -1,5 +1,9 @@
 # event-aware-sae-trainer
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![pip installable](https://img.shields.io/badge/pip-installable-green)](https://pypi.org/)
+
 Train a sparse autoencoder (SAE) on **every decoder layer of any Hugging Face language
 model — in a single, unattended run.** No per-layer hyperparameter retuning, no
 restart-and-retune loop. The scheduler watches the training signal and adjusts itself.
@@ -40,10 +44,15 @@ activation batches. **How activations are captured is pluggable (`--capture`):**
 | `sae_trainer_rolling.py` | The trainer — scheduler-driven training loop, SAE arch, datasets, both capture backends, CLI. |
 | `sae_scheduler.py`       | The event-aware scheduler (AECS modes + Augmented-Lagrangian λ control). |
 | `examples/configs.py`    | Example expansion / sparsity configs. |
+| `examples/use_trained_sae.py` | Load a trained SAE and inspect feature activations. |
 
 ## Install
 
 ```bash
+# Development install (editable)
+pip install -e .
+
+# Or from requirements
 pip install -r requirements.txt
 ```
 
@@ -75,6 +84,21 @@ python sae_trainer_rolling.py --model-id Qwen/Qwen2.5-1.5B --hub-id me/qwen-saes
 python sae_trainer_rolling.py --start-layer 0 --end-layer 2 --max-steps 500 --no-pretok
 ```
 
+### Hobbyist presets (limited VRAM / disk)
+
+```bash
+# 24GB VRAM, 100GB disk: 4x gradient accumulation, smaller pool
+python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B \
+    --microbatch-tokens 8192 --pool-batches 1000 --end-layer 8
+
+# Resume from checkpoint after preemption/interruption
+python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it \
+    --resume-from ./data/saes/layer_03_s0_latest/checkpoint_full.pt
+
+# Ultra-low disk (50GB): train with 500 batches, more epoching
+python sae_trainer_rolling.py --pool-batches 500 --end-layer 4
+```
+
 `python sae_trainer_rolling.py --help` lists every flag.
 
 ## Key hyperparameters
@@ -83,12 +107,28 @@ python sae_trainer_rolling.py --start-layer 0 --end-layer 2 --max-steps 500 --no
 |-------|---------|-------|
 | `--expansion` | `32` | SAE dict size = `expansion × d_in` |
 | `K` (target L0) | `500` | the constraint the scheduler converges to |
-| `BATCH_TOKENS` | `32_768` | tokens per SAE step |
+| `BATCH_TOKENS` | `32_768` | tokens per SAE step (accumulated across microbatches) |
+| `--microbatch-tokens` | `32_768` | tokens per microbatch; use 8192 for 4x VRAM savings |
 | `SEQ_LEN` | `2_048` | sequence length into the model |
 | `AUX_K` | `128` | dead features revived per token via the aux loss |
-| `--pool-batches` | `4000` | activation batches cached per layer |
+| `--pool-batches` | `4000` | activation batches cached per layer (~400GB); use 500-1000 for ~50-100GB |
 
 `d_in` is **not** a hyperparameter — it's read from the model config.
+
+## Checkpoint resume
+
+At the end of each layer, training saves `checkpoint_full.pt` with:
+- Model weights (`sae_state`)
+- Optimizer state (`optimizer_state`)
+- Scheduler state (lambda, mode, event history)
+- RNG states (CUDA + CPU)
+- Dead-feature stats (`steps_since_fired`, `feature_fire_counts`)
+- Activation provider cursor (resumes at exact position in shuffled pool)
+
+To resume after interruption:
+```bash
+python sae_trainer_rolling.py --resume-from ./data/saes/layer_03_s0_latest/checkpoint_full.pt
+```
 
 ## Tests
 
