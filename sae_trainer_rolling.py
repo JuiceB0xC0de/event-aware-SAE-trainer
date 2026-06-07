@@ -865,11 +865,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         cooldown_steps=250, event_persistence=3, mode_verbose=True,
         target_l0=float(K_INIT), l0_tolerance=0.20,
         use_augmented_lagrangian=True, lambda_l0_init=0.0, lambda_l0_min=0.0,
-        # E4B-tuned: the old 5e-3 cap pinned lambda, L0 plateaued at ~730 vs target 500.
-        # Cranked lambda ceiling, boosted mu for quadratic curvature at large slack,
-        # faster integrator. L0 should swing through the target; each pass gives EV
-        # a chance to converge. Live-tune dials let you crank higher if it stalls.
-        lambda_l0_max=0.1, al_mu=5e-5, al_dual_step=2e-8, al_log_every=LOG_EVERY,
+        # E4B-tuned: threshold nudge + wider STE bandwidth for L0 descent.
+        # Lambda ceiling at 1.0 — the nudge does the heavy lifting on threshold,
+        # lambda provides supporting gradient pressure through the STE channel.
+        lambda_l0_max=1.0, al_mu=5e-5, al_dual_step=2e-8, al_log_every=LOG_EVERY,
         ev_floor=0.0, ev_floor_patience=10**9, ev_drop_thresh=-1.0,
         ev_stop_thresh=0.88, ev_stop_patience=3,
         dead_emergency_thresh=20.0, dead_emergency_cooldown=5000,

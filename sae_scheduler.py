@@ -146,15 +146,15 @@ class SAEAECSConfig:
     # applied to log_threshold of ALL features (not just near-threshold ones).
     # Positive nudge pushes threshold up → fewer features fire → lower L0.
     # Set nudge_gain=0.0 to disable.
-    threshold_nudge_gain: float = 0.0       # proportional gain (0 = disabled)
+    threshold_nudge_gain: float = 0.08      # proportional gain (0 = disabled; 0.08 for E4B)
     threshold_nudge_every: int = 50          # apply every N steps
-    threshold_nudge_l0_min: float = 600.0   # only nudge when L0 > this (don't overshoot)
+    threshold_nudge_l0_min: float = 550.0   # only nudge when L0 > this (buffer below target)
 
     # -- STE bandwidth (gradient channel width) ---------------------------------
-    # Default 0.1 matches the JumpReLU paper. Widen (e.g. 0.3-0.5) to give
+    # Default 0.1 matches the JumpReLU paper. Widen (e.g. 0.2-0.3) to give
     # gradient signal to more features near threshold when L0 is stuck.
     # Live-tuneable: write {"ste_bandwidth": 0.3} to live_tune.json.
-    ste_bandwidth: float = 0.1
+    ste_bandwidth: float = 0.2
 
     # -- Live-tune dials (runtime overrides via JSON file) --------------------
     # Write a JSON file to this path with any of these keys to override at runtime:
