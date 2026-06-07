@@ -136,9 +136,30 @@ class SAEAECSConfig:
     stall_abs_progress_floor: float = 0.05
     stall_dead_suppress_pct: float = 12.0
 
+    # -- Direct threshold nudge (bypasses STE gradient bottleneck) ------------
+    # When L0 is far above target, the JumpReLU STE only gives gradient to
+    # features whose pre-activations are near the threshold.  Features far
+    # above threshold are "stuck on" — the gradient can't reach them.
+    # The threshold nudge directly steps log_threshold based on L0 error,
+    # bypassing the STE entirely.  This is a proportional controller:
+    #   nudge = nudge_gain * (L0 - target) / L0
+    # applied to log_threshold of ALL features (not just near-threshold ones).
+    # Positive nudge pushes threshold up → fewer features fire → lower L0.
+    # Set nudge_gain=0.0 to disable.
+    threshold_nudge_gain: float = 0.0       # proportional gain (0 = disabled)
+    threshold_nudge_every: int = 50          # apply every N steps
+    threshold_nudge_l0_min: float = 600.0   # only nudge when L0 > this (don't overshoot)
+
+    # -- STE bandwidth (gradient channel width) ---------------------------------
+    # Default 0.1 matches the JumpReLU paper. Widen (e.g. 0.3-0.5) to give
+    # gradient signal to more features near threshold when L0 is stuck.
+    # Live-tuneable: write {"ste_bandwidth": 0.3} to live_tune.json.
+    ste_bandwidth: float = 0.1
+
     # -- Live-tune dials (runtime overrides via JSON file) --------------------
     # Write a JSON file to this path with any of these keys to override at runtime:
-    #   lambda_l0_max, al_mu, al_dual_step, target_l0, lambda_l0_override
+    #   lambda_l0_max, al_mu, al_dual_step, target_l0, lambda_l0_override,
+    #   ste_bandwidth, threshold_nudge_gain
     # The scheduler picks up changes every live_tune_every steps.
     # Set to None or "" to disable. Set to a path like "live_tune.json" to enable.
     live_tune_path: Optional[str] = None
@@ -841,6 +862,8 @@ class SAEEventControlScheduler:
         "l0_tolerance": float,
         "constraint_lr_floor": float,
         "lambda_l0_override": float,  # directly set lambda, bypasses integrator
+        "ste_bandwidth": float,        # widen STE gradient channel (default 0.1)
+        "threshold_nudge_gain": float, # direct threshold stepping gain (0 = disabled)
     }
 
     def _apply_live_tune(self):

@@ -193,6 +193,10 @@ def _ensure_sae_classes():
             self.log_threshold = nn.Parameter(
                 torch.full((n_features,), math.log(INIT_THRESHOLD))
             )
+            # STE bandwidth as a mutable instance attribute so it can be
+            # overridden at runtime (live-tune knob for widening the gradient
+            # channel).  Default matches the module constant.
+            self.ste_bandwidth = STE_BANDWIDTH
             # W_dec orthonormal, W_enc tied to W_dec.T at init (Anthropic recipe)
             nn.init.orthogonal_(self.W_dec.weight)
             self._normalize_decoder()
@@ -208,16 +212,16 @@ def _ensure_sae_classes():
 
         def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
             pre = self.W_enc(x - self.b_dec)
-            return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
+            return _JumpReLU.apply(pre, self.log_threshold, self.ste_bandwidth)
 
         def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
             return self.W_enc(x - self.b_dec)
 
         def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
+            return _JumpReLU.apply(pre, self.log_threshold, self.ste_bandwidth)
 
         def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _L0Indicator.apply(pre, self.log_threshold, STE_BANDWIDTH)
+            return _L0Indicator.apply(pre, self.log_threshold, self.ste_bandwidth)
 
         def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
             return self.W_dec(acts) + self.b_dec
@@ -725,6 +729,8 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
         "stall_fast_alpha", "stall_slow_alpha",
         "stall_crossover_ratio", "stall_min_slow_progress",
         "stall_abs_progress_floor", "stall_dead_suppress_pct",
+        "threshold_nudge_gain", "threshold_nudge_every", "threshold_nudge_l0_min",
+        "ste_bandwidth",
     ]
     ckpt = {
         "step": step,
@@ -915,6 +921,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     sae_cfg.live_tune_path_alt = "/tmp/live_tune.json"
 
     sae = _make_sae(d_in, N_FEATURES, seed).to(device)
+    # Sync STE bandwidth from config to SAE (live-tune can override it later)
+    sae.ste_bandwidth = sae_cfg.ste_bandwidth
     if frozen_decoder:
         sae.W_dec.weight.requires_grad_(False)
 
@@ -1227,6 +1235,41 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         scheduler.step({"loss": recon_val, "grad_norm": grad_norm_val,
                         "l0": l0_val, "ev": ev, "dead_pct": dead,
                         "activation_norm": activation_norm_step})
+
+        # -- Direct threshold nudge: bypasses STE gradient bottleneck ---------------
+        # When L0 >> target, the JumpReLU STE only gives gradient to features near
+        # the threshold.  Features far above threshold are "stuck on" — the sparsity
+        # loss gradient can't reach them.  The nudge directly steps log_threshold
+        # based on L0 error, providing gradient-free pressure on ALL features.
+        # This is a proportional controller: nudge = gain * (L0 - target) / L0.
+        # Positive nudge pushes threshold up → fewer features fire → lower L0.
+        nudge_cfg = sae_cfg  # same config object, threshold_nudge_gain lives there
+        nudge_gain = getattr(nudge_cfg, 'threshold_nudge_gain', 0.0)
+        nudge_every = getattr(nudge_cfg, 'threshold_nudge_every', 50)
+        nudge_l0_min = getattr(nudge_cfg, 'threshold_nudge_l0_min', 600.0)
+        if nudge_gain > 0 and l0_val > nudge_l0_min and step % nudge_every == 0:
+            # L0-relative error: (L0 - target) / L0, so a 10% overshoot at L0=2000
+            # gives 0.1 * gain.  This keeps the nudge proportional regardless of
+            # absolute L0 scale.
+            rel_error = (l0_val - sae_cfg.target_l0) / max(l0_val, 1.0)
+            nudge = nudge_gain * rel_error
+            with torch.no_grad():
+                sae.log_threshold.data += nudge
+            if step % LOG_EVERY == 0:
+                print(f"  [THRESH NUDGE @ {step}] gain={nudge_gain:.3f} "
+                      f"rel_error={rel_error:.4f} nudge={nudge:.5f} "
+                      f"new_thr_mean={sae.log_threshold.exp().mean().item():.4f}")
+
+        # -- Live-tune: sync STE bandwidth from config to SAE --------------------
+        # The scheduler's _apply_live_tune writes overrides to sae_cfg, but the
+        # SAE object's self.ste_bandwidth also needs updating so the forward pass
+        # uses the new value.  Sync every step (cheap check, ensures prompt pickup).
+        cfg_bw = getattr(sae_cfg, 'ste_bandwidth', STE_BANDWIDTH)
+        if abs(cfg_bw - sae.ste_bandwidth) > 1e-6:
+            old_bw = sae.ste_bandwidth
+            sae.ste_bandwidth = cfg_bw
+            if step % LOG_EVERY == 0:
+                print(f"  [STE-BW @ {step}] bandwidth {old_bw:.4f} -> {cfg_bw:.4f}")
 
         if step % LOG_EVERY == 0:
             with torch.no_grad():
