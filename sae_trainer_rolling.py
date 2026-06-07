@@ -41,10 +41,14 @@ import math
 import os
 from pathlib import Path
 
-try:
-    from torch.utils.data import IterableDataset
-except ImportError:                      # torch may be absent at import-time on a control host
-    IterableDataset = object
+class IterableDataset:
+    """Tiny import-time base for the local streaming datasets.
+
+    The trainer iterates these datasets directly, so importing the module should
+    not initialize torch/OpenMP on CPU-only control hosts just to read constants
+    or parse CLI wiring.
+    """
+    pass
 
 def _slug(model_id: str) -> str:
     """Filesystem-safe tag from a HF model id ('google/gemma-4-E2B-it' ->
@@ -111,104 +115,118 @@ POOL_BATCHES_DEFAULT = 4000
 #  SAE model  (JumpReLU, inlined -- this file is the single source of truth)
 # ===========================================================================
 
-import torch
-import torch.nn as nn
+JumpReLUSAE = None
 
 
-class _JumpReLU(torch.autograd.Function):
-    """JumpReLU activation with straight-through estimator for threshold gradient.
-    Forward:  y = pre * H(pre - theta)
-    Backward: dy/dpre passes through where active (relu-like);
-              dy/dtheta uses rectangle-kernel pseudo-derivative
+def _ensure_sae_classes():
+    """Define torch-backed SAE classes lazily.
+
+    Importing this module should only read constants and CLI wiring. Pulling in
+    torch/OpenMP at import time can fail on lightweight control hosts and in
+    sandboxed subprocess tests.
     """
-    @staticmethod
-    def forward(ctx, pre, log_threshold, bandwidth):
-        threshold = log_threshold.exp()
-        gate = (pre > threshold).to(pre.dtype)
-        ctx.save_for_backward(pre, threshold, gate)
-        ctx.bandwidth = bandwidth
-        return pre * gate
+    global JumpReLUSAE
+    if JumpReLUSAE is not None:
+        return JumpReLUSAE
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        pre, threshold, gate = ctx.saved_tensors
-        eps = ctx.bandwidth
-        grad_pre = grad_output * gate
-        in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
-        sum_dims = tuple(range(grad_output.ndim - 1))
-        grad_threshold = -(pre * in_band * grad_output).sum(dim=sum_dims)
-        grad_log_threshold = grad_threshold * threshold
-        return grad_pre, grad_log_threshold, None
+    import torch
+    import torch.nn as nn
 
-class _L0Indicator(torch.autograd.Function):
-    """Step function H(pre - theta) with STE for L0 sparsity loss."""
-    @staticmethod
-    def forward(ctx, pre, log_threshold, bandwidth):
-        threshold = log_threshold.exp()
-        ctx.save_for_backward(pre, threshold)
-        ctx.bandwidth = bandwidth
-        return (pre > threshold).to(pre.dtype)
+    class _JumpReLU(torch.autograd.Function):
+        """JumpReLU activation with straight-through estimator for threshold gradient."""
+        @staticmethod
+        def forward(ctx, pre, log_threshold, bandwidth):
+            threshold = log_threshold.exp()
+            gate = (pre > threshold).to(pre.dtype)
+            ctx.save_for_backward(pre, threshold, gate)
+            ctx.bandwidth = bandwidth
+            return pre * gate
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        pre, threshold = ctx.saved_tensors
-        eps = ctx.bandwidth
-        in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
-        sum_dims = tuple(range(grad_output.ndim - 1))
-        grad_threshold = -(in_band * grad_output).sum(dim=sum_dims)
-        grad_log_threshold = grad_threshold * threshold
-        return None, grad_log_threshold, None
+        @staticmethod
+        def backward(ctx, grad_output):
+            pre, threshold, gate = ctx.saved_tensors
+            eps = ctx.bandwidth
+            grad_pre = grad_output * gate
+            in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
+            sum_dims = tuple(range(grad_output.ndim - 1))
+            grad_threshold = -(pre * in_band * grad_output).sum(dim=sum_dims)
+            grad_log_threshold = grad_threshold * threshold
+            return grad_pre, grad_log_threshold, None
 
-class JumpReLUSAE(nn.Module):
-    def __init__(self, d_in: int, n_features: int):
-        super().__init__()
-        self.d_in      = d_in
-        self.n_features = n_features
-        self.W_enc = nn.Linear(d_in, n_features, bias=True)
-        self.W_dec = nn.Linear(n_features, d_in, bias=False)
-        self.b_dec = nn.Parameter(torch.zeros(d_in))
-        self.log_threshold = nn.Parameter(
-            torch.full((n_features,), math.log(INIT_THRESHOLD))
-        )
-        # W_dec orthonormal, W_enc tied to W_dec.T at init (Anthropic recipe)
-        nn.init.orthogonal_(self.W_dec.weight)
-        self._normalize_decoder()
-        with torch.no_grad():
-            self.W_enc.weight.copy_(self.W_dec.weight.t())
-            self.W_enc.bias.zero_()
+    class _L0Indicator(torch.autograd.Function):
+        """Step function H(pre - theta) with STE for L0 sparsity loss."""
+        @staticmethod
+        def forward(ctx, pre, log_threshold, bandwidth):
+            threshold = log_threshold.exp()
+            ctx.save_for_backward(pre, threshold)
+            ctx.bandwidth = bandwidth
+            return (pre > threshold).to(pre.dtype)
 
-    def _normalize_decoder(self):
-        with torch.no_grad():
-            # W_dec.weight is [d_in, n_features]; each FEATURE direction is a COLUMN.
-            # Normalize columns to unit norm so L0 loss is meaningful (each firing = a
-            # unit-norm contribution to recon).
-            norms = self.W_dec.weight.norm(dim=0, keepdim=True).clamp(min=1e-8)  # [1, n_features]
-            self.W_dec.weight.div_(norms)
+        @staticmethod
+        def backward(ctx, grad_output):
+            pre, threshold = ctx.saved_tensors
+            eps = ctx.bandwidth
+            in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
+            sum_dims = tuple(range(grad_output.ndim - 1))
+            grad_threshold = -(in_band * grad_output).sum(dim=sum_dims)
+            grad_log_threshold = grad_threshold * threshold
+            return None, grad_log_threshold, None
 
-    def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
-        pre = self.W_enc(x - self.b_dec)
-        return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
+    class _JumpReLUSAE(nn.Module):
+        def __init__(self, d_in: int, n_features: int):
+            super().__init__()
+            self.d_in = d_in
+            self.n_features = n_features
+            self.W_enc = nn.Linear(d_in, n_features, bias=True)
+            self.W_dec = nn.Linear(n_features, d_in, bias=False)
+            self.b_dec = nn.Parameter(torch.zeros(d_in))
+            self.log_threshold = nn.Parameter(
+                torch.full((n_features,), math.log(INIT_THRESHOLD))
+            )
+            # W_dec orthonormal, W_enc tied to W_dec.T at init (Anthropic recipe)
+            nn.init.orthogonal_(self.W_dec.weight)
+            self._normalize_decoder()
+            with torch.no_grad():
+                self.W_enc.weight.copy_(self.W_dec.weight.t())
+                self.W_enc.bias.zero_()
 
-    def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
-        return self.W_enc(x - self.b_dec)
+        def _normalize_decoder(self):
+            with torch.no_grad():
+                # W_dec.weight is [d_in, n_features]; each FEATURE direction is a COLUMN.
+                norms = self.W_dec.weight.norm(dim=0, keepdim=True).clamp(min=1e-8)
+                self.W_dec.weight.div_(norms)
 
-    def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
-        return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
+        def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
+            pre = self.W_enc(x - self.b_dec)
+            return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
 
-    def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
-        return _L0Indicator.apply(pre, self.log_threshold, STE_BANDWIDTH)
+        def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
+            return self.W_enc(x - self.b_dec)
 
-    def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
-        return self.W_dec(acts) + self.b_dec
+        def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
+            return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
 
-    def forward(self, x: "torch.Tensor", k: int = K):
-        acts = self.encode(x, k=k)
-        x_hat = self.decode(acts)
-        return x_hat, acts
+        def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
+            return _L0Indicator.apply(pre, self.log_threshold, STE_BANDWIDTH)
+
+        def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
+            return self.W_dec(acts) + self.b_dec
+
+        def forward(self, x: "torch.Tensor", k: int = K):
+            acts = self.encode(x, k=k)
+            x_hat = self.decode(acts)
+            return x_hat, acts
+
+    JumpReLUSAE = _JumpReLUSAE
+    return JumpReLUSAE
+
 
 def _make_sae(d_in: int, n_features: int, seed: int = 0):
+    import torch
+
     torch.manual_seed(seed)
-    return JumpReLUSAE(d_in, n_features)
+    sae_cls = _ensure_sae_classes()
+    return sae_cls(d_in, n_features)
 
 
 
@@ -595,11 +613,13 @@ class RollingActivationProvider:
     """Yields [BATCH_TOKENS, D_IN] bf16 activations on device from pool[L] shards.
     Background thread prefetches the next shard so the SAE hot loop never waits.
 
-    Supports checkpoint resume via get_state()/restore_state() -- tracks the current
-    shard cursor and consumed shards so training can resume at the exact position.
+    The reader pool is intentionally simple: resume restores model/optimizer/
+    scheduler state, while the activation stream restarts from the cached pool.
+    That keeps checkpointing useful for preemption without serializing a large
+    asynchronous prefetch queue.
     """
 
-    def __init__(self, pool_dir: Path, device, seed=0, queue_size=8):
+    def __init__(self, pool_dir: Path, device, seed=0, queue_size=12, n_workers=4):
         import threading, queue as _queue
         self.paths = sorted(_shard_paths(pool_dir))
         if not self.paths:
@@ -608,56 +628,54 @@ class RollingActivationProvider:
         self.seed = seed
         self._q = _queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-        # State for resume: current position in the shuffled order
-        self._current_order = list(range(len(self.paths)))
-        self._cursor = 0
-        self._consumed = set()
-        self._lock = threading.Lock()
+        # Multiple reader threads: torch.load releases the GIL during the file read,
+        # so N threads overlap N shard reads. A single reader could not saturate even
+        # local NVMe (each shard is ~168MB at d_in=2560), leaving the H100 waiting.
+        n_workers = max(1, min(n_workers, len(self.paths)))
+        self._threads = [
+            threading.Thread(target=self._worker, args=(w, n_workers), daemon=True)
+            for w in range(n_workers)
+        ]
+        for t in self._threads:
+            t.start()
 
-    def _worker(self):
+    def _worker(self, wid, n_workers):
         import random as _random
+        import queue as _queue
         import torch
-        rng = _random.Random(self.seed * 7919)
+        rng = _random.Random(self.seed * 7919 + wid)
+        my_idx = [i for i in range(len(self.paths)) if i % n_workers == wid]
+        if not my_idx:
+            return
         while not self._stop.is_set():
-            with self._lock:
-                if self._cursor >= len(self.paths):
-                    # Reshuffle for a new epoch
-                    rng.shuffle(self._current_order)
-                    self._cursor = 0
-                    self._consumed.clear()
-                idx = self._current_order[self._cursor]
-                self._cursor += 1
-                self._consumed.add(idx)
-            path = self.paths[idx]
-            # Load with mmap for faster IO, reshape, keep on CPU but pinned
-            t = torch.load(path, map_location="cpu", weights_only=True, mmap=True)  # [n_seqs,SEQ_LEN,d] bf16
-            t = t.reshape(-1, t.shape[-1])  # flatten to [total_tokens, d_in]
-            # Pin memory for faster GPU transfer
-            if not t.is_pinned():
-                t = t.pin_memory()
-            self._q.put(t, timeout=5)
+            rng.shuffle(my_idx)
+            for idx in my_idx:
+                if self._stop.is_set():
+                    return
+                t = torch.load(self.paths[idx], map_location="cpu", weights_only=True)  # [n_seqs,SEQ_LEN,d] bf16
+                t = t.reshape(-1, t.shape[-1])
+                if self.device.type == "cuda" and torch.cuda.is_available() and not t.is_pinned():
+                    t = t.pin_memory()
+                while not self._stop.is_set():
+                    try:
+                        self._q.put(t, timeout=0.5)
+                        break
+                    except _queue.Full:
+                        continue
 
     def next_batch(self):
-        t = self._q.get(timeout=5)
+        t = self._q.get()
         return t.to(self.device, non_blocking=True)        # [BATCH_TOKENS, D_IN] bf16
 
+    # Stubs retained so any external caller that touches resume_state on a
+    # fresh run (e.g. the trainer's checkpoint-restore path) gets a no-op
+    # rather than AttributeError. The provider itself does not support
+    # resume in this build.
     def get_state(self):
-        """Return provider state for checkpoint resume."""
-        with self._lock:
-            return {
-                "current_order": self._current_order.copy(),
-                "cursor": self._cursor,
-                "consumed": list(self._consumed),
-            }
+        return None
 
     def restore_state(self, state):
-        """Restore provider state from a checkpoint."""
-        with self._lock:
-            self._current_order = state.get("current_order", list(range(len(self.paths))))
-            self._cursor = state.get("cursor", 0)
-            self._consumed = set(state.get("consumed", []))
+        pass
 
     def close(self):
         self._stop.set()
@@ -666,6 +684,8 @@ class RollingActivationProvider:
                 self._q.get_nowait()
         except Exception:
             pass
+        for t in getattr(self, "_threads", []):
+            t.join(timeout=1.0)
 
 
 # ===========================================================================
@@ -676,6 +696,23 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
                           feature_fire_counts, steps_since_fired, provider_state):
     """Save a complete checkpoint: model, optimizer, scheduler, RNG, dead-feature stats."""
     import torch
+    energy_config_keys = [
+        "initial_lr_multiplier", "initial_lr_decay_steps",
+        "activation_norm_ref", "activation_norm_lr_alpha",
+        "activation_norm_lr_min", "activation_norm_lr_max",
+        "lr_energy_max", "convergence_lockout_rel",
+        "constraint_lr_floor",
+        "early_pulse_steps", "early_pulse_multiplier",
+        "early_pulse_warmup_floor", "early_pulse_dampen",
+        "al_landing_zone_rel", "al_landing_min_progress",
+        "al_landing_gain_max",
+        "stall_pulse_enabled", "stall_warmup_steps",
+        "stall_cooldown_steps", "stall_pulse_steps",
+        "stall_pulse_max_extra", "stall_pulse_min_multiplier",
+        "stall_fast_alpha", "stall_slow_alpha",
+        "stall_crossover_ratio", "stall_min_slow_progress",
+        "stall_abs_progress_floor", "stall_dead_suppress_pct",
+    ]
     ckpt = {
         "step": step,
         "sae_state": {k: v.cpu().clone() for k, v in sae.state_dict().items()},
@@ -688,6 +725,19 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
             "event_counter": scheduler.event_counter,
             "transition_log": scheduler.transition_log[-100:],  # last 100 transitions
             "_lambda_history": scheduler._lambda_history,
+            "_activation_norm_ema": getattr(scheduler, "_activation_norm_ema", None),
+            "_prev_l0": getattr(scheduler, "_prev_l0", None),
+            "_l0_progress_fast": getattr(scheduler, "_l0_progress_fast", None),
+            "_l0_progress_slow": getattr(scheduler, "_l0_progress_slow", None),
+            "_stall_pulse_remaining": getattr(scheduler, "_stall_pulse_remaining", 0),
+            "_stall_pulse_multiplier": getattr(scheduler, "_stall_pulse_multiplier", 1.0),
+            "_last_stall_pulse_step": getattr(scheduler, "_last_stall_pulse_step", -10**9),
+            "_energy_dampen": getattr(scheduler, "_energy_dampen", 1.0),
+            "energy_config": {
+                k: getattr(scheduler.config, k)
+                for k in energy_config_keys
+                if hasattr(scheduler.config, k)
+            },
         },
         "rng_state": rng_states,
         "feature_fire_counts": feature_fire_counts.cpu().clone(),
@@ -715,6 +765,17 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
         scheduler.event_counter = sched_state["event_counter"]
         scheduler.transition_log = sched_state["transition_log"]
         scheduler._lambda_history = sched_state.get("_lambda_history", [])
+        scheduler._activation_norm_ema = sched_state.get("_activation_norm_ema")
+        scheduler._prev_l0 = sched_state.get("_prev_l0")
+        scheduler._l0_progress_fast = sched_state.get("_l0_progress_fast")
+        scheduler._l0_progress_slow = sched_state.get("_l0_progress_slow")
+        scheduler._stall_pulse_remaining = sched_state.get("_stall_pulse_remaining", 0)
+        scheduler._stall_pulse_multiplier = sched_state.get("_stall_pulse_multiplier", 1.0)
+        scheduler._last_stall_pulse_step = sched_state.get("_last_stall_pulse_step", -10**9)
+        scheduler._energy_dampen = sched_state.get("_energy_dampen", 1.0)
+        for k, v in sched_state.get("energy_config", {}).items():
+            if hasattr(scheduler.config, k):
+                setattr(scheduler.config, k, v)
         return {
             "step": ckpt["step"],
             "rng_state": ckpt["rng_state"],
@@ -730,7 +791,7 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
 def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=False,
                              max_steps=N_STEPS, bdec_batches=BDEC_INIT_BATCHES,
                              microbatch_tokens=MICROBATCH_TOKENS,
-                             resume_from=None, push=True):
+                             resume_from=None, push=True, activation_norm_ref=None):
     """Train one JumpReLU SAE on activations supplied by `provider`.
 
     Gradient accumulation: if `microbatch_tokens < BATCH_TOKENS`, accumulate gradients
@@ -776,7 +837,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         cooldown_steps=250, event_persistence=3, mode_verbose=True,
         target_l0=float(K_INIT), l0_tolerance=0.20,
         use_augmented_lagrangian=True, lambda_l0_init=0.0, lambda_l0_min=0.0,
-        lambda_l0_max=5e-3, al_mu=1e-7, al_dual_step=5e-10, al_log_every=LOG_EVERY,
+        # Cranked for E4B (d_in=2560, large residual scale): the 5e-3 cap pinned
+        # lambda and L0 plateaued at ~730 vs target 500. More headroom + a faster
+        # integrator so the pressure arrives while the cosine LR is still alive.
+        lambda_l0_max=3e-2, al_mu=2e-7, al_dual_step=2e-9, al_log_every=LOG_EVERY,
         ev_floor=0.88, ev_floor_patience=3, ev_drop_thresh=-0.05,
         ev_stop_thresh=0.88, ev_stop_patience=3,
         dead_emergency_thresh=20.0, dead_emergency_cooldown=5000,
@@ -812,12 +876,19 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         print(f"  resume_from={resume_from}")
     print(f"{'='*60}")
 
+    out_dir = Path(SAE_DIR) / f"layer_{layer:02d}_s{seed}{out_suffix}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     sae = _make_sae(d_in, N_FEATURES, seed).to(device)
     if frozen_decoder:
         sae.W_dec.weight.requires_grad_(False)
 
-    # Compile for H100 speedup (fuse kernels, reduce launch overhead)
-    sae = torch.compile(sae, mode="reduce-overhead")
+    # NO torch.compile here. The original rolling trainer (mapping-corpus)
+    # never compiled -- the SAE is small enough (2560 -> 81920) that PyTorch
+    # eager is fine, and compile + this training loop's non-deterministic
+    # control flow (resample/reset/scheduler branches, dead-mask .item()
+    # syncs) is what killed the H100 container last run (first compile
+    # pass took >60s and tripped the Modal heartbeat).
 
     optimizer = torch.optim.Adam(
         [{"params": sae.W_enc.parameters(), "weight_decay": 0},
@@ -826,6 +897,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
          {"params": [sae.log_threshold], "weight_decay": 0}],
         lr=LR, betas=(0.9, 0.999), fused=True)
     scheduler = SAEEventControlScheduler(optimizer, sae_cfg, mode_label=f"L{layer:02d}")
+
+    preflight_stats = {
+        "activation_norm_probe": None,
+        "activation_norm_ref": activation_norm_ref,
+        "initial_l0_probe": None,
+        "initial_lr_multiplier": 1.0,
+        "early_pulse_multiplier": 1.0,
+        "layer_lr_multiplier": 1.0,
+    }
 
     # -- Resume from checkpoint -----------------------------------------------
     start_step = 1
@@ -845,7 +925,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             if "cpu" in loaded["rng_state"]:
                 torch.set_rng_state(loaded["rng_state"]["cpu"])
             print(f"  Resumed from step {start_step}, lambda={scheduler.lambda_l0:.3e}, mode={scheduler.mode}")
-            # Tell provider to resume at the right cursor if it supports it
+            # Provider resume is optional. The current async provider restarts
+            # its cached activation stream instead of serializing queued shards.
             if loaded.get("provider_state"):
                 provider.restore_state(loaded["provider_state"])
 
@@ -854,14 +935,56 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         print(f"Estimating b_dec from {bdec_batches} batches ...")
         acc = torch.zeros(d_in, device=device, dtype=torch.float32)
         n_acc = 0
+        probe_batch = None
         for _ in range(bdec_batches):
             a = provider.next_batch()
+            if probe_batch is None:
+                probe_batch = a
             acc += a.sum(dim=0)
             n_acc += a.shape[0]
         if n_acc > 0:
             with torch.no_grad():
                 sae.b_dec.copy_(acc / n_acc)
             print(f"  b_dec set from {n_acc} tokens, ||b_dec||={sae.b_dec.norm().item():.4f}")
+        if probe_batch is not None:
+            probe_tokens = min(probe_batch.shape[0], max(1024, min(microbatch_tokens, 8192)))
+            probe = probe_batch[:probe_tokens]
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                probe_pre = sae.encode_pre(probe)
+                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1).float().mean().item()
+            activation_norm = probe.float().pow(2).mean().sqrt().item()
+            ref_norm = activation_norm_ref if activation_norm_ref and activation_norm_ref > 0 else activation_norm
+            norm_ratio = activation_norm / max(ref_norm, 1e-8)
+            norm_mult = max(0.90, min(1.35, norm_ratio ** 0.5))
+            layer_mult = 1.0
+            if layer >= 16:
+                layer_mult = min(1.35, 1.15 + 0.01 * (layer - 16))
+            violation = max(0.0, initial_l0 - float(K)) / max(float(K), 1.0)
+            coupled_mult = 1.0 + min(0.30, 0.06 * violation)
+            early_pulse_mult = 1.0 + min(0.35, 0.08 * violation)
+            if layer >= 16:
+                early_pulse_mult += 0.08
+            initial_lr_mult = min(1.65, norm_mult * layer_mult * coupled_mult)
+
+            sae_cfg.activation_norm_ref = ref_norm
+            sae_cfg.initial_lr_multiplier = initial_lr_mult
+            sae_cfg.early_pulse_multiplier = min(1.45, early_pulse_mult)
+            scheduler._activation_norm_ema = activation_norm
+            preflight_stats.update({
+                "activation_norm_probe": activation_norm,
+                "activation_norm_ref": ref_norm,
+                "initial_l0_probe": initial_l0,
+                "initial_lr_multiplier": sae_cfg.initial_lr_multiplier,
+                "early_pulse_multiplier": sae_cfg.early_pulse_multiplier,
+                "layer_lr_multiplier": layer_mult,
+            })
+            for group, lr in zip(optimizer.param_groups, scheduler._compute_lrs()):
+                group["lr"] = lr
+            print(
+                f"  [PREFLIGHT] act_norm={activation_norm:.4f} ref={ref_norm:.4f} "
+                f"initial_L0={initial_l0:.1f} lr_mult={sae_cfg.initial_lr_multiplier:.2f} "
+                f"pulse={sae_cfg.early_pulse_multiplier:.2f}"
+            )
 
     metrics = {"recon_loss": [], "mean_l0": [], "dead_pct": [], "resampled": [],
                "ev": [], "nonlinear_err": [], "linear_err": []}
@@ -904,7 +1027,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         return n_dead
 
     # -- training loop --------------------------------------------------------
-    for step in range(1, n_steps + 1):
+    last_step = start_step - 1
+    for step in range(start_step, n_steps + 1):
+        last_step = step
         if scheduler.should_stop:
             print(f"  EARLY STOP @ step {step}: {scheduler.stop_reason}")
             if use_wandb:
@@ -919,36 +1044,31 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         accum_l0 = 0.0
         accum_sparsity_loss = 0.0
         accum_aux_loss = 0.0
+        fired_accum = torch.zeros(N_FEATURES, device=device, dtype=torch.bool)
 
-        # Get full batch and split into microbatches for accumulation
-        full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16
-        full_batch_device = full_batch.to(device)
+        # Get full batch and split into microbatches for accumulation. provider.next_batch
+        # already returns the batch on-device, so no extra H2D copy here.
+        full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16, on device
+        activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
         microbatch_size = microbatch_tokens  # tokens per microbatch
 
-        # Compute a single full-batch L0 and sparsity penalty for the whole accumulation
-        with torch.no_grad():
-            full_pre = sae.encode_pre(full_batch_device)
-            full_gate = sae.l0_indicator(full_pre)
-            l0_full = full_gate.sum(dim=-1).float().mean()
-            slack = (l0_full - sae_cfg.target_l0).clamp(min=0.0)
-            sparsity_loss_full = (
-                scheduler.lambda_l0 * slack
-                + 0.5 * sae_cfg.al_mu * slack * slack
-            ) / accum_steps
-
-            # Pre-compute dead feature parameters for the aux loss to avoid doing this per microbatch
-            dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
-            n_dead = int(dead_mask_aux.sum().item())
-            if n_dead > 0:
-                dead_indices = torch.where(dead_mask_aux)[0]
-                eff_k = min(AUX_K, n_dead)
+        # Pre-compute dead feature parameters for the aux loss. L0/sparsity stay
+        # inside each microbatch forward so the JumpReLU threshold gradient is live.
+        dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
+        n_dead = int(dead_mask_aux.sum().item())
+        if n_dead > 0:
+            dead_indices = torch.where(dead_mask_aux)[0]
+            eff_k = min(AUX_K, n_dead)
 
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
             end_idx = start_idx + microbatch_size
-            acts_mb = full_batch_device[start_idx:end_idx]  # bf16, [microbatch_tokens, d_in]
+            acts_mb = full_batch[start_idx:end_idx]  # bf16, [microbatch_tokens, d_in]
 
-            # bf16 forward: keep activations in bf16, cast only for loss computation
+            # bf16 forward: keep activations in bf16, cast only for loss computation.
+            # Everything the step needs (recon, L0, sparsity, aux, fired-mask) comes
+            # from THIS forward -- the two extra full-batch encode passes that used to
+            # bracket this loop (one for L0, one for the fired mask) are gone.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pre = sae.encode_pre(acts_mb)
                 feat_acts = sae.apply_jumprelu(pre)
@@ -956,7 +1076,20 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
                 # Cast to fp32 only for loss computation (numerical stability)
                 recon_loss = (acts_mb.float() - x_hat.float()).pow(2).mean() / accum_steps
-                sparsity_loss = sparsity_loss_full
+
+                # Sparsity penalty -- IN-GRAPH so the L0 straight-through estimator
+                # actually trains the JumpReLU thresholds. This used to be computed
+                # under torch.no_grad() and added as a detached constant: lambda exerted
+                # ZERO gradient, nothing pushed the thresholds up, and L0 ran away to
+                # n_features (the all-features-active degeneracy). Augmented-Lagrangian
+                # hinge for the inequality constraint L0_avg <= target.
+                gate = sae.l0_indicator(pre)
+                l0_mb = gate.sum(dim=-1).float().mean()
+                slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
+                sparsity_loss = (
+                    scheduler.lambda_l0 * slack
+                    + 0.5 * sae_cfg.al_mu * slack * slack
+                ) / accum_steps
 
                 # Aux loss for dead features (scaled by accum_steps)
                 if n_dead > 0:
@@ -975,18 +1108,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
             loss.backward()
 
-            accum_recon_loss += recon_loss.detach()
-            accum_l0 += l0_full.detach()
-            accum_sparsity_loss += sparsity_loss.detach()
-            accum_aux_loss += aux_loss.detach()
-
-        # Extract values for logging once after the microbatch loop
-        # We also compute the average L0 directly rather than sum and divide by accum_steps for accum_l0
-        # since L0 does not multiply by accum_steps like others
-        accum_recon_loss = accum_recon_loss.item() * accum_steps if isinstance(accum_recon_loss, torch.Tensor) else 0.0
-        accum_l0 = accum_l0.item() if isinstance(accum_l0, torch.Tensor) else 0.0
-        accum_sparsity_loss = accum_sparsity_loss.item() * accum_steps if isinstance(accum_sparsity_loss, torch.Tensor) else 0.0
-        accum_aux_loss = accum_aux_loss.item() * accum_steps if isinstance(accum_aux_loss, torch.Tensor) else 0.0
+            accum_recon_loss += recon_loss.detach().item() * accum_steps
+            accum_l0 += l0_mb.detach().item()
+            accum_sparsity_loss += sparsity_loss.detach().item() * accum_steps
+            accum_aux_loss += aux_loss.detach().item() * accum_steps
+            with torch.no_grad():
+                fired_accum |= (feat_acts.detach() > 0).any(dim=0)
 
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
@@ -1001,14 +1128,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         recon_loss = torch.tensor(accum_recon_loss / accum_steps, device=device)
         l0 = torch.tensor(accum_l0 / accum_steps, device=device)  # average L0 across microbatches
 
+        # Dead/fired bookkeeping reuses the fired mask gathered during the forward
+        # passes above -- no extra encode of the full batch.
         with torch.no_grad():
-            # Compute fired features across the full accumulated batch
-            full_pre = sae.encode_pre(full_batch.to(device))
-            full_feat = sae.apply_jumprelu(full_pre)
-            fired = (full_feat > 0).any(dim=0)
             steps_since_fired += 1
-            steps_since_fired[fired] = 0
-            feature_fire_counts += fired.long()
+            steps_since_fired[fired_accum] = 0
+            feature_fire_counts += fired_accum.long()
             log_window_tokens += BATCH_TOKENS
 
         if step % RESET_EVERY == 0 and step > 0:
@@ -1055,13 +1180,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if is_log_step:
             dead = (steps_since_fired >= LOG_EVERY).float().mean().item() * 100
             with torch.no_grad():
-                total_var = full_batch.float().var()
+                total_var = full_batch.float().var().item()  # .item(): keep ev a python float
                 ev = 1.0 - (recon_val / total_var) if total_var > 0 else 0.0
         else:
             dead = None; ev = None
 
         scheduler.step({"loss": recon_val, "grad_norm": grad_norm_val,
-                        "l0": l0_val, "ev": ev, "dead_pct": dead})
+                        "l0": l0_val, "ev": ev, "dead_pct": dead,
+                        "activation_norm": activation_norm_step})
 
         if step % LOG_EVERY == 0:
             with torch.no_grad():
@@ -1118,10 +1244,24 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            "train/dead_pct": dead, "train/explained_variance": ev,
                            "train/lr": scheduler.optimizer.param_groups[0]["lr"],
                            "train/lambda_l0": scheduler.lambda_l0,
+                           "train/activation_norm": activation_norm_step,
+                           "scheduler/l0_progress_fast": scheduler._l0_progress_fast,
+                           "scheduler/l0_progress_slow": scheduler._l0_progress_slow,
+                           "scheduler/energy_dampen": scheduler._energy_dampen,
                            "train/best_ev_so_far": best_ev,
                            "features/ultra_active_count": ultra_active,
                            "timing/tokens_per_sec": tokens_per_sec,
                            "scheduler/mode": scheduler.mode}, step=step)
+
+        if step % CHECKPOINT_EVERY == 0:
+            rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
+            provider_state = provider.get_state() if hasattr(provider, "get_state") else None
+            _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
+                                  feature_fire_counts.clone(), steps_since_fired.clone(),
+                                  provider_state)
+            print(f"  [CHECKPOINT @ {step}] {out_dir / 'checkpoint_full.pt'}")
+
+    step = last_step
 
     # -- final best flush -----------------------------------------------------
     if best_state_pending and best_state_in_memory is not None:
@@ -1134,18 +1274,19 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         print(f"  [BEST FINAL FLUSH] peak EV={best_ev:.4f}@{best_ev_step}")
 
     # -- save final + meta + HF push ------------------------------------------
-    out_dir = Path(SAE_DIR) / f"layer_{layer:02d}_s{seed}{out_suffix}"
-    out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(sae.state_dict(), out_dir / "sae.pt")
     sched_summary = scheduler.summary()
+    final_metrics = {k: v[-1] if v else None for k, v in metrics.items()}
+    final_metrics.update(preflight_stats)
     meta = {"layer": layer, "seed": seed, "model_id": MODEL_ID, "d_in": d_in,
             "n_features": N_FEATURES, "k": K, "batch_tokens": BATCH_TOKENS,
             "n_steps": step, "lr": LR, "lambda_l0": scheduler.lambda_l0, "tier": tier,
+            "preflight": preflight_stats,
             "scheduler_mode": scheduler.mode,
             "scheduler_transitions": sched_summary["transitions"],
             "total_tokens": step * BATCH_TOKENS, "early_stopped": scheduler.should_stop,
             "path": "rolling", "best_ev": best_ev, "best_ev_step": best_ev_step,
-            "final_metrics": {k: v[-1] if v else None for k, v in metrics.items()},
+            "final_metrics": final_metrics,
             "training_curve": metrics}
     with open(out_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -1302,6 +1443,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         return _pool_dir(f"pool_L{L:02d}_s{seed}")
 
     results = {}
+    activation_norm_ref = None
     t0 = time.time()
     # rolling must walk from 0 to build the residual chain; hook capture is independent
     # per layer, so it starts at start_layer.
@@ -1329,10 +1471,15 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             res = train_sae_on_activations(L, d_in, seed, provider,
                                            max_steps=max_steps, bdec_batches=bdec_batches,
                                            microbatch_tokens=microbatch_tokens or MICROBATCH_TOKENS,
-                                           resume_from=layer_resume, push=push)
+                                           resume_from=layer_resume, push=push,
+                                           activation_norm_ref=activation_norm_ref)
         finally:
             provider.close()
         results[f"layer_{L:02d}"] = res
+        if activation_norm_ref is None:
+            probe_norm = res.get("activation_norm_probe") if isinstance(res, dict) else None
+            if probe_norm:
+                activation_norm_ref = probe_norm
 
         if capture == "auto":                             # independent capture -> free now
             _rm_pool(dst_dir)

@@ -45,9 +45,16 @@ image = (
         "/opt/sae-trainer/sae_scheduler.py",
         copy=True,
     )
-    .env({"SAE_DATA_DIR": "/data", "SAE_SCRATCH_DIR": "/scratch"})
+    .env({
+        "SAE_DATA_DIR": "/data",
+        # Container-local NVMe, NOT a Modal Volume. The activation pool is read
+        # once per step (168MB/shard at d_in=2560); on the network Volume this
+        # capped throughput at ~193MB/s and starved the H100 (37k tok/s) while
+        # blocking the Modal heartbeat -> container restarts. Local disk is GB/s.
+        "SAE_SCRATCH_DIR": "/root/rollcache",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+    })
 )
-
 # =============================================================================
 # Volumes (persistent storage)
 # =============================================================================
@@ -73,8 +80,9 @@ app = modal.App("gemma4-sae-train", image=image)
 
 
 @app.cls(
-    gpu="H100",
-    volumes={"/data": data_volume, "/scratch": scratch_volume},
+    gpu="RTX-PRO-6000",
+    volumes={"/data": data_volume},          # /scratch removed: pool lives on local NVMe now
+    ephemeral_disk=1_048_576,                 # 1 TiB container-local NVMe for the activation pool
     secrets=[modal.Secret.from_name("KAGEL_KEY")],
     timeout=86400,  # 24 hours max per Modal limits
 )
@@ -160,7 +168,8 @@ class SAETainer:
             seed=0,
             pool_batches=pool_batches,
             microbatch_tokens=microbatch_tokens,
-            use_pretok=True,  # Use pretokenized shards (faster)
+            use_pretok=True,  # Use pretokenized shards (faster). Build once with:
+                              #   modal run gemma4_sae.py::pretokenize
             max_steps=max_steps,
             bdec_batches=50,
             resume_from=None,
@@ -176,6 +185,91 @@ class SAETainer:
         subprocess.run(["sync"])
 
         return {"status": "complete", "layers": list(range(start, end)), "results": results}
+
+
+# =============================================================================
+# Pre-tokenization (build /data/pretok/fineweb-edu shards -- the fast data path)
+# =============================================================================
+
+PRETOK_OUT = "/data/pretok/fineweb-edu"
+
+
+@app.function(
+    image=image,
+    volumes={"/data": data_volume},
+    timeout=86400,
+)
+def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
+                      model_path: str = "/data/models/gemma-4-e4b") -> int:
+    """Stream a disjoint slice of FineWeb-Edu, tokenize it, and write one 1-D int32
+    token shard to /data/pretok/fineweb-edu/shard_NN.npy. Parallelized across
+    containers via .starmap (one container per shard). Idempotent: skips a shard
+    that already has >= tokens_per_shard tokens."""
+    import os
+    import numpy as np
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    os.makedirs(PRETOK_OUT, exist_ok=True)
+    shard_path = f"{PRETOK_OUT}/shard_{shard_idx:02d}.npy"
+    if os.path.exists(shard_path):
+        existing = np.load(shard_path, mmap_mode="r")
+        if existing.shape[0] >= tokens_per_shard:
+            print(f"  [pretok {shard_idx:02d}] exists ({existing.shape[0]} tok) -- skip")
+            return shard_idx
+
+    tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+    ds = ds.shard(num_shards=n_shards, index=shard_idx)
+
+    buf, total = [], 0
+    for row in ds:
+        text = row.get("text", "")
+        if not text.strip():
+            continue
+        ids = tok(text, add_special_tokens=True).input_ids
+        if len(ids) < 8:
+            continue
+        prev = total
+        buf.append(np.asarray(ids, dtype=np.int32))
+        total += len(ids)
+        if total // 1_000_000 != prev // 1_000_000:
+            print(f"  [pretok {shard_idx:02d}] {total/1e6:.0f}M / {tokens_per_shard/1e6:.0f}M tok")
+        if total >= tokens_per_shard:
+            break
+
+    arr = np.concatenate(buf)[:tokens_per_shard]
+    np.save(shard_path, arr)
+    data_volume.commit()
+    print(f"  [pretok {shard_idx:02d}] wrote {arr.shape[0]} tok -> {shard_path}")
+    return shard_idx
+
+
+@app.function(image=image, volumes={"/data": data_volume})
+def _write_pretok_manifest(n_shards: int):
+    import json, os
+    os.makedirs(PRETOK_OUT, exist_ok=True)
+    with open(f"{PRETOK_OUT}/manifest.json", "w") as f:
+        json.dump({"n_shards": n_shards}, f)
+    data_volume.commit()
+    print(f"  [pretok] manifest -> n_shards={n_shards}")
+
+
+@app.local_entrypoint()
+def pretokenize(n_shards: int = 16, tokens_per_shard: int = 12_000_000):
+    """Build the pretokenized FineWeb-Edu shards the trainer reads with use_pretok=True.
+    Run ONCE (the Gemma-4 model must already be cached on /data from a prior run):
+
+        modal run gemma4_sae.py::pretokenize
+        modal run gemma4_sae.py::pretokenize --n-shards 24 --tokens-per-shard 10000000
+
+    16 shards x 12M tok = ~192M tokens (~770MB int32). Containers run in parallel,
+    so wall time is ~one shard's tokenize pass, not the sum."""
+    args = [(i, n_shards, tokens_per_shard) for i in range(n_shards)]
+    done = list(pretokenize_shard.starmap(args))
+    _write_pretok_manifest.remote(n_shards)
+    print(f"\nPretokenize complete: {len(done)} shards x {tokens_per_shard/1e6:.0f}M tok "
+          f"-> {PRETOK_OUT}")
 
 
 # =============================================================================

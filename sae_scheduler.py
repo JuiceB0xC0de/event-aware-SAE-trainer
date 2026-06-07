@@ -73,6 +73,9 @@ class SAEAECSConfig:
     al_dual_step: float = 5e-9           # dual ascent step size -- integrator gain
     al_log_every: int = 250              # print lambda update at this cadence (every step is too noisy)
     al_convergence_rel_tol: float = 0.005  # lambda "plateau" tolerance: max(recent)/recent[0]-1 < this -> considered converged
+    al_landing_zone_rel: float = 0.35    # final-stretch lambda boost zone above target
+    al_landing_min_progress: float = 0.08  # L0/step; below this while above band = stalled
+    al_landing_gain_max: float = 16.0    # max multiplier on dual gain in final stretch
 
     # -- Legacy P-controller knobs (kept for use_augmented_lagrangian=False) -
     lambda_adjust_factor: float = 1.0    # multiplicative step per adjustment (1.0 = frozen)
@@ -95,6 +98,39 @@ class SAEAECSConfig:
     # -- L0 stabilization detection ----------------------------------------
     l0_stabilize_window: int = 3          # consecutive windows to detect stabilization
     l0_stabilize_std_thresh: float = 0.5  # std of L0 window below this -> stabilize
+
+    # -- Preemptive LR energy ------------------------------------------------
+    # These multipliers are coarse steering only. They are locked out once L0 is
+    # near/below target so late convergence remains the lambda integrator's job.
+    initial_lr_multiplier: float = 1.0
+    initial_lr_decay_steps: int = 3000
+    activation_norm_ref: Optional[float] = None
+    activation_norm_lr_alpha: float = 0.5
+    activation_norm_lr_min: float = 0.85
+    activation_norm_lr_max: float = 1.45
+    lr_energy_max: float = 2.0
+    convergence_lockout_rel: float = 0.25
+    constraint_lr_floor: float = 0.08    # min LR fraction while L0 is still above tolerance band
+
+    # -- Early pulse ---------------------------------------------------------
+    early_pulse_steps: int = 400
+    early_pulse_multiplier: float = 1.0
+    early_pulse_warmup_floor: float = 0.50
+    early_pulse_dampen: float = 0.5
+
+    # -- L0 momentum stall pulses ------------------------------------------
+    stall_pulse_enabled: bool = True
+    stall_warmup_steps: int = 750
+    stall_cooldown_steps: int = 500
+    stall_pulse_steps: int = 150
+    stall_pulse_max_extra: float = 0.45
+    stall_pulse_min_multiplier: float = 1.08
+    stall_fast_alpha: float = 0.35
+    stall_slow_alpha: float = 0.05
+    stall_crossover_ratio: float = 0.35
+    stall_min_slow_progress: float = 0.10
+    stall_abs_progress_floor: float = 0.05
+    stall_dead_suppress_pct: float = 12.0
 
 
 class SAESignalBuffer:
@@ -256,6 +292,14 @@ class SAEEventControlScheduler:
         self.should_stop: bool = False
         self.stop_reason: str = ""
         self._lambda_history: list = []     # rolling lambda readings for plateau detection
+        self._activation_norm_ema: Optional[float] = None
+        self._prev_l0: Optional[float] = None
+        self._l0_progress_fast: Optional[float] = None
+        self._l0_progress_slow: Optional[float] = None
+        self._stall_pulse_remaining: int = 0
+        self._stall_pulse_multiplier: float = 1.0
+        self._last_stall_pulse_step: int = -10**9
+        self._energy_dampen: float = 1.0
 
     def step(self, signals: Dict) -> str:
         """Advance scheduler one step.
@@ -271,6 +315,7 @@ class SAEEventControlScheduler:
         l0 = signals.get("l0")
         ev = signals.get("ev")
         dead_pct = signals.get("dead_pct")
+        activation_norm = signals.get("activation_norm")
 
         # EMA for loss spike detection
         if self.total_steps == 0:
@@ -297,6 +342,12 @@ class SAEEventControlScheduler:
         if l0 is not None or ev_for_buffer is not None or dead_pct is not None:
             self.buffer.push_sae(l0=l0, ev=ev_for_buffer, dead_pct=dead_pct)
 
+        if activation_norm is not None:
+            self._update_activation_norm(float(activation_norm))
+        if l0 is not None:
+            self._update_l0_progress(float(l0))
+            self._maybe_trigger_stall_pulse(float(l0), dead_pct)
+
         # -- SAE-specific event detection (uses log-window-rate EV signal) --
         sae_event = self._detect_sae_events(signals) if ev_check_due else None
 
@@ -321,6 +372,8 @@ class SAEEventControlScheduler:
         final_event = sae_event or base_event
         if final_event:
             self._maybe_transition(final_event)
+            if final_event in ("GRADIENT_SPIKE", "LOSS_SPIKE", "UNSTABLE", "DEAD_EMERGENCY"):
+                self._dampen_energy(final_event)
 
         # -- Compute LR modulation --------------------------------------
         lrs = self._compute_lrs()
@@ -355,7 +408,8 @@ class SAEEventControlScheduler:
         """
         cfg = self.config
         error = current_l0 - cfg.target_l0   # signed (negative means we're below target)
-        new_lambda = self.lambda_l0 + cfg.al_dual_step * error
+        gain = self._landing_lambda_gain(current_l0, error)
+        new_lambda = self.lambda_l0 + cfg.al_dual_step * gain * error
         # Project onto [lambda_min, lambda_max]
         new_lambda = max(cfg.lambda_l0_min, min(cfg.lambda_l0_max, new_lambda))
         self.lambda_l0 = new_lambda
@@ -365,8 +419,30 @@ class SAEEventControlScheduler:
         if cfg.verbose and self.total_steps % cfg.al_log_every == 0:
             print(
                 f"  [AL @ step {self.total_steps}] lambda={self.lambda_l0:.3e} "
-                f"(L0={current_l0:.1f}, target={cfg.target_l0}, error={error:+.1f})"
+                f"(L0={current_l0:.1f}, target={cfg.target_l0}, error={error:+.1f}, gain={gain:.1f}x)"
             )
+
+    def _landing_lambda_gain(self, current_l0: float, error: float) -> float:
+        cfg = self.config
+        if error <= 0:
+            return 1.0
+        target = max(cfg.target_l0, 1e-8)
+        error_rel = error / target
+        if error_rel <= cfg.l0_tolerance:
+            return 1.0
+        if error_rel > cfg.al_landing_zone_rel:
+            return 1.0
+
+        progress = self._l0_progress_fast
+        if progress is not None and progress >= cfg.al_landing_min_progress:
+            return 1.0
+
+        span = max(cfg.al_landing_zone_rel - cfg.l0_tolerance, 1e-8)
+        zone_frac = min(1.0, max(0.0, (error_rel - cfg.l0_tolerance) / span))
+        stall_frac = 1.0
+        if progress is not None:
+            stall_frac = min(1.0, max(0.0, (cfg.al_landing_min_progress - progress) / cfg.al_landing_min_progress))
+        return 1.0 + (cfg.al_landing_gain_max - 1.0) * max(zone_frac, stall_frac)
 
     # -- L0 P-Controller (legacy -- kept for use_augmented_lagrangian=False) ----
 
@@ -617,6 +693,157 @@ class SAEEventControlScheduler:
 
     # -- LR computation ---------------------------------------------------------
 
+    def _update_activation_norm(self, activation_norm: float):
+        if activation_norm <= 0:
+            return
+        if self._activation_norm_ema is None:
+            self._activation_norm_ema = activation_norm
+        else:
+            self._activation_norm_ema = 0.95 * self._activation_norm_ema + 0.05 * activation_norm
+
+    def _update_l0_progress(self, current_l0: float):
+        if self._prev_l0 is None:
+            self._prev_l0 = current_l0
+            return
+        # Positive progress means L0 is moving down toward the target from above.
+        progress = self._prev_l0 - current_l0
+        self._prev_l0 = current_l0
+        if self._l0_progress_fast is None:
+            self._l0_progress_fast = progress
+            self._l0_progress_slow = progress
+            return
+        cfg = self.config
+        self._l0_progress_fast = (
+            cfg.stall_fast_alpha * progress
+            + (1.0 - cfg.stall_fast_alpha) * self._l0_progress_fast
+        )
+        self._l0_progress_slow = (
+            cfg.stall_slow_alpha * progress
+            + (1.0 - cfg.stall_slow_alpha) * self._l0_progress_slow
+        )
+
+    def _convergence_locked(self, l0: Optional[float] = None) -> bool:
+        if l0 is None:
+            if self.buffer.l0_values:
+                l0 = self.buffer.l0_values[-1]
+            else:
+                l0 = self.buffer.l0_mean(window=3)
+        if l0 <= 0:
+            return False
+        target = self.config.target_l0
+        return l0 <= target * (1.0 + self.config.convergence_lockout_rel)
+
+    def _maybe_trigger_stall_pulse(self, current_l0: float, dead_pct: Optional[float]):
+        cfg = self.config
+        if not cfg.stall_pulse_enabled:
+            return
+        if self.total_steps < cfg.stall_warmup_steps:
+            return
+        if self._convergence_locked(current_l0):
+            self._stall_pulse_remaining = 0
+            self._stall_pulse_multiplier = 1.0
+            return
+        if self._stall_pulse_remaining > 0:
+            return
+        if self.total_steps - self._last_stall_pulse_step < cfg.stall_cooldown_steps:
+            return
+        if dead_pct is not None and dead_pct >= cfg.stall_dead_suppress_pct:
+            return
+        if self._l0_progress_fast is None or self._l0_progress_slow is None:
+            return
+
+        fast = self._l0_progress_fast
+        slow = self._l0_progress_slow
+        structural_stall = (
+            slow > cfg.stall_min_slow_progress
+            and fast < slow * cfg.stall_crossover_ratio
+        )
+        flat_stall = abs(fast) < cfg.stall_abs_progress_floor and abs(slow) < cfg.stall_abs_progress_floor
+        if not (structural_stall or flat_stall):
+            return
+
+        distance = max(0.0, current_l0 - cfg.target_l0)
+        distance_frac = min(1.0, distance / max(cfg.target_l0 * 3.0, 1.0))
+        extra = cfg.stall_pulse_max_extra * distance_frac
+        pulse = max(cfg.stall_pulse_min_multiplier, 1.0 + extra)
+        self._stall_pulse_multiplier = min(pulse, cfg.lr_energy_max)
+        self._stall_pulse_remaining = cfg.stall_pulse_steps
+        self._last_stall_pulse_step = self.total_steps
+
+        if cfg.mode_verbose:
+            prefix = f"[{self.mode_label}] " if self.mode_label else ""
+            print(
+                f"{prefix}[SAE-ACS] L0 stall pulse x{self._stall_pulse_multiplier:.2f} "
+                f"for {cfg.stall_pulse_steps} steps "
+                f"(L0={current_l0:.1f}, fast={fast:.3f}, slow={slow:.3f})"
+            )
+
+    def _dampen_energy(self, cause: str):
+        cfg = self.config
+        old = self._energy_dampen
+        self._energy_dampen = max(0.25, self._energy_dampen * cfg.early_pulse_dampen)
+        self._stall_pulse_remaining = 0
+        self._stall_pulse_multiplier = 1.0
+        if cfg.mode_verbose and old != self._energy_dampen:
+            prefix = f"[{self.mode_label}] " if self.mode_label else ""
+            print(f"{prefix}[SAE-ACS] energy dampened x{self._energy_dampen:.2f} ({cause})")
+
+    def _activation_lr_multiplier(self) -> float:
+        cfg = self.config
+        if cfg.activation_norm_ref is None or cfg.activation_norm_ref <= 0:
+            return 1.0
+        if self._activation_norm_ema is None or self._activation_norm_ema <= 0:
+            return 1.0
+        raw = (self._activation_norm_ema / cfg.activation_norm_ref) ** cfg.activation_norm_lr_alpha
+        return max(cfg.activation_norm_lr_min, min(cfg.activation_norm_lr_max, raw))
+
+    def _initial_lr_multiplier(self) -> float:
+        cfg = self.config
+        if cfg.initial_lr_multiplier <= 1.0:
+            return 1.0
+        if cfg.initial_lr_decay_steps <= 0:
+            return cfg.initial_lr_multiplier
+        decay = max(0.0, 1.0 - self.total_steps / cfg.initial_lr_decay_steps)
+        return 1.0 + (cfg.initial_lr_multiplier - 1.0) * decay
+
+    def _early_pulse_multiplier(self) -> float:
+        cfg = self.config
+        if cfg.early_pulse_steps <= 0 or cfg.early_pulse_multiplier <= 1.0:
+            return 1.0
+        if self.total_steps > cfg.early_pulse_steps:
+            return 1.0
+        decay = max(0.0, 1.0 - self.total_steps / cfg.early_pulse_steps)
+        return 1.0 + (cfg.early_pulse_multiplier - 1.0) * decay
+
+    def _stall_lr_multiplier(self) -> float:
+        if self._stall_pulse_remaining <= 0:
+            return 1.0
+        cfg = self.config
+        decay = self._stall_pulse_remaining / max(cfg.stall_pulse_steps, 1)
+        self._stall_pulse_remaining -= 1
+        return 1.0 + (self._stall_pulse_multiplier - 1.0) * decay
+
+    def _energy_lr_multiplier(self) -> float:
+        if self._convergence_locked():
+            return 1.0
+        mult = (
+            self._initial_lr_multiplier()
+            * self._activation_lr_multiplier()
+            * self._early_pulse_multiplier()
+            * self._stall_lr_multiplier()
+            * self._energy_dampen
+        )
+        return max(0.25, min(self.config.lr_energy_max, mult))
+
+    def _constraint_lr_floor(self) -> float:
+        cfg = self.config
+        if not self.buffer.l0_values:
+            return 0.0
+        l0 = self.buffer.l0_values[-1]
+        if l0 > cfg.target_l0 * (1.0 + cfg.l0_tolerance):
+            return cfg.constraint_lr_floor
+        return 0.0
+
     def _compute_lrs(self) -> List[float]:
         cfg = self.config
         step = self.total_steps
@@ -628,6 +855,10 @@ class SAEEventControlScheduler:
             progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
             backbone = 0.5 * (1.0 + math.cos(math.pi * progress))
 
+        if not self._convergence_locked() and step <= cfg.early_pulse_steps:
+            backbone = max(backbone, cfg.early_pulse_warmup_floor)
+        backbone = max(backbone, self._constraint_lr_floor())
+
         # Mode modulation
         mult = 1.0
         if self.mode == "RECOVERY":
@@ -637,7 +868,8 @@ class SAEEventControlScheduler:
         elif self.mode == "STABILIZE":
             mult = cfg.recovery_lr_factor * 0.8
 
-        return [base * backbone * mult for base in self.base_lrs]
+        energy_mult = self._energy_lr_multiplier()
+        return [base * backbone * mult * energy_mult for base in self.base_lrs]
 
     def _apply_mode_tweaks(self):
         cfg = self.config
@@ -669,5 +901,10 @@ class SAEEventControlScheduler:
             "event_counter": self.event_counter,
             "ev_below_floor": self._ev_below_floor_count,
             "ev_above_floor": self._ev_above_floor_count,
+            "activation_norm_ema": self._activation_norm_ema,
+            "l0_progress_fast": self._l0_progress_fast,
+            "l0_progress_slow": self._l0_progress_slow,
+            "stall_pulse_remaining": self._stall_pulse_remaining,
+            "energy_dampen": self._energy_dampen,
             "recent_transitions": self.transition_log[-5:],
         }

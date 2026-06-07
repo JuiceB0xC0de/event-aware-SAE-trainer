@@ -93,7 +93,7 @@ python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B \
 
 # Resume from checkpoint after preemption/interruption
 python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it \
-    --resume-from ./data/saes/layer_03_s0_latest/checkpoint_full.pt
+    --resume-from ./data/saes/google_gemma-4-e2b-it/layer_03_s0/checkpoint_full.pt
 
 # Ultra-low disk (50GB): train with 500 batches, more epoching
 python sae_trainer_rolling.py --pool-batches 500 --end-layer 4
@@ -117,17 +117,19 @@ python sae_trainer_rolling.py --pool-batches 500 --end-layer 4
 
 ## Checkpoint resume
 
-At the end of each layer, training saves `checkpoint_full.pt` with:
+During training and at the end of each layer, training saves `checkpoint_full.pt` with:
 - Model weights (`sae_state`)
 - Optimizer state (`optimizer_state`)
 - Scheduler state (lambda, mode, event history)
 - RNG states (CUDA + CPU)
 - Dead-feature stats (`steps_since_fired`, `feature_fire_counts`)
-- Activation provider cursor (resumes at exact position in shuffled pool)
+
+The async activation reader is deliberately optimized for throughput; after resume it restarts
+from the cached activation pool rather than serializing the in-flight prefetch queue.
 
 To resume after interruption:
 ```bash
-python sae_trainer_rolling.py --resume-from ./data/saes/layer_03_s0_latest/checkpoint_full.pt
+python sae_trainer_rolling.py --resume-from ./data/saes/google_gemma-4-e2b-it/layer_03_s0/checkpoint_full.pt
 ```
 
 ## Tests

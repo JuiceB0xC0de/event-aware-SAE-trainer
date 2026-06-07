@@ -11,27 +11,30 @@ The trainer now runs on **consumer hardware** with these presets:
 | **24GB VRAM** | `--microbatch-tokens 8192` | 4x VRAM reduction via gradient accumulation |
 | **100GB disk** | `--pool-batches 1000` | 4x disk reduction (400GB → 100GB) |
 | **50GB disk** | `--pool-batches 500` | 8x disk reduction, more epoching |
-| **Preemption** | `--resume-from ckpt.pt` | Resume from exact position |
+| **Preemption** | `--resume-from ckpt.pt` | Resume model/optimizer/scheduler state |
 
 ## Changes
 
 ### 1. Checkpoint Resume (Full State)
 
-**What it saves** (`checkpoint_full.pt` at end of each layer):
+**What it saves** (`checkpoint_full.pt` periodically and at end of each layer):
 - Model weights (`sae_state`)
 - Optimizer state (momentum, variance)
 - Scheduler state (lambda, mode, event history, `_lambda_history`)
 - RNG states (CUDA + CPU)
 - Dead-feature stats (`steps_since_fired`, `feature_fire_counts`)
-- Activation provider cursor (shuffled order + consumed shards)
+
+The async activation reader restarts from the cached pool after resume. This avoids
+serializing large in-flight prefetch queues while still preserving the expensive
+training state.
 
 **Usage:**
 ```bash
 # Resume after interruption
-python sae_trainer_rolling.py --resume-from ./data/saes/layer_03_s0_latest/checkpoint_full.pt
+python sae_trainer_rolling.py --resume-from ./data/saes/google_gemma-4-e2b-it/layer_03_s0/checkpoint_full.pt
 ```
 
-**Why it matters:** Multi-day runs on consumer hardware are now resumable. No lost work on preemption, power loss, or scheduled maintenance.
+**Why it matters:** Multi-day runs on consumer hardware are now resumable without losing model, optimizer, scheduler, or dead-feature state on preemption, power loss, or scheduled maintenance.
 
 ### 2. Configurable Pool Size (`--pool-batches`)
 
@@ -54,7 +57,7 @@ python sae_trainer_rolling.py --pool-batches 1000 --end-layer 8
 python sae_trainer_rolling.py --pool-batches 500 --end-layer 4
 ```
 
-**Note:** Smaller pools mean more epoching. The shuffling is preserved across epochs via provider state checkpointing.
+**Note:** Smaller pools mean more epoching. On resume, the cached activation stream restarts from the pool.
 
 ### 3. Gradient Accumulation (`--microbatch-tokens`)
 
