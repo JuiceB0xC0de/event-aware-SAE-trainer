@@ -114,6 +114,7 @@ POOL_BATCHES_DEFAULT = 4000
 import torch
 import torch.nn as nn
 
+
 class _JumpReLU(torch.autograd.Function):
     """JumpReLU activation with straight-through estimator for threshold gradient.
     Forward:  y = pre * H(pre - theta)
@@ -158,60 +159,23 @@ class _L0Indicator(torch.autograd.Function):
         grad_log_threshold = grad_threshold * threshold
         return None, grad_log_threshold, None
 
-def _make_sae(d_in: int, n_features: int, seed: int = 0):
-    torch.manual_seed(seed)
-    return JumpReLUSAE(d_in, n_features)
-
-    class _JumpReLU(torch.autograd.Function):
-        """JumpReLU activation with straight-through estimator for threshold gradient.
-        Forward:  y = pre * H(pre - theta)
-        Backward: dy/dpre passes through where active (relu-like);
-                  dy/dtheta uses rectangle-kernel pseudo-derivative
-        """
-        @staticmethod
-        def forward(ctx, pre, log_threshold, bandwidth):
-            threshold = log_threshold.exp()
-            gate = (pre > threshold).to(pre.dtype)
-            ctx.save_for_backward(pre, threshold, gate)
-            ctx.bandwidth = bandwidth
-            return pre * gate
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            pre, threshold, gate = ctx.saved_tensors
-            eps = ctx.bandwidth
-            grad_pre = grad_output * gate
-            in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
-            sum_dims = tuple(range(grad_output.ndim - 1))
-            grad_threshold = -(pre * in_band * grad_output).sum(dim=sum_dims)
-            grad_log_threshold = grad_threshold * threshold
-            return grad_pre, grad_log_threshold, None
-
-    class JumpReLUSAE(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.d_in      = d_in
-            self.n_features = n_features
-            self.W_enc = nn.Linear(d_in, n_features, bias=True)
-            self.W_dec = nn.Linear(n_features, d_in, bias=False)
-            self.b_dec = nn.Parameter(torch.zeros(d_in))
-            self.log_threshold = nn.Parameter(
-                torch.full((n_features,), math.log(INIT_THRESHOLD))
-            )
-            # W_dec orthonormal, W_enc tied to W_dec.T at init (Anthropic recipe)
-            nn.init.orthogonal_(self.W_dec.weight)
-            self._normalize_decoder()
-            with torch.no_grad():
-                self.W_enc.weight.copy_(self.W_dec.weight.t())
-                self.W_enc.bias.zero_()
-
-        def _normalize_decoder(self):
-            with torch.no_grad():
-                # W_dec.weight is [d_in, n_features]; each FEATURE direction is a COLUMN.
-                # Normalize columns to unit norm so L0 loss is meaningful (each firing = a
-                # unit-norm contribution to recon).
-                norms = self.W_dec.weight.norm(dim=0, keepdim=True).clamp(min=1e-8)  # [1, n_features]
-                self.W_dec.weight.div_(norms)
+class JumpReLUSAE(nn.Module):
+    def __init__(self, d_in: int, n_features: int):
+        super().__init__()
+        self.d_in      = d_in
+        self.n_features = n_features
+        self.W_enc = nn.Linear(d_in, n_features, bias=True)
+        self.W_dec = nn.Linear(n_features, d_in, bias=False)
+        self.b_dec = nn.Parameter(torch.zeros(d_in))
+        self.log_threshold = nn.Parameter(
+            torch.full((n_features,), math.log(INIT_THRESHOLD))
+        )
+        # W_dec orthonormal, W_enc tied to W_dec.T at init (Anthropic recipe)
+        nn.init.orthogonal_(self.W_dec.weight)
+        self._normalize_decoder()
+        with torch.no_grad():
+            self.W_enc.weight.copy_(self.W_dec.weight.t())
+            self.W_enc.bias.zero_()
 
     def _normalize_decoder(self):
         with torch.no_grad():
@@ -228,8 +192,8 @@ def _make_sae(d_in: int, n_features: int, seed: int = 0):
     def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
         return self.W_enc(x - self.b_dec)
 
-        def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return (pre > self.log_threshold.exp()).to(pre.dtype)
+    def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
+        return _JumpReLU.apply(pre, self.log_threshold, STE_BANDWIDTH)
 
     def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
         return _L0Indicator.apply(pre, self.log_threshold, STE_BANDWIDTH)
@@ -241,6 +205,12 @@ def _make_sae(d_in: int, n_features: int, seed: int = 0):
         acts = self.encode(x, k=k)
         x_hat = self.decode(acts)
         return x_hat, acts
+
+def _make_sae(d_in: int, n_features: int, seed: int = 0):
+    torch.manual_seed(seed)
+    return JumpReLUSAE(d_in, n_features)
+
+
 
 
 # ===========================================================================
