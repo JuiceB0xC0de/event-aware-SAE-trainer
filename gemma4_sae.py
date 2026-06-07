@@ -128,7 +128,7 @@ class SAETainer:
     @modal.method()
     def train(self, layer_range: str, capture: str, expansion: int = 32,
               pool_batches: int = 2000, max_steps: int = 15000,
-              microbatch_tokens: int = 32768) -> dict:
+              microbatch_tokens: int = 32768, resume_from: str | None = None) -> dict:
         """
         Train SAEs on a range of layers.
 
@@ -139,6 +139,7 @@ class SAETainer:
             pool_batches: activation batches to cache (default 2000)
             max_steps: max training steps per layer
             microbatch_tokens: for gradient accumulation (default 32k = no accum)
+            resume_from: optional /data/.../checkpoint_full.pt for the first trained layer
         """
         import os
         import sys
@@ -159,6 +160,8 @@ class SAETainer:
         print(f"  Capture: {capture}")
         print(f"  Expansion: {expansion}x")
         print(f"  Pool batches: {pool_batches}")
+        if resume_from:
+            print(f"  Resume: {resume_from}")
         print(f"{'='*60}\n")
 
         # Run training
@@ -172,7 +175,7 @@ class SAETainer:
                               #   modal run gemma4_sae.py::pretokenize
             max_steps=max_steps,
             bdec_batches=50,
-            resume_from=None,
+            resume_from=resume_from,
             push=False,  # don't push to HF, save locally
             capture=capture,
             model_id=self.model_path,
@@ -283,6 +286,7 @@ def main(
     expansion: int = 32,
     pool_batches: int = 2000,
     max_steps: int = 15000,
+    resume_from: str | None = None,
 ):
     """
     Train SAEs on Gemma-4 E4B layers.
@@ -290,6 +294,7 @@ def main(
     Examples:
         modal run gemma4_sae.py --layer-range 0,15 --capture rolling
         modal run gemma4_sae.py --layer-range 15,42 --capture auto
+        modal run gemma4_sae.py --layer-range 5,10 --capture rolling --resume-from /data/saes/data_models_gemma-4-e4b/layer_05_s0/checkpoint_full.pt
     """
     tainer = SAETainer()
     result = tainer.train.remote(
@@ -298,6 +303,7 @@ def main(
         expansion=expansion,
         pool_batches=pool_batches,
         max_steps=max_steps,
+        resume_from=resume_from,
     )
     print(f"\nTraining complete: {result['status']}")
     print(f"Layers trained: {result['layers']}")

@@ -14,11 +14,13 @@ Two control loops, one event detection engine.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
+import json
 import math
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -76,6 +78,8 @@ class SAEAECSConfig:
     al_landing_zone_rel: float = 0.35    # final-stretch lambda boost zone above target
     al_landing_min_progress: float = 0.08  # L0/step; below this while above band = stalled
     al_landing_gain_max: float = 16.0    # max multiplier on dual gain in final stretch
+    al_slingshot_overshoot_rel: float = 0.10  # aim below K before releasing lambda pressure
+    al_slingshot_gain_max: float = 24.0   # dual gain while L0 is still above K
 
     # -- Legacy P-controller knobs (kept for use_augmented_lagrangian=False) -
     lambda_adjust_factor: float = 1.0    # multiplicative step per adjustment (1.0 = frozen)
@@ -110,7 +114,7 @@ class SAEAECSConfig:
     activation_norm_lr_max: float = 1.45
     lr_energy_max: float = 2.0
     convergence_lockout_rel: float = 0.25
-    constraint_lr_floor: float = 0.08    # min LR fraction while L0 is still above tolerance band
+    constraint_lr_floor: float = 0.12    # min LR fraction while L0 is still above target
 
     # -- Early pulse ---------------------------------------------------------
     early_pulse_steps: int = 400
@@ -131,6 +135,15 @@ class SAEAECSConfig:
     stall_min_slow_progress: float = 0.10
     stall_abs_progress_floor: float = 0.05
     stall_dead_suppress_pct: float = 12.0
+
+    # -- Live-tune dials (runtime overrides via JSON file) --------------------
+    # Write a JSON file to this path with any of these keys to override at runtime:
+    #   lambda_l0_max, al_mu, al_dual_step, target_l0, lambda_l0_override
+    # The scheduler picks up changes every live_tune_every steps.
+    # Set to None or "" to disable. Set to a path like "live_tune.json" to enable.
+    live_tune_path: Optional[str] = None
+    live_tune_path_alt: str = "/tmp/live_tune.json"  # fallback: always container-local
+    live_tune_every: int = 50        # check for overrides every N steps
 
 
 class SAESignalBuffer:
@@ -301,6 +314,10 @@ class SAEEventControlScheduler:
         self._last_stall_pulse_step: int = -10**9
         self._energy_dampen: float = 1.0
 
+        # Live-tune state
+        self._live_tune_mtime: float = 0.0
+        self._live_tune_applied: Dict[str, object] = {}
+
     def step(self, signals: Dict) -> str:
         """Advance scheduler one step.
 
@@ -333,6 +350,10 @@ class SAEEventControlScheduler:
         self.buffer.push_base(loss, grad_norm)
         self.total_steps += 1
         self.mode_steps += 1
+
+        # -- Live-tune: pick up runtime parameter overrides from JSON file --
+        if self.config.live_tune_path and self.total_steps % max(1, self.config.live_tune_every) == 0:
+            self._apply_live_tune()
 
         ev_check_due = (
             ev is not None
@@ -408,8 +429,10 @@ class SAEEventControlScheduler:
         """
         cfg = self.config
         error = current_l0 - cfg.target_l0   # signed (negative means we're below target)
-        gain = self._landing_lambda_gain(current_l0, error)
-        new_lambda = self.lambda_l0 + cfg.al_dual_step * gain * error
+        control_target = self._dual_control_target(current_l0)
+        control_error = current_l0 - control_target
+        gain = self._landing_lambda_gain(current_l0, control_error)
+        new_lambda = self.lambda_l0 + cfg.al_dual_step * gain * control_error
         # Project onto [lambda_min, lambda_max]
         new_lambda = max(cfg.lambda_l0_min, min(cfg.lambda_l0_max, new_lambda))
         self.lambda_l0 = new_lambda
@@ -419,15 +442,24 @@ class SAEEventControlScheduler:
         if cfg.verbose and self.total_steps % cfg.al_log_every == 0:
             print(
                 f"  [AL @ step {self.total_steps}] lambda={self.lambda_l0:.3e} "
-                f"(L0={current_l0:.1f}, target={cfg.target_l0}, error={error:+.1f}, gain={gain:.1f}x)"
+                f"(L0={current_l0:.1f}, target={cfg.target_l0}, error={error:+.1f}, "
+                f"control_target={control_target:.1f}, gain={gain:.1f}x)"
             )
 
-    def _landing_lambda_gain(self, current_l0: float, error: float) -> float:
+    def _dual_control_target(self, current_l0: float) -> float:
         cfg = self.config
-        if error <= 0:
+        if current_l0 > cfg.target_l0:
+            return cfg.target_l0 * (1.0 - cfg.al_slingshot_overshoot_rel)
+        return cfg.target_l0
+
+    def _landing_lambda_gain(self, current_l0: float, control_error: float) -> float:
+        cfg = self.config
+        if control_error <= 0:
             return 1.0
+        if current_l0 > cfg.target_l0:
+            return cfg.al_slingshot_gain_max
         target = max(cfg.target_l0, 1e-8)
-        error_rel = error / target
+        error_rel = control_error / target
         if error_rel <= cfg.l0_tolerance:
             return 1.0
         if error_rel > cfg.al_landing_zone_rel:
@@ -527,8 +559,9 @@ class SAEEventControlScheduler:
         l0_mean = self.buffer.l0_mean(window=3)
         l0_in_target = (
             l0_mean > 0
-            and abs(l0_mean - self.config.target_l0)
-                < self.config.target_l0 * self.config.l0_tolerance
+            and self.config.target_l0 * (1.0 - self.config.al_slingshot_overshoot_rel)
+                <= l0_mean
+                <= self.config.target_l0
         )
 
         # Track lambda history (separate from the buffer, since buffer fields are signals not state)
@@ -788,6 +821,104 @@ class SAEEventControlScheduler:
             prefix = f"[{self.mode_label}] " if self.mode_label else ""
             print(f"{prefix}[SAE-ACS] energy dampened x{self._energy_dampen:.2f} ({cause})")
 
+    # -- Live-tune: runtime parameter overrides from JSON file -----------------
+
+    # Tunable knobs and their types. Write any subset to live_tune.json:
+    #   {"lambda_l0_max": 0.1, "al_mu": 5e-5, "target_l0": 300, ...}
+    # Special key "lambda_l0_override" directly sets lambda (nuclear option).
+    # Delete the file or set keys to null to revert to config defaults.
+    _LIVE_TUNE_KEYS = {
+        "lambda_l0_max": float,
+        "lambda_l0_min": float,
+        "al_mu": float,
+        "al_dual_step": float,
+        "al_slingshot_gain_max": float,
+        "al_landing_zone_rel": float,
+        "al_landing_min_progress": float,
+        "al_landing_gain_max": float,
+        "al_slingshot_overshoot_rel": float,
+        "target_l0": float,
+        "l0_tolerance": float,
+        "constraint_lr_floor": float,
+        "lambda_l0_override": float,  # directly set lambda, bypasses integrator
+    }
+
+    def _apply_live_tune(self):
+        """Check live_tune.json for runtime parameter overrides.
+
+        Checks TWO paths: live_tune_path (Volume, may lag) and
+        live_tune_path_alt (/tmp, always container-local). The alt path
+        takes priority if both exist. Picks up changes by comparing mtime;
+        only re-reads when the file changes. Prints a summary of overrides.
+        """
+        cfg = self.config
+        paths = [p for p in [cfg.live_tune_path, getattr(cfg, 'live_tune_path_alt', None)]
+                 if p]
+        if not paths:
+            return
+        # Find the most recently modified file that exists
+        best_p = None
+        best_mtime = 0
+        for path in paths:
+            p = Path(path)
+            try:
+                if p.exists():
+                    mt = p.stat().st_mtime
+                    if mt > best_mtime:
+                        best_mtime = mt
+                        best_p = p
+            except OSError:
+                continue
+        if best_p is None:
+            # Neither file exists — revert all overrides to config defaults
+            if self._live_tune_applied:
+                for key in list(self._live_tune_applied):
+                    setattr(cfg, key, getattr(cfg, key))
+                self._live_tune_applied = {}
+            return
+        if best_mtime == self._live_tune_mtime:
+            return  # no change
+        self._live_tune_mtime = best_mtime
+        try:
+            text = best_p.read_text()
+            if not text.strip():
+                return
+            overrides = json.loads(text)
+        except (json.JSONDecodeError, OSError) as e:
+            if cfg.verbose and self.total_steps % 500 == 0:
+                print(f"  [live-tune] WARNING: failed to read {best_p}: {e}")
+            return
+        applied = {}
+        for key, expected_type in self._LIVE_TUNE_KEYS.items():
+            if key not in overrides:
+                continue
+            val = overrides[key]
+            if val is None:
+                # Revert to default — remove from applied, don't set
+                if key in self._live_tune_applied:
+                    self._live_tune_applied.pop(key, None)
+                continue
+            try:
+                val = expected_type(val)
+            except (ValueError, TypeError):
+                continue
+            if key == "lambda_l0_override":
+                # Directly set lambda, bypass integrator
+                self.lambda_l0 = val
+                applied[key] = val
+                continue
+            # Override the config attribute
+            old = getattr(cfg, key, None)
+            setattr(cfg, key, val)
+            applied[key] = val
+            self._live_tune_applied[key] = val
+
+        if applied and cfg.verbose:
+            prefix = f"[{self.mode_label}] " if self.mode_label else ""
+            parts = [f"{k}={v:.3e}" if isinstance(v, float) and abs(v) < 0.01 else f"{k}={v}"
+                      for k, v in applied.items()]
+            print(f"  {prefix}[live-tune @ step {self.total_steps}] {', '.join(parts)}")
+
     def _activation_lr_multiplier(self) -> float:
         cfg = self.config
         if cfg.activation_norm_ref is None or cfg.activation_norm_ref <= 0:
@@ -840,7 +971,7 @@ class SAEEventControlScheduler:
         if not self.buffer.l0_values:
             return 0.0
         l0 = self.buffer.l0_values[-1]
-        if l0 > cfg.target_l0 * (1.0 + cfg.l0_tolerance):
+        if l0 > cfg.target_l0:
             return cfg.constraint_lr_floor
         return 0.0
 

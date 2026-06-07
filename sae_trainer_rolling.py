@@ -56,6 +56,16 @@ def _slug(model_id: str) -> str:
     return model_id.strip("/").replace("/", "_").replace(" ", "_").lower()
 
 
+def _l0_crossed_target(l0: float, target_l0: float) -> bool:
+    """True once the sparsity controller has pushed L0 through the target."""
+    return l0 <= target_l0
+
+
+def _post_peak_decline_is_bad(ev: float, best_ev: float, margin: float, floor: float) -> bool:
+    """Catastrophe guard: ignore normal EV sag unless quality is also absolutely low."""
+    return (best_ev - ev) >= margin and ev < floor
+
+
 # Default model -- override per-run with --model-id / $SAE_MODEL_ID. Nothing below is
 # hardcoded to a model family except the opt-in 'rolling' capture path.
 MODEL_ID   = os.environ.get("SAE_MODEL_ID", "google/gemma-4-E2B-it")
@@ -705,7 +715,10 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
         "early_pulse_steps", "early_pulse_multiplier",
         "early_pulse_warmup_floor", "early_pulse_dampen",
         "al_landing_zone_rel", "al_landing_min_progress",
-        "al_landing_gain_max",
+        "al_landing_gain_max", "al_slingshot_overshoot_rel",
+        "al_slingshot_gain_max",
+        "lambda_l0_max", "lambda_l0_min", "al_mu", "al_dual_step",
+        "target_l0", "l0_tolerance",
         "stall_pulse_enabled", "stall_warmup_steps",
         "stall_cooldown_steps", "stall_pulse_steps",
         "stall_pulse_max_extra", "stall_pulse_min_multiplier",
@@ -773,9 +786,18 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
         scheduler._stall_pulse_multiplier = sched_state.get("_stall_pulse_multiplier", 1.0)
         scheduler._last_stall_pulse_step = sched_state.get("_last_stall_pulse_step", -10**9)
         scheduler._energy_dampen = sched_state.get("_energy_dampen", 1.0)
-        for k, v in sched_state.get("energy_config", {}).items():
+        default_constraint_lr_floor = scheduler.config.constraint_lr_floor
+        energy_config = sched_state.get("energy_config", {})
+        for k, v in energy_config.items():
             if hasattr(scheduler.config, k):
                 setattr(scheduler.config, k, v)
+        # Older checkpoints were saved before the slingshot controller existed.
+        # Keep their dynamic state, but upgrade the final-stretch policy.
+        if "al_slingshot_gain_max" not in energy_config:
+            scheduler.config.constraint_lr_floor = max(
+                scheduler.config.constraint_lr_floor,
+                default_constraint_lr_floor,
+            )
         return {
             "step": ckpt["step"],
             "rng_state": ckpt["rng_state"],
@@ -837,13 +859,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         cooldown_steps=250, event_persistence=3, mode_verbose=True,
         target_l0=float(K_INIT), l0_tolerance=0.20,
         use_augmented_lagrangian=True, lambda_l0_init=0.0, lambda_l0_min=0.0,
-        # Cranked for E4B (d_in=2560, large residual scale): the 5e-3 cap pinned
-        # lambda and L0 plateaued at ~730 vs target 500. More headroom + a faster
-        # integrator so the pressure arrives while the cosine LR is still alive.
-        lambda_l0_max=3e-2, al_mu=2e-7, al_dual_step=2e-9, al_log_every=LOG_EVERY,
-        ev_floor=0.88, ev_floor_patience=3, ev_drop_thresh=-0.05,
+        # E4B-tuned: the old 5e-3 cap pinned lambda, L0 plateaued at ~730 vs target 500.
+        # Cranked lambda ceiling, boosted mu for quadratic curvature at large slack,
+        # faster integrator. L0 should swing through the target; each pass gives EV
+        # a chance to converge. Live-tune dials let you crank higher if it stalls.
+        lambda_l0_max=0.1, al_mu=5e-5, al_dual_step=2e-8, al_log_every=LOG_EVERY,
+        ev_floor=0.0, ev_floor_patience=10**9, ev_drop_thresh=-1.0,
         ev_stop_thresh=0.88, ev_stop_patience=3,
         dead_emergency_thresh=20.0, dead_emergency_cooldown=5000,
+        # live_tune_path is set after out_dir is created below
     )
     out_suffix = "_frozen" if frozen_decoder else ""
 
@@ -878,6 +902,17 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     out_dir = Path(SAE_DIR) / f"layer_{layer:02d}_s{seed}{out_suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # -- Live-tune dials -------------------------------------------------------
+    # Write a JSON file to override AL/scheduler params at runtime.
+    # Keys: lambda_l0_max, al_mu, al_dual_step, target_l0, lambda_l0_override, ...
+    # The trainer checks TWO paths: the layer output dir (on Volume, may lag)
+    # and /tmp/live_tune.json (always container-local, always fresh).
+    # To crank dials on a running Modal container, use:
+    #   modal exec <app> -- bash -c 'echo "{\"lambda_l0_max\": 0.3}" > /tmp/live_tune.json'
+    # Or from the training container's shell directly.
+    sae_cfg.live_tune_path = str(out_dir / "live_tune.json")
+    sae_cfg.live_tune_path_alt = "/tmp/live_tune.json"
 
     sae = _make_sae(d_in, N_FEATURES, seed).to(device)
     if frozen_decoder:
@@ -995,7 +1030,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     best_ev = -float("inf"); best_ev_step = 0; best_ev_l0 = 0.0
     best_state_in_memory = None; best_state_pending = False
     best_ev_persist_margin = 0.005
-    ev_decline_margin = 0.01; ev_decline_patience = 5; ev_decline_warmup_steps = 1500
+    ev_decline_margin = 0.035
+    ev_decline_floor = 0.95
+    ev_decline_patience = 8
+    ev_decline_warmup_steps = 1500
+    ev_decline_stop_enabled = False
     ev_below_peak_streak = 0
 
     def resample_dead_neurons(dead_mask, err_buf):
@@ -1216,15 +1255,24 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 best_state_pending = False
                 print(f"  [BEST PERSIST @ {step}] peak EV={best_ev:.4f}@{best_ev_step}")
 
-            if step >= ev_decline_warmup_steps and best_ev > -float("inf"):
-                if (best_ev - ev) >= ev_decline_margin:
+            l0_crossed_target = _l0_crossed_target(l0_val, sae_cfg.target_l0)
+            if (
+                ev_decline_stop_enabled
+                and step >= ev_decline_warmup_steps
+                and best_ev > -float("inf")
+                and l0_crossed_target
+            ):
+                if _post_peak_decline_is_bad(ev, best_ev, ev_decline_margin, ev_decline_floor):
                     ev_below_peak_streak += 1
                 else:
                     ev_below_peak_streak = 0
                 if ev_below_peak_streak >= ev_decline_patience:
                     scheduler.should_stop = True
-                    scheduler.stop_reason = (f"Post-peak decline: EV {ev:.4f} below peak "
-                                             f"{best_ev:.4f}@{best_ev_step} for {ev_decline_patience} windows")
+                    scheduler.stop_reason = (f"Post-peak quality collapse after target cross: EV {ev:.4f} below "
+                                             f"floor {ev_decline_floor:.2f} and peak "
+                                             f"{best_ev:.4f}@{best_ev_step} by >= {ev_decline_margin:.3f} "
+                                             f"for {ev_decline_patience} windows "
+                                             f"(L0={l0_val:.1f}, target={sae_cfg.target_l0:.1f})")
                     print(f"  [POST-PEAK STOP @ {step}] {scheduler.stop_reason}")
             else:
                 ev_below_peak_streak = 0

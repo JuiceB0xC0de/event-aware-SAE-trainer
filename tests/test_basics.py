@@ -34,6 +34,12 @@ def test_slug():
     assert t._slug("") == ""
 
 
+def test_l0_crossed_target_gate():
+    assert t._l0_crossed_target(500.0, 500.0) is True
+    assert t._l0_crossed_target(499.9, 500.0) is True
+    assert t._l0_crossed_target(500.1, 500.0) is False
+
+
 def test_sae_dir_composes_under_data_dir():
     assert str(t.DATA_DIR) in t.SAE_DIR
     # output dir is derived from the model id slug, not a hardcoded name

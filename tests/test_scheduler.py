@@ -210,42 +210,80 @@ def test_stall_pulse_triggers_only_far_from_target():
 
 
 def test_landing_stall_accelerates_lambda_not_lr_pulse():
-    slow = _make_scheduler(
+    above_target = _make_scheduler(
+        lambda_l0_max=1.0,
+        l0_tolerance=0.20,
+        al_slingshot_overshoot_rel=0.10,
+        al_slingshot_gain_max=24.0,
+        early_pulse_steps=0,
+    )
+    above_target._prev_l0 = 620.02
+    above_target.step(_sig(l0=620.0))
+
+    old_landing = _make_scheduler(
         lambda_l0_max=1.0,
         l0_tolerance=0.20,
         al_landing_zone_rel=0.35,
         al_landing_min_progress=0.08,
         al_landing_gain_max=16.0,
+        al_slingshot_overshoot_rel=0.10,
+        al_slingshot_gain_max=24.0,
         early_pulse_steps=0,
     )
-    slow._prev_l0 = 620.02
-    slow.step(_sig(l0=620.0))
+    old_landing._prev_l0 = 500.02
+    old_landing.step(_sig(l0=500.0))
 
-    fast = _make_scheduler(
-        lambda_l0_max=1.0,
-        l0_tolerance=0.20,
-        al_landing_zone_rel=0.35,
-        al_landing_min_progress=0.08,
-        al_landing_gain_max=16.0,
-        early_pulse_steps=0,
-    )
-    fast._prev_l0 = 700.0
-    fast.step(_sig(l0=620.0))
-
-    assert slow.lambda_l0 > fast.lambda_l0 * 5
-    assert slow._stall_pulse_remaining == 0
+    assert above_target.lambda_l0 > old_landing.lambda_l0 * 10
+    assert above_target._stall_pulse_remaining == 0
 
 
-def test_constraint_lr_floor_keeps_optimizer_alive_above_tolerance():
+def test_constraint_lr_floor_keeps_optimizer_alive_until_target_crossed():
     sched = _make_scheduler(
         warmup_steps=1,
         total_steps=10_000,
         l0_tolerance=0.20,
-        constraint_lr_floor=0.08,
+        constraint_lr_floor=0.12,
         early_pulse_steps=0,
     )
     sched.total_steps = 9_500
-    sched.step(_sig(l0=620.0))
+    sched.step(_sig(l0=599.0))
 
     lr = sched.optimizer.param_groups[0]["lr"]
     assert lr >= sched.config.base_lr * sched.config.constraint_lr_floor
+
+    crossed = _make_scheduler(
+        warmup_steps=1,
+        total_steps=10_000,
+        l0_tolerance=0.20,
+        constraint_lr_floor=0.12,
+        early_pulse_steps=0,
+    )
+    crossed.total_steps = 9_500
+    crossed.step(_sig(l0=499.0))
+    assert crossed.optimizer.param_groups[0]["lr"] < lr
+
+
+def test_early_stop_requires_sparse_side_crossing():
+    sched = _make_scheduler(
+        l0_tolerance=0.20,
+        al_slingshot_overshoot_rel=0.10,
+        ev_stop_patience=1,
+        ev_check_every=1,
+    )
+    sched.lambda_l0 = 1e-3
+    sched._lambda_history = [1e-3, 1e-3, 1e-3]
+    for l0 in [599.0, 599.0, 599.0]:
+        sched.step({**_sig(l0=l0), "ev": 0.99})
+    assert sched.should_stop is False
+
+    crossed = _make_scheduler(
+        l0_tolerance=0.20,
+        al_slingshot_overshoot_rel=0.10,
+        ev_stop_patience=1,
+        ev_check_every=1,
+    )
+    crossed.lambda_l0 = 1e-3
+    crossed._lambda_history = [1e-3, 1e-3, 1e-3]
+    for l0 in [475.0, 475.0, 475.0]:
+        crossed.step({**_sig(l0=l0), "ev": 0.99})
+    assert crossed.should_stop is True
