@@ -1121,7 +1121,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 x_hat = sae.decode(feat_acts)
 
                 # Cast to fp32 only for loss computation (numerical stability)
-                recon_loss = (acts_mb.float() - x_hat.float()).pow(2).mean() / accum_steps
+                residual_float = acts_mb.float() - x_hat.float()
+                recon_loss = residual_float.pow(2).mean() / accum_steps
 
                 # Sparsity penalty -- IN-GRAPH so the L0 straight-through estimator
                 # actually trains the JumpReLU thresholds. This used to be computed
@@ -1145,7 +1146,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     aux_acts.scatter_(-1, topk_idx, topk_vals)
                     W_dec_dead = sae.W_dec.weight.t()[dead_indices]
                     x_aux = aux_acts @ W_dec_dead
-                    residual_target = acts_mb.float() - x_hat.detach().float()
+                    residual_target = residual_float.detach()
                     aux_loss = ((residual_target - x_aux.float()).pow(2).mean() * AUX_COEFF) / accum_steps
                 else:
                     aux_loss = torch.zeros((), device=acts_mb.device, dtype=torch.float32)
