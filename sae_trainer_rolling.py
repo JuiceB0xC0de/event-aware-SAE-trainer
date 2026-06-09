@@ -1095,7 +1095,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # Get full batch and split into microbatches for accumulation. provider.next_batch
         # already returns the batch on-device, so no extra H2D copy here.
         full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16, on device
-        activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
+        full_batch_float = full_batch.float()
+        activation_norm_step = full_batch_float.pow(2).mean().sqrt().item()
         microbatch_size = microbatch_tokens  # tokens per microbatch
 
         # Pre-compute dead feature parameters for the aux loss. L0/sparsity stay
@@ -1106,10 +1107,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             dead_indices = torch.where(dead_mask_aux)[0]
             eff_k = min(AUX_K, n_dead)
 
+        next_resample_step = min((s for s in RESAMPLE_STEPS if s >= step), default=None)
+        is_resample_buffer_step = next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64
+        mb_errors = [] if is_resample_buffer_step else None
+
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
             end_idx = start_idx + microbatch_size
             acts_mb = full_batch[start_idx:end_idx]  # bf16, [microbatch_tokens, d_in]
+            acts_mb_float = full_batch_float[start_idx:end_idx]
 
             # bf16 forward: keep activations in bf16, cast only for loss computation.
             # Everything the step needs (recon, L0, sparsity, aux, fired-mask) comes
@@ -1121,7 +1127,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 x_hat = sae.decode(feat_acts)
 
                 # Cast to fp32 only for loss computation (numerical stability)
-                residual_float = acts_mb.float() - x_hat.float()
+                residual_float = acts_mb_float - x_hat.float()
                 recon_loss = residual_float.pow(2).mean() / accum_steps
 
                 # Sparsity penalty -- IN-GRAPH so the L0 straight-through estimator
@@ -1161,6 +1167,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             accum_aux_loss += aux_loss.detach().item() * accum_steps
             with torch.no_grad():
                 fired_accum |= (feat_acts.detach() > 0).any(dim=0)
+                if is_resample_buffer_step:
+                    mb_errors.append(residual_float.pow(2).sum(dim=-1).detach())
 
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
@@ -1195,10 +1203,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     steps_since_fired[very_dead] = 0
                     print(f"  [RESET @ {step}] theta->{INIT_THRESHOLD} for {n_reset} dead")
 
-        next_resample_step = min((s for s in RESAMPLE_STEPS if s >= step), default=None)
-        if next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64:
+        if is_resample_buffer_step:
             with torch.no_grad():
-                per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
+                per_token_err = torch.cat(mb_errors, dim=0)
                 top_err_idx = per_token_err.topk(min(64, len(per_token_err))).indices
                 err_buffer.append(full_batch[top_err_idx].detach().cpu())
                 if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
@@ -1227,7 +1234,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if is_log_step:
             dead = (steps_since_fired >= LOG_EVERY).float().mean().item() * 100
             with torch.no_grad():
-                total_var = full_batch.float().var().item()  # .item(): keep ev a python float
+                total_var = full_batch_float.var().item()  # .item(): keep ev a python float
                 ev = 1.0 - (recon_val / total_var) if total_var > 0 else 0.0
         else:
             dead = None; ev = None
