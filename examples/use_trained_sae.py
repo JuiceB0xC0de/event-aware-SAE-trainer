@@ -142,7 +142,7 @@ def main():
     variance = hidden_states.var()
     explained_var = 1 - (reconstructed - hidden_states).var() / variance
 
-    print(f"\n=== Results ===")
+    print("\n=== Results ===")
     print(f"Reconstruction MSE: {mse.item():.6f}")
     print(f"Explained variance: {explained_var.item():.2%}")
 

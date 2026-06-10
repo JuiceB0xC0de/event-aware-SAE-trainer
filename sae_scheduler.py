@@ -19,11 +19,10 @@ __version__ = "0.2.0"
 import json
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import torch
 
 
 @dataclass
@@ -666,7 +665,7 @@ class SAEEventControlScheduler:
 
     def _detect_sae_events(self, signals: Dict) -> Optional[str]:
         """Detect events from SAE-specific signals. Overrides base AECS decisions."""
-        l0 = signals.get("l0")
+        signals.get("l0")
         ev = signals.get("ev")
 
         # Same warmup gate as _detect_base_event: during sparsity calibration the
@@ -931,7 +930,7 @@ class SAEEventControlScheduler:
                 applied[key] = val
                 continue
             # Override the config attribute
-            old = getattr(cfg, key, None)
+            getattr(cfg, key, None)
             setattr(cfg, key, val)
             applied[key] = val
             self._live_tune_applied[key] = val
