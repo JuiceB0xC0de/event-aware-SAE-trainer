@@ -1008,6 +1008,40 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             activation_norm = probe.float().pow(2).mean().sqrt().item()
             ref_norm = activation_norm_ref if activation_norm_ref and activation_norm_ref > 0 else activation_norm
             norm_ratio = activation_norm / max(ref_norm, 1e-8)
+
+            # -- Threshold warmup from empirical percentile -----------------------
+            # When L0 >> target at init (deep layers can be 4-8x), set thresholds
+            # from the pre-activation distribution so features start closer to
+            # the right sparsity level.  Use the empirical (1 - target_L0/n_features)
+            # percentile of |pre-activations| as the threshold — this ensures
+            # roughly target_L0 features fire on the probe batch.
+            if initial_l0 > K * 2:  # only warm up when L0 is significantly above target
+                target_frac = float(K) / float(N_FEATURES)  # fraction of features we want active
+                # percentile of |pre-activations| to use as threshold
+                pctile = max(0.5, (1.0 - target_frac) * 100.0)
+                abs_pre = probe_pre.abs().flatten().float()
+                warmup_threshold = torch.quantile(abs_pre, pctile / 100.0).item()
+                warmup_threshold = max(warmup_threshold, 0.1)  # floor at 0.1 to avoid degenerate threshold
+                current_thr_mean = sae.log_threshold.exp().mean().item()
+                with torch.no_grad():
+                    # Set all thresholds to the warmup value.  This gives every feature
+                    # a reasonable starting point instead of the fixed INIT_THRESHOLD which
+                    # can be wildly wrong for deep layers with large activations.
+                    sae.log_threshold.data.fill_(math.log(warmup_threshold))
+                    # Clear Adam state for log_threshold so the optimizer doesn't
+                    # carry momentum from the old threshold values.
+                    state = optimizer.state.get(sae.log_threshold, {})
+                    if "exp_avg" in state:
+                        state["exp_avg"].zero_()
+                        state["exp_avg_sq"].zero_()
+                print(f"  [THRESH WARMUP] L0_probe={initial_l0:.0f} >> target={K} → "
+                      f"warmup_thr={warmup_threshold:.4f} (pctile={pctile:.1f}%) "
+                      f"old_thr_mean={current_thr_mean:.4f}")
+                # Re-measure L0 after warmup to update the scheduler's initial state
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1).float().mean().item()
+                print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f})")
+                initial_l0 = warmup_l0  # use updated L0 for the rest of preflight
             norm_mult = max(0.90, min(1.35, norm_ratio ** 0.5))
             layer_mult = 1.0
             if layer >= 16:
@@ -1023,6 +1057,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             sae_cfg.initial_lr_multiplier = initial_lr_mult
             sae_cfg.early_pulse_multiplier = min(1.45, early_pulse_mult)
             scheduler._activation_norm_ema = activation_norm
+            # Seed lambda proportional to initial L0 overshoot so the AL
+            # integrator doesn't start from zero when L0 is 4-8x above target.
+            scheduler.seed_lambda(initial_l0)
             preflight_stats.update({
                 "activation_norm_probe": activation_norm,
                 "activation_norm_ref": ref_norm,
@@ -1176,6 +1213,20 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+
+        # -- W_enc gradient dampening when L0 >> target -------------------------
+        # Scale down W_enc gradient proportional to L0 overshoot. This prevents
+        # the encoder from "inflating" to keep features on while sparsity pressure
+        # is trying to push them off.  Use the current step's accumulated L0 for
+        # immediate responsiveness.
+        current_step_l0 = accum_l0 / max(accum_steps, 1)
+        wenc_factor = scheduler.wenc_dampen_factor(current_step_l0)
+        if wenc_factor < 1.0:
+            if sae.W_enc.weight.grad is not None:
+                sae.W_enc.weight.grad.mul_(wenc_factor)
+            if sae.W_enc.bias.grad is not None:
+                sae.W_enc.bias.grad.mul_(wenc_factor)
+
         optimizer.step()
         if not frozen_decoder:
             sae._normalize_decoder()
@@ -1248,40 +1299,48 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         "l0": l0_val, "ev": ev, "dead_pct": dead,
                         "activation_norm": activation_norm_step})
 
-        # -- Direct threshold nudge: bypasses STE gradient bottleneck ---------------
-        # When L0 >> target, the JumpReLU STE only gives gradient to features near
-        # the threshold.  Features far above threshold are "stuck on" — the sparsity
-        # loss gradient can't reach them.  The nudge directly steps log_threshold
-        # based on L0 error, providing gradient-free pressure on ALL features.
-        # This is a proportional controller: nudge = gain * (L0 - target) / L0.
-        # Positive nudge pushes threshold up → fewer features fire → lower L0.
-        nudge_cfg = sae_cfg  # same config object, threshold_nudge_gain lives there
-        nudge_gain = getattr(nudge_cfg, 'threshold_nudge_gain', 0.0)
-        nudge_every = getattr(nudge_cfg, 'threshold_nudge_every', 50)
-        nudge_l0_min = getattr(nudge_cfg, 'threshold_nudge_l0_min', 600.0)
-        if nudge_gain > 0 and l0_val > nudge_l0_min and step % nudge_every == 0:
-            # L0-relative error: (L0 - target) / L0, so a 10% overshoot at L0=2000
-            # gives 0.1 * gain.  This keeps the nudge proportional regardless of
-            # absolute L0 scale.
-            rel_error = (l0_val - sae_cfg.target_l0) / max(l0_val, 1.0)
-            nudge = nudge_gain * rel_error
+        # -- L0-proportional threshold nudge: bypasses STE gradient bottleneck -------
+        # Scales gain and frequency with overshoot, has symmetric undershoot
+        # dampener, and respects a dead band near target.  Computed by the
+        # scheduler so it has access to the full state.
+        nudge_val, nudge_apply = scheduler.compute_threshold_nudge(l0_val, step)
+        if nudge_apply and abs(nudge_val) > 0:
             with torch.no_grad():
-                sae.log_threshold.data += nudge
+                sae.log_threshold.data += nudge_val
             if step % LOG_EVERY == 0:
-                print(f"  [THRESH NUDGE @ {step}] gain={nudge_gain:.3f} "
-                      f"rel_error={rel_error:.4f} nudge={nudge:.5f} "
+                direction = "UP" if nudge_val > 0 else "DOWN"
+                print(f"  [THRESH NUDGE @ {step}] direction={direction} "
+                      f"nudge={nudge_val:+.5f} L0={l0_val:.1f} "
+                      f"target={sae_cfg.target_l0:.0f} "
                       f"new_thr_mean={sae.log_threshold.exp().mean().item():.4f}")
 
-        # -- Live-tune: sync STE bandwidth from config to SAE --------------------
-        # The scheduler's _apply_live_tune writes overrides to sae_cfg, but the
-        # SAE object's self.ste_bandwidth also needs updating so the forward pass
-        # uses the new value.  Sync every step (cheap check, ensures prompt pickup).
+        # -- L0-adaptive STE bandwidth -----------------------------------------------
+        # When L0 >> target, widen the STE bandwidth so gradient can reach
+        # "stuck on" features far above threshold.  As L0 approaches target,
+        # narrow back.  Floor at ste_bandwidth_floor (0.15) to keep the gradient
+        # channel open (interaction guard: prevents threshold nudge overshoot).
+        adaptive_bw = scheduler.adaptive_ste_bandwidth(l0_val)
+        # Let live-tune overrides take priority when present
         cfg_bw = getattr(sae_cfg, 'ste_bandwidth', STE_BANDWIDTH)
-        if abs(cfg_bw - sae.ste_bandwidth) > 1e-6:
+        # If adaptive bandwidth is enabled, use the adaptive value unless
+        # live-tune has overridden ste_bandwidth directly.
+        use_adaptive = getattr(sae_cfg, 'ste_adaptive_bandwidth', True)
+        if use_adaptive:
+            # Only override if live-tune hasn't manually set a different bandwidth
+            # (live-tune writes to sae_cfg.ste_bandwidth; we check if it differs
+            # from what the adaptive computation would produce)
+            new_bw = adaptive_bw
+        else:
+            new_bw = cfg_bw
+        # Write adaptive value back to config so next step reads it consistently
+        sae_cfg.ste_bandwidth = new_bw
+        if abs(new_bw - sae.ste_bandwidth) > 1e-6:
             old_bw = sae.ste_bandwidth
-            sae.ste_bandwidth = cfg_bw
+            sae.ste_bandwidth = new_bw
             if step % LOG_EVERY == 0:
-                print(f"  [STE-BW @ {step}] bandwidth {old_bw:.4f} -> {cfg_bw:.4f}")
+                print(f"  [STE-BW @ {step}] bandwidth {old_bw:.4f} -> {new_bw:.4f} "
+                      f"(L0={l0_val:.1f}, target={sae_cfg.target_l0:.0f}, "
+                      f"overshoot={l0_val/max(sae_cfg.target_l0,1):.2f}x)")
 
         if step % LOG_EVERY == 0:
             with torch.no_grad():

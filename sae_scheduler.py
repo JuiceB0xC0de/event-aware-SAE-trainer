@@ -144,16 +144,69 @@ class SAEAECSConfig:
     #   nudge = nudge_gain * (L0 - target) / L0
     # applied to log_threshold of ALL features (not just near-threshold ones).
     # Positive nudge pushes threshold up → fewer features fire → lower L0.
-    # Set nudge_gain=0.0 to disable.
+    #
+    # The nudge is L0-proportional:
+    #   - Gain scales with overshoot: nudge_gain * max(1, overshoot / approach_scale)
+    #   - Frequency scales with overshoot: more frequent when L0 >> target
+    #   - Symmetric undershoot dampener: when L0 < target, applies a gentle
+    #     downward nudge to prevent overshoot from pulling threshold too high.
+    #   - Dead band near target: suppress nudge within tolerance to avoid
+    #     oscillation with the AL integrator.
+    #
+    # Interaction guard (Fable): bandwidth floor (0.15) ensures STE gradient
+    # stays wide enough to provide a restoring force alongside the nudge.
+    # The undershoot dampener provides symmetry — if L0 drops below target,
+    # the nudge reverses to lower thresholds, preventing the nudge from
+    # overshooting alone.
     threshold_nudge_gain: float = 0.08      # proportional gain (0 = disabled; 0.08 for E4B)
-    threshold_nudge_every: int = 50          # apply every N steps
+    threshold_nudge_every: int = 50          # apply every N steps (base frequency)
     threshold_nudge_l0_min: float = 550.0   # only nudge when L0 > this (buffer below target)
+    # L0-proportional nudge extensions:
+    threshold_nudge_overshoot_scale: float = 2.0   # overshoot ratio where gain reaches max
+    threshold_nudge_gain_max: float = 0.25          # max effective gain (cap proportional scaling)
+    threshold_nudge_freq_overshoot: float = 3.0    # overshoot ratio where frequency doubles
+    threshold_nudge_undershoot_gain: float = 0.04   # gain for downward nudge when L0 < target
+    threshold_nudge_deadband_rel: float = 0.10      # suppress nudge within +/-10% of target
+
+    # -- W_enc gradient dampening -----------------------------------------------
+    # When L0 >> target, W_enc weights adapt to keep features on despite rising
+    # sparsity pressure — a classic SAE pathology where the encoder "inflates"
+    # to overpower the threshold.  This dampens the W_enc gradient proportional
+    # to L0 overshoot, reducing the encoder's ability to fight back while L0
+    # converges.  Blunt but effective — revisit if recon degrades.
+    wenc_dampen_enabled: bool = True
+    wenc_dampen_overshoot_start: float = 2.0   # start dampening at 2x target L0
+    wenc_dampen_max_factor: float = 0.5         # max dampening: scale gradient by (1 - this)
 
     # -- STE bandwidth (gradient channel width) ---------------------------------
     # Default 0.1 matches the JumpReLU paper. Widen (e.g. 0.2-0.3) to give
     # gradient signal to more features near threshold when L0 is stuck.
     # Live-tuneable: write {"ste_bandwidth": 0.3} to live_tune.json.
     ste_bandwidth: float = 0.2
+
+    # -- L0-adaptive STE bandwidth -----------------------------------------------
+    # When L0 >> target, widen the STE bandwidth so gradient can reach features
+    # that are "stuck on" (far above threshold).  As L0 approaches target,
+    # narrow back toward the base.  Floor at ste_bandwidth_floor to prevent
+    # the gradient channel from collapsing entirely.
+    # Interaction guard (Fable): the bandwidth floor (0.15) prevents the
+    # adaptive bandwidth from going so narrow that the threshold nudge (#2)
+    # overshoots alone — the STE gradient channel stays wide enough to
+    # provide a restoring force.
+    ste_adaptive_bandwidth: bool = True          # enable L0-adaptive bandwidth
+    ste_bandwidth_floor: float = 0.15           # never go below this
+    ste_bandwidth_max: float = 0.5              # cap when L0 is very far above target
+    ste_bandwidth_approach_scale: float = 2.0   # overshoot ratio where bandwidth reaches max
+
+    # -- L0-aware lambda warmup --------------------------------------------------
+    # In deep layers, L0 can start 4-8x above target. Starting lambda at 0 means
+    # the AL integrator has to build up from zero, which wastes thousands of steps
+    # while L0 runs away. Seed lambda proportional to the initial overshoot so
+    # the integrator has a head start.
+    # lambda_warmup = warmup_base + warmup_per_overshoot * max(0, initial_l0/target - 1)
+    # Capped at lambda_l0_max. Set warmup_per_overshoot=0.0 to disable.
+    lambda_warmup_base: float = 0.0            # base lambda seed (0 = start from zero normally)
+    lambda_warmup_per_overshoot: float = 5e-3   # lambda added per unit of overshoot ratio
 
     # -- Live-tune dials (runtime overrides via JSON file) --------------------
     # Write a JSON file to this path with any of these keys to override at runtime:
@@ -338,6 +391,32 @@ class SAEEventControlScheduler:
         self._live_tune_mtime: float = 0.0
         self._live_tune_applied: Dict[str, object] = {}
 
+    def seed_lambda(self, initial_l0: float):
+        """Seed lambda proportional to initial L0 overshoot.
+
+        In deep layers, L0 can start 4-8x above target. Starting lambda at
+        0 means the AL integrator wastes thousands of steps building up.
+        This seeds lambda based on how far above target L0 is at init, so
+        the integrator has a head start.
+
+        Call this once from the preflight probe (before training begins).
+        """
+        cfg = self.config
+        if cfg.lambda_warmup_per_overshoot <= 0:
+            return  # disabled
+        target = max(cfg.target_l0, 1.0)
+        overshoot_ratio = max(0.0, initial_l0 / target - 1.0)  # 0 if at/below target
+        seed = cfg.lambda_warmup_base + cfg.lambda_warmup_per_overshoot * overshoot_ratio
+        seed = min(seed, cfg.lambda_l0_max)  # cap at max
+        if seed > self.lambda_l0:
+            old = self.lambda_l0
+            self.lambda_l0 = seed
+            if cfg.mode_verbose:
+                prefix = f"[{self.mode_label}] " if self.mode_label else ""
+                print(f"{prefix}[LAMBDA WARMUP] lambda {old:.3e} -> {seed:.3e} "
+                      f"(initial_l0={initial_l0:.1f}, target={target:.0f}, "
+                      f"overshoot_ratio={overshoot_ratio:.2f}x)")
+
     def step(self, signals: Dict) -> str:
         """Advance scheduler one step.
 
@@ -495,6 +574,121 @@ class SAEEventControlScheduler:
         if progress is not None:
             stall_frac = min(1.0, max(0.0, (cfg.al_landing_min_progress - progress) / cfg.al_landing_min_progress))
         return 1.0 + (cfg.al_landing_gain_max - 1.0) * max(zone_frac, stall_frac)
+
+    # -- L0-adaptive STE bandwidth -----------------------------------------------
+
+    def adaptive_ste_bandwidth(self, current_l0: float) -> float:
+        """Compute adaptive STE bandwidth based on L0 overshoot.
+
+        When L0 >> target, widen bandwidth so gradient can reach features
+        that are far above threshold (the "stuck on" problem).  As L0
+        approaches target, narrow back toward the base.  Floor at
+        ste_bandwidth_floor to keep the gradient channel open.
+
+        Returns the adaptive bandwidth; caller writes it to sae_cfg.ste_bandwidth.
+        """
+        cfg = self.config
+        if not cfg.ste_adaptive_bandwidth:
+            return cfg.ste_bandwidth
+
+        target = max(cfg.target_l0, 1.0)
+        overshoot = current_l0 / target  # e.g. 4.0 means L0 is 4x target
+
+        # Map overshoot to a bandwidth scale in [0, 1].
+        # At overshoot = 1.0 (L0 = target), scale = 0 → bandwidth = floor.
+        # At overshoot = ste_bandwidth_approach_scale, scale = 1 → bandwidth = max.
+        # Between, linearly interpolate.
+        scale = max(0.0, min(1.0, (overshoot - 1.0) / max(cfg.ste_bandwidth_approach_scale - 1.0, 0.01)))
+        bw = cfg.ste_bandwidth_floor + (cfg.ste_bandwidth_max - cfg.ste_bandwidth_floor) * scale
+        return bw
+
+    # -- L0-proportional threshold nudge ------------------------------------------
+
+    def compute_threshold_nudge(self, current_l0: float, step: int) -> Tuple[float, bool]:
+        """Compute threshold nudge value and whether to apply it this step.
+
+        Returns (nudge_value, should_apply).
+        Positive nudge → push threshold up (reduce L0 when above target).
+        Negative nudge → push threshold down (increase L0 when below target).
+        Zero → dead band near target, don't nudge.
+
+        The nudge is proportional to overshoot:
+          - Gain scales with L0 overshoot ratio, capped at gain_max.
+          - Frequency increases with overshoot (every n steps, faster when far).
+          - Symmetric undershoot dampener: gentle downward nudge when L0 < target.
+          - Dead band: suppress nudge within tolerance of target.
+        """
+        cfg = self.config
+        if cfg.threshold_nudge_gain <= 0:
+            return 0.0, False
+
+        target = max(cfg.target_l0, 1.0)
+        overshoot = current_l0 / target  # >1 when above target, <1 when below
+
+        # Dead band: suppress nudge within tolerance of target.
+        # This prevents the nudge from fighting the AL integrator near convergence.
+        within_deadband = abs(current_l0 - target) / target <= cfg.threshold_nudge_deadband_rel
+        if within_deadband:
+            return 0.0, False
+
+        # Overshoot nudge (L0 > target): scale gain with overshoot ratio
+        if current_l0 > target:
+            # Scale gain: gain * max(1, overshoot / approach_scale), capped at gain_max
+            scale = max(1.0, overshoot / max(cfg.threshold_nudge_overshoot_scale, 0.01))
+            effective_gain = min(cfg.threshold_nudge_gain * scale, cfg.threshold_nudge_gain_max)
+            rel_error = (current_l0 - target) / max(current_l0, 1.0)
+            nudge = effective_gain * rel_error
+
+            # Scale frequency: apply more often when overshoot is large.
+            # Base: every threshold_nudge_every steps. At overshoot > freq_overshoot,
+            # halve the interval (apply twice as often).
+            freq = cfg.threshold_nudge_every
+            if overshoot > cfg.threshold_nudge_freq_overshoot:
+                freq = max(1, freq // 2)
+            should_apply = (step % freq == 0)
+
+            # Also suppress if below the old L0-min gate (safety net)
+            if current_l0 < cfg.threshold_nudge_l0_min and target < cfg.threshold_nudge_l0_min:
+                should_apply = False
+
+            return nudge, should_apply
+
+        # Undershoot dampener (L0 < target): gentle downward nudge to reverse
+        # any threshold overshoot and let L0 recover.  This is the symmetric
+        # counterpart — without it, the nudge can overshoot alone because
+        # there's no restoring force pulling thresholds back down.
+        undershoot = 1.0 - overshoot  # e.g. 0.2 if L0 is 80% of target
+        nudge = -cfg.threshold_nudge_undershoot_gain * undershoot
+        # Apply undershoot correction at base frequency
+        should_apply = (step % cfg.threshold_nudge_every == 0)
+        return nudge, should_apply
+
+    # -- W_enc gradient dampening ------------------------------------------------
+
+    def wenc_dampen_factor(self, current_l0: float) -> float:
+        """Compute W_enc gradient dampening factor based on L0 overshoot.
+
+        Returns a multiplier in [1.0 - wenc_dampen_max_factor, 1.0].
+        1.0 = no dampening (L0 at or below target).
+        0.5 = halve the W_enc gradient (L0 very far above target).
+
+        The dampening scales linearly from 1.0 at wenc_dampen_overshoot_start
+        to (1 - wenc_dampen_max_factor) at 2x overshhoot_start.
+        """
+        cfg = self.config
+        if not cfg.wenc_dampen_enabled:
+            return 1.0
+
+        target = max(cfg.target_l0, 1.0)
+        overshoot = current_l0 / target
+
+        if overshoot <= cfg.wenc_dampen_overshoot_start:
+            return 1.0
+
+        # Scale dampening linearly from 0 to max between overshoot_start and 2*overshoot_start
+        scale = min(1.0, (overshoot - cfg.wenc_dampen_overshoot_start) / max(cfg.wenc_dampen_overshoot_start, 0.01))
+        dampen = 1.0 - cfg.wenc_dampen_max_factor * scale
+        return max(1.0 - cfg.wenc_dampen_max_factor, dampen)
 
     # -- L0 P-Controller (legacy -- kept for use_augmented_lagrangian=False) ----
 
@@ -862,6 +1056,9 @@ class SAEEventControlScheduler:
         "constraint_lr_floor": float,
         "lambda_l0_override": float,  # directly set lambda, bypasses integrator
         "ste_bandwidth": float,        # widen STE gradient channel (default 0.1)
+        "ste_adaptive_bandwidth": bool, # enable/disable L0-adaptive bandwidth
+        "ste_bandwidth_floor": float,  # min adaptive bandwidth
+        "ste_bandwidth_max": float,    # max adaptive bandwidth
         "threshold_nudge_gain": float, # direct threshold stepping gain (0 = disabled)
     }
 
