@@ -157,9 +157,13 @@ def _ensure_sae_classes():
             pre, threshold, gate = ctx.saved_tensors
             eps = ctx.bandwidth
             grad_pre = grad_output * gate
-            in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
+
+            # Optimization: avoid boolean mask to float casting and elementwise multiplication.
+            # Using torch.where reduces O(N) ops to O(M), skipping irrelevant zeros.
+            in_band_mask = (pre - threshold).abs() < eps
             sum_dims = tuple(range(grad_output.ndim - 1))
-            grad_threshold = -(pre * in_band * grad_output).sum(dim=sum_dims)
+            masked_vals = torch.where(in_band_mask, pre * grad_output, 0.0)
+            grad_threshold = -(masked_vals.sum(dim=sum_dims) / (2 * eps))
             grad_log_threshold = grad_threshold * threshold
             return grad_pre, grad_log_threshold, None
 
@@ -176,9 +180,13 @@ def _ensure_sae_classes():
         def backward(ctx, grad_output):
             pre, threshold = ctx.saved_tensors
             eps = ctx.bandwidth
-            in_band = ((pre - threshold).abs() < eps).to(pre.dtype) / (2 * eps)
+
+            # Optimization: avoid boolean mask to float casting and elementwise multiplication.
+            # Using torch.where is faster and more memory efficient.
+            in_band_mask = (pre - threshold).abs() < eps
             sum_dims = tuple(range(grad_output.ndim - 1))
-            grad_threshold = -(in_band * grad_output).sum(dim=sum_dims)
+            masked_vals = torch.where(in_band_mask, grad_output, 0.0)
+            grad_threshold = -(masked_vals.sum(dim=sum_dims) / (2 * eps))
             grad_log_threshold = grad_threshold * threshold
             return None, grad_log_threshold, None
 
@@ -582,7 +590,6 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
     Tokens are always needed for per_layer_inputs (PLE)."""
-    import torch
     import time
 
     tok_paths = _shard_paths(tok_dir)
@@ -634,7 +641,8 @@ class RollingActivationProvider:
     """
 
     def __init__(self, pool_dir: Path, device, seed=0, queue_size=12, n_workers=4):
-        import threading, queue as _queue
+        import threading
+        import queue as _queue
         self.paths = sorted(_shard_paths(pool_dir))
         if not self.paths:
             raise RuntimeError(f"No pool shards in {pool_dir}")
@@ -830,7 +838,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     bf16 path: activations are kept in bf16 through the forward; loss/reductions in fp32.
     """
-    import json, math, time, threading
+    import json
+    import math
+    import time
+    import threading
     import torch
     import torch.nn as nn
     from sae_scheduler import SAEAECSConfig, SAEEventControlScheduler
@@ -854,7 +865,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         tier = "trough"
     else:
         tier = "mid"
-    tier_lambda = {"hot": 1e-3, "trough": 3e-4, "mid": 5e-4}[tier]
+    {"hot": 1e-3, "trough": 3e-4, "mid": 5e-4}[tier]
 
     sae_cfg = SAEAECSConfig(
         base_lr=LR, warmup_steps=min(LR_WARMUP_STEPS, max(1, n_steps // 5)), total_steps=n_steps,
@@ -1131,7 +1142,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 # n_features (the all-features-active degeneracy). Augmented-Lagrangian
                 # hinge for the inequality constraint L0_avg <= target.
                 gate = sae.l0_indicator(pre)
-                l0_mb = gate.sum(dim=-1).float().mean()
+                # Optimization: accumulate sum in float32 directly to save an intermediate cast operation
+                l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
                 slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
                 sparsity_loss = (
                     scheduler.lambda_l0 * slack
@@ -1402,7 +1414,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                           path_in_repo=f"layer_{layer:02d}_s{seed}", repo_type="model")
         print(f"Pushed layer_{layer:02d}_s{seed} -> {SAE_HUB_ID}")
     elif push and not SAE_HUB_ID:
-        print(f"  [push skipped] no --hub-id / $SAE_HUB_ID set -- SAE saved locally only")
+        print("  [push skipped] no --hub-id / $SAE_HUB_ID set -- SAE saved locally only")
     else:
         print(f"  [push disabled] skipped HF upload for layer {layer}")
 
