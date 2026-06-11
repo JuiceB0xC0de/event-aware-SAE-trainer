@@ -2,7 +2,6 @@ import sys
 from pathlib import Path
 import json
 
-import pytest
 import torch
 import torch.nn.functional as F
 

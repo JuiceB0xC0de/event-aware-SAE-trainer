@@ -19,11 +19,10 @@ __version__ = "0.2.0"
 import json
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import torch
 
 
 @dataclass

@@ -154,7 +154,7 @@ class SAETainer:
         from sae_trainer_rolling import run_atlas_rolling
 
         print(f"\n{'='*60}")
-        print(f"Training SAE on Gemma-4 E4B")
+        print("Training SAE on Gemma-4 E4B")
         print(f"  Model: {self.model_path}")
         print(f"  Layers: {start}-{end} ({end-start} layers)")
         print(f"  Capture: {capture}")
@@ -250,7 +250,8 @@ def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
 
 @app.function(image=image, volumes={"/data": data_volume})
 def _write_pretok_manifest(n_shards: int):
-    import json, os
+    import json
+    import os
     os.makedirs(PRETOK_OUT, exist_ok=True)
     with open(f"{PRETOK_OUT}/manifest.json", "w") as f:
         json.dump({"n_shards": n_shards}, f)

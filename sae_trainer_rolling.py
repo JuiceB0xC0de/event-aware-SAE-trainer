@@ -582,7 +582,6 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
     Tokens are always needed for per_layer_inputs (PLE)."""
-    import torch
     import time
 
     tok_paths = _shard_paths(tok_dir)
@@ -634,7 +633,8 @@ class RollingActivationProvider:
     """
 
     def __init__(self, pool_dir: Path, device, seed=0, queue_size=12, n_workers=4):
-        import threading, queue as _queue
+        import threading
+        import queue as _queue
         self.paths = sorted(_shard_paths(pool_dir))
         if not self.paths:
             raise RuntimeError(f"No pool shards in {pool_dir}")
@@ -830,7 +830,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     bf16 path: activations are kept in bf16 through the forward; loss/reductions in fp32.
     """
-    import json, math, time, threading
+    import json
+    import math
+    import time
+    import threading
     import torch
     import torch.nn as nn
     from sae_scheduler import SAEAECSConfig, SAEEventControlScheduler
@@ -1092,6 +1095,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         accum_aux_loss = 0.0
         fired_accum = torch.zeros(N_FEATURES, device=device, dtype=torch.bool)
 
+        # ⚡ Bolt optimization: Collect detached residuals instead of a redundant full-batch forward pass
+        next_resample_step = min((s for s in RESAMPLE_STEPS if s >= step), default=None)
+        collect_residuals = next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64
+        mb_residuals = [] if collect_residuals else None
+
         # Get full batch and split into microbatches for accumulation. provider.next_batch
         # already returns the batch on-device, so no extra H2D copy here.
         full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16, on device
@@ -1161,6 +1169,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             accum_aux_loss += aux_loss.detach().item() * accum_steps
             with torch.no_grad():
                 fired_accum |= (feat_acts.detach() > 0).any(dim=0)
+                if collect_residuals:
+                    mb_residuals.append(residual_float.detach())
 
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
@@ -1198,7 +1208,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         next_resample_step = min((s for s in RESAMPLE_STEPS if s >= step), default=None)
         if next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64:
             with torch.no_grad():
-                per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
+                # ⚡ Bolt optimization: Reuse detached residuals instead of a redundant full-batch forward pass
+                per_token_err = torch.cat(mb_residuals, dim=0).pow(2).sum(dim=-1)
                 top_err_idx = per_token_err.topk(min(64, len(per_token_err))).indices
                 err_buffer.append(full_batch[top_err_idx].detach().cpu())
                 if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
@@ -1402,7 +1413,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                           path_in_repo=f"layer_{layer:02d}_s{seed}", repo_type="model")
         print(f"Pushed layer_{layer:02d}_s{seed} -> {SAE_HUB_ID}")
     elif push and not SAE_HUB_ID:
-        print(f"  [push skipped] no --hub-id / $SAE_HUB_ID set -- SAE saved locally only")
+        print("  [push skipped] no --hub-id / $SAE_HUB_ID set -- SAE saved locally only")
     else:
         print(f"  [push disabled] skipped HF upload for layer {layer}")
 
