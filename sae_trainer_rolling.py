@@ -1010,15 +1010,19 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             norm_ratio = activation_norm / max(ref_norm, 1e-8)
 
             # -- Threshold warmup from empirical percentile -----------------------
-            # When L0 >> target at init (deep layers can be 4-8x), set thresholds
-            # from the pre-activation distribution so features start closer to
-            # the right sparsity level.  Use the empirical (1 - target_L0/n_features)
-            # percentile of |pre-activations| as the threshold — this ensures
-            # roughly target_L0 features fire on the probe batch.
+            # When L0 >> target at init (deep layers can be 4-8x), shift thresholds
+            # up from the pre-activation distribution so features start closer to
+            # the right sparsity level.  Target a WARMUP L0 that's well ABOVE the
+            # final target (3x target, or 30% of initial, whichever is smaller) —
+            # aiming for the exact target L0 overcorrects because setting all
+            # thresholds uniformly kills natural feature variation and drops L0
+            # below target, leaving the AL integrator with nothing to integrate.
             if initial_l0 > K * 2:  # only warm up when L0 is significantly above target
-                target_frac = float(K) / float(N_FEATURES)  # fraction of features we want active
+                warmup_l0_target = min(float(K) * 3, initial_l0 * 0.3)
+                warmup_l0_target = max(warmup_l0_target, float(K) * 1.5)  # floor at 1.5x target
+                warmup_frac = warmup_l0_target / float(N_FEATURES)  # fraction of features we want active
                 # percentile of |pre-activations| to use as threshold
-                pctile = max(0.5, (1.0 - target_frac) * 100.0)
+                pctile = max(0.5, (1.0 - warmup_frac) * 100.0)
                 # Subsample to ~1M elements for quantile — full tensor is too large
                 # (probe_tokens × N_FEATURES can be >600M elements, quantile OOMs)
                 abs_pre_flat = probe_pre.abs().flatten().float()
@@ -1043,12 +1047,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         state["exp_avg"].zero_()
                         state["exp_avg_sq"].zero_()
                 print(f"  [THRESH WARMUP] L0_probe={initial_l0:.0f} >> target={K} → "
-                      f"warmup_thr={warmup_threshold:.4f} (pctile={pctile:.1f}%) "
-                      f"old_thr_mean={current_thr_mean:.4f}")
+                      f"warmup_target_L0={warmup_l0_target:.0f} (pctile={pctile:.1f}%) "
+                      f"warmup_thr={warmup_threshold:.4f} old_thr_mean={current_thr_mean:.4f}")
                 # Re-measure L0 after warmup to update the scheduler's initial state
                 with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1).float().mean().item()
-                print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f})")
+                print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f}, "
+                      f"target_warmup_L0={warmup_l0_target:.0f})")
                 initial_l0 = warmup_l0  # use updated L0 for the rest of preflight
             norm_mult = max(0.90, min(1.35, norm_ratio ** 0.5))
             layer_mult = 1.0
