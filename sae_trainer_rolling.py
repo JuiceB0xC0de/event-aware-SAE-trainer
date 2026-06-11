@@ -1019,8 +1019,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 target_frac = float(K) / float(N_FEATURES)  # fraction of features we want active
                 # percentile of |pre-activations| to use as threshold
                 pctile = max(0.5, (1.0 - target_frac) * 100.0)
-                abs_pre = probe_pre.abs().flatten().float()
-                warmup_threshold = torch.quantile(abs_pre, pctile / 100.0).item()
+                # Subsample to ~1M elements for quantile — full tensor is too large
+                # (probe_tokens × N_FEATURES can be >600M elements, quantile OOMs)
+                abs_pre_flat = probe_pre.abs().flatten().float()
+                max_quantile_elems = 1_000_000
+                if abs_pre_flat.numel() > max_quantile_elems:
+                    perm = torch.randperm(abs_pre_flat.numel(), device=abs_pre_flat.device)[:max_quantile_elems]
+                    abs_pre_sample = abs_pre_flat[perm]
+                else:
+                    abs_pre_sample = abs_pre_flat
+                warmup_threshold = torch.quantile(abs_pre_sample, pctile / 100.0).item()
                 warmup_threshold = max(warmup_threshold, 0.1)  # floor at 0.1 to avoid degenerate threshold
                 current_thr_mean = sae.log_threshold.exp().mean().item()
                 with torch.no_grad():

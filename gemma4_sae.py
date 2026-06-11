@@ -1,5 +1,5 @@
 """
-Modal app for training event-aware SAEs on Gemma-4 models from Kaggle.
+Modal app for training event-aware SAEs on Gemma-4 models from HuggingFace.
 
 Usage:
     modal run gemma4_sae.py --layer-range 0,15 --capture rolling
@@ -30,7 +30,6 @@ image = (
         "protobuf",
         "huggingface_hub",
         "hf_transfer",
-        "kagglehub",
         "wandb",
     )
     # Bake the local trainer modules into the image so the container
@@ -52,7 +51,8 @@ image = (
         # capped throughput at ~193MB/s and starved the H100 (37k tok/s) while
         # blocking the Modal heartbeat -> container restarts. Local disk is GB/s.
         "SAE_SCRATCH_DIR": "/root/rollcache",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
     })
 )
 # =============================================================================
@@ -69,7 +69,7 @@ scratch_volume = Volume.from_name("sae-training-scratch", create_if_missing=True
 # Secrets
 # =============================================================================
 
-# KAGEL_KEY should already be set in your Modal secrets
+# HF_TOKEN read from the "huggingface" Modal secret
 # Optional: WANDB_PROJECT for logging
 
 # =============================================================================
@@ -83,7 +83,7 @@ app = modal.App("gemma4-sae-train", image=image)
     gpu="RTX-PRO-6000",
     volumes={"/data": data_volume},          # /scratch removed: pool lives on local NVMe now
     ephemeral_disk=1_048_576,                 # 1 TiB container-local NVMe for the activation pool
-    secrets=[modal.Secret.from_name("KAGEL_KEY")],
+    secrets=[modal.Secret.from_name("huggingface")],
     timeout=86400,  # 24 hours max per Modal limits
 )
 class SAETainer:
@@ -92,38 +92,24 @@ class SAETainer:
     @modal.enter()
     def setup(self):
         import os
-        import kagglehub
-        import shutil
+        from huggingface_hub import snapshot_download
 
-        # Kaggle auth - KAGEL_KEY should be set from Modal secret
-        kaggle_key = os.environ.get("KAGEL_KEY") or os.environ.get("KAGGLE_API_KEY")
-        if kaggle_key:
-            os.environ["KAGGLE_API_KEY"] = kaggle_key
-
-        # Cache model on persistent volume (survives across runs)
+        hf_token = os.environ.get("HF_TOKEN")
         volume_model_path = "/data/models/gemma-4-e4b"
-        kaggle_cache_path = "/root/.cache/kagglehub/google/gemma-4/transformers/gemma-4-e4b"
 
         if os.path.exists(volume_model_path) and os.listdir(volume_model_path):
-            # Already cached on volume from previous run
-            print(f"Loading cached Gemma-4 E4B from volume: {volume_model_path}")
-            self.model_path = volume_model_path
+            print(f"Using cached Gemma-4 E4B from volume: {volume_model_path}")
         else:
-            # First run - download from Kaggle to volume
-            print("Downloading Gemma-4 E4B from Kaggle (first run, will cache on volume)...")
-            kaggle_path = kagglehub.model_download("google/gemma-4/transformers/gemma-4-e4b")
-            # Find the versioned directory
-            if os.path.isdir(kaggle_cache_path):
-                versions = [d for d in os.listdir(kaggle_cache_path) if d.isdigit()]
-                if versions:
-                    kaggle_path = os.path.join(kaggle_cache_path, versions[0])
-            # Copy to volume for persistence
-            os.makedirs(os.path.dirname(volume_model_path), exist_ok=True)
-            if os.path.exists(volume_model_path):
-                shutil.rmtree(volume_model_path)
-            shutil.copytree(kaggle_path, volume_model_path)
+            print("Downloading google/gemma-4-e4b-it from HuggingFace (first run, will cache on volume)...")
+            os.makedirs(volume_model_path, exist_ok=True)
+            snapshot_download(
+                "google/gemma-4-e4b-it",
+                local_dir=volume_model_path,
+                token=hf_token,
+            )
             print(f"Cached to volume at: {volume_model_path}")
-            self.model_path = volume_model_path
+
+        self.model_path = volume_model_path
 
     @modal.method()
     def train(self, layer_range: str, capture: str, expansion: int = 32,
@@ -200,6 +186,7 @@ PRETOK_OUT = "/data/pretok/fineweb-edu"
 @app.function(
     image=image,
     volumes={"/data": data_volume},
+    secrets=[modal.Secret.from_name("huggingface")],
     timeout=86400,
 )
 def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
