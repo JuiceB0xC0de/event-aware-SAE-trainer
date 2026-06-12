@@ -142,53 +142,39 @@ def _ensure_sae_classes():
     import torch
     import torch.nn as nn
 
-    class _JumpReLU(torch.autograd.Function):
-        """JumpReLU activation with straight-through estimator for threshold gradient."""
+    class _JumpReLUAndL0(torch.autograd.Function):
+        """Combined JumpReLU activation and L0 indicator with STE for threshold gradient."""
         @staticmethod
         def forward(ctx, pre, log_threshold, bandwidth):
             threshold = log_threshold.exp()
             gate = (pre > threshold).to(pre.dtype)
             ctx.save_for_backward(pre, threshold, gate)
             ctx.bandwidth = bandwidth
-            return pre * gate
+            return pre * gate, gate
 
         @staticmethod
-        def backward(ctx, grad_output):
+        def backward(ctx, grad_feat, grad_gate):
             pre, threshold, gate = ctx.saved_tensors
             eps = ctx.bandwidth
-            grad_pre = grad_output * gate
 
-            # Optimization: avoid boolean mask to float casting and elementwise multiplication.
-            # Using torch.where reduces O(N) ops to O(M), skipping irrelevant zeros.
+            grad_pre = None
+            if grad_feat is not None:
+                grad_pre = grad_feat * gate
+
             in_band_mask = (pre - threshold).abs() < eps
-            sum_dims = tuple(range(grad_output.ndim - 1))
-            masked_vals = torch.where(in_band_mask, pre * grad_output, 0.0)
+            sum_dims = tuple(range(pre.ndim - 1))
+
+            combined_grad = 0.0
+            if grad_feat is not None:
+                combined_grad = combined_grad + pre * grad_feat
+            if grad_gate is not None:
+                combined_grad = combined_grad + grad_gate
+
+            masked_vals = torch.where(in_band_mask, combined_grad, 0.0)
             grad_threshold = -(masked_vals.sum(dim=sum_dims) / (2 * eps))
             grad_log_threshold = grad_threshold * threshold
+
             return grad_pre, grad_log_threshold, None
-
-    class _L0Indicator(torch.autograd.Function):
-        """Step function H(pre - theta) with STE for L0 sparsity loss."""
-        @staticmethod
-        def forward(ctx, pre, log_threshold, bandwidth):
-            threshold = log_threshold.exp()
-            ctx.save_for_backward(pre, threshold)
-            ctx.bandwidth = bandwidth
-            return (pre > threshold).to(pre.dtype)
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            pre, threshold = ctx.saved_tensors
-            eps = ctx.bandwidth
-
-            # Optimization: avoid boolean mask to float casting and elementwise multiplication.
-            # Using torch.where is faster and more memory efficient.
-            in_band_mask = (pre - threshold).abs() < eps
-            sum_dims = tuple(range(grad_output.ndim - 1))
-            masked_vals = torch.where(in_band_mask, grad_output, 0.0)
-            grad_threshold = -(masked_vals.sum(dim=sum_dims) / (2 * eps))
-            grad_log_threshold = grad_threshold * threshold
-            return None, grad_log_threshold, None
 
     class _JumpReLUSAE(nn.Module):
         def __init__(self, d_in: int, n_features: int):
@@ -220,16 +206,19 @@ def _ensure_sae_classes():
 
         def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
             pre = self.W_enc(x - self.b_dec)
-            return _JumpReLU.apply(pre, self.log_threshold, self.ste_bandwidth)
+            return _JumpReLUAndL0.apply(pre, self.log_threshold, self.ste_bandwidth)[0]
 
         def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
             return self.W_enc(x - self.b_dec)
 
+        def apply_jumprelu_and_l0(self, pre: "torch.Tensor"):
+            return _JumpReLUAndL0.apply(pre, self.log_threshold, self.ste_bandwidth)
+
         def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _JumpReLU.apply(pre, self.log_threshold, self.ste_bandwidth)
+            return _JumpReLUAndL0.apply(pre, self.log_threshold, self.ste_bandwidth)[0]
 
         def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _L0Indicator.apply(pre, self.log_threshold, self.ste_bandwidth)
+            return _JumpReLUAndL0.apply(pre, self.log_threshold, self.ste_bandwidth)[1]
 
         def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
             return self.W_dec(acts) + self.b_dec
@@ -1165,7 +1154,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # bracket this loop (one for L0, one for the fired mask) are gone.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pre = sae.encode_pre(acts_mb)
-                feat_acts = sae.apply_jumprelu(pre)
+                feat_acts, gate = sae.apply_jumprelu_and_l0(pre)
                 x_hat = sae.decode(feat_acts)
 
                 # Cast to fp32 only for loss computation (numerical stability)
@@ -1178,7 +1167,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 # ZERO gradient, nothing pushed the thresholds up, and L0 ran away to
                 # n_features (the all-features-active degeneracy). Augmented-Lagrangian
                 # hinge for the inequality constraint L0_avg <= target.
-                gate = sae.l0_indicator(pre)
+                # gate is now computed alongside feat_acts
                 # Optimization: accumulate sum in float32 directly to save an intermediate cast operation
                 l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
                 slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
