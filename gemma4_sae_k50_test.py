@@ -69,7 +69,7 @@ app = modal.App("gemma4-sae-k50-test", image=image)
 
 
 @app.cls(
-    gpu="RTX-PRO-6000",
+    gpu="H100",
     volumes={"/data": data_volume},
     ephemeral_disk=1_048_576,  # 1 TiB container-local NVMe
     secrets=[modal.Secret.from_name("huggingface")],
@@ -105,7 +105,7 @@ class SAETainerK50:
         self,
         layer_range: str = "0,3",
         capture: str = "rolling",
-        expansion: int = 32,
+        expansion: int = 16,
         pool_batches: int = 500,
         max_steps: int = 3000,
         microbatch_tokens: int = 32768,
@@ -119,7 +119,7 @@ class SAETainerK50:
         Args:
             layer_range: "start,end" e.g. "0,3" or "0,15"
             capture: "rolling" (layers 0-14) or "auto" (any layer)
-            expansion: SAE expansion factor
+            expansion: SAE expansion factor (default 16 for K=50; 32 is overkill at this sparsity)
             pool_batches: activation batches per layer
             max_steps: training steps per layer
             microbatch_tokens: tokens per microbatch for gradient accumulation
@@ -146,6 +146,7 @@ class SAETainerK50:
         print(f"  Max steps/layer: {max_steps}")
         print(f"  Microbatch tokens: {microbatch_tokens}")
         print(f"  Target L0 (K): {target_l0}")
+        print(f"  Expansion: {expansion}x  (dict size = {expansion * 2560})")
         print(f"  Evict model during training: {evict_model}")
         if resume_from:
             print(f"  Resume: {resume_from}")
@@ -185,7 +186,7 @@ class SAETainerK50:
 def main(
     layer_range: str = "0,3",
     capture: str = "rolling",
-    expansion: int = 32,
+    expansion: int = 16,
     pool_batches: int = 500,
     max_steps: int = 3000,
     microbatch_tokens: int = 32768,

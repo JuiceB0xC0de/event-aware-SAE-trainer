@@ -116,6 +116,28 @@ ERR_BUFFER_SZ  = 16_384     # high-error activation buffer (tokens)
 RESAMPLE_SCALE = 1.0        # scale of resampled encoder rows vs mean alive norm
 DEFAULT_SEED   = 0
 
+
+def _aggressive_k_aux_k(target_l0: int) -> int:
+    """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
+    to a fraction of the target so the aux loss doesn't fight the sparsity budget."""
+    return max(8, min(AUX_K, target_l0 // 2))
+
+
+def _aggressive_k_reset_threshold(target_l0: int) -> int:
+    """Dead features accumulate faster at low L0; reset/resample them sooner."""
+    if target_l0 <= 100:
+        return 750
+    if target_l0 <= 250:
+        return 1000
+    return RESET_THRESHOLD
+
+
+def _aggressive_k_resample_steps(target_l0: int):
+    """Add an early resample window for aggressive low-L0 runs."""
+    if target_l0 <= 100:
+        return (K_CURRICULUM_STEPS, 2000, 6000, 12_000)
+    return (K_CURRICULUM_STEPS, 12_000)
+
 # Pool sizing: T batches of fresh activations per layer. Early-stop converges
 # ~3500 steps, so T=4000 gives fresh-every-step (no epoching) with headroom.
 POOL_BATCHES_DEFAULT = 4000
@@ -999,6 +1021,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         tier = "mid"
     {"hot": 1e-3, "trough": 3e-4, "mid": 5e-4}[tier]
 
+    # Aggressive low-L0 runs (K <= 100) converge fast and then collapse into
+    # feature death if training continues. Tighten the AL convergence window and
+    # the dead-feature guards for this regime while keeping K=500 defaults intact.
+    aggressive_k = K <= 100
+    ev_check_every = 250 if aggressive_k else 500
+    ev_stop_patience = 2 if aggressive_k else 5
+    dead_emergency_thresh = 10.0 if aggressive_k else 20.0
+    dead_emergency_cooldown = 1500 if aggressive_k else 5000
+
     sae_cfg = SAEAECSConfig(
         base_lr=LR, warmup_steps=min(LR_WARMUP_STEPS, max(1, n_steps // 5)), total_steps=n_steps,
         event_warmup_steps=5_000, instability_z_thresh=10.0,
@@ -1013,8 +1044,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # lambda provides supporting gradient pressure through the STE channel.
         lambda_l0_max=1.0, al_mu=5e-5, al_dual_step=2e-8, al_log_every=LOG_EVERY,
         ev_floor=0.0, ev_floor_patience=10**9, ev_drop_thresh=-1.0,
-        ev_stop_thresh=0.88, ev_stop_patience=3,
-        dead_emergency_thresh=20.0, dead_emergency_cooldown=5000,
+        ev_stop_thresh=0.88, ev_stop_patience=ev_stop_patience,
+        ev_check_every=ev_check_every,
+        dead_emergency_thresh=dead_emergency_thresh,
+        dead_emergency_cooldown=dead_emergency_cooldown,
         # live_tune_path is set after out_dir is created below
     )
     out_suffix = "_frozen" if frozen_decoder else ""
@@ -1300,11 +1333,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         # Pre-compute dead feature parameters for the aux loss. L0/sparsity stay
         # inside each microbatch forward so the JumpReLU threshold gradient is live.
+        # At aggressive low L0, cap AUX_K to a fraction of the target so the aux loss
+        # doesn't try to revive more features than the sparsity budget allows.
+        aux_k_eff = _aggressive_k_aux_k(K)
+        reset_threshold_eff = _aggressive_k_reset_threshold(K)
         dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
         n_dead = int(dead_mask_aux.sum().item())
         if n_dead > 0:
             dead_indices = torch.where(dead_mask_aux)[0]
-            eff_k = min(AUX_K, n_dead)
+            eff_k = min(aux_k_eff, n_dead)
 
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
@@ -1398,9 +1435,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             feature_fire_counts += fired_accum.long()
             log_window_tokens += BATCH_TOKENS
 
+        # Use K-aware reset/resample cadence for aggressive low-L0 runs.
+        resample_steps_eff = _aggressive_k_resample_steps(K)
         if step % RESET_EVERY == 0 and step > 0:
             with torch.no_grad():
-                very_dead = (steps_since_fired >= RESET_THRESHOLD)
+                very_dead = (steps_since_fired >= reset_threshold_eff)
                 n_reset = int(very_dead.sum().item())
                 if n_reset > 0:
                     sae.log_threshold.data[very_dead] = math.log(INIT_THRESHOLD)
@@ -1410,7 +1449,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     steps_since_fired[very_dead] = 0
                     print(f"  [RESET @ {step}] theta->{INIT_THRESHOLD} for {n_reset} dead")
 
-        next_resample_step = min((s for s in RESAMPLE_STEPS if s >= step), default=None)
+        next_resample_step = min((s for s in resample_steps_eff if s >= step), default=None)
         if next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64:
             with torch.no_grad():
                 per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
@@ -1419,8 +1458,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
                     err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
 
-        if step in RESAMPLE_STEPS:
-            dead_mask = (steps_since_fired >= 1000)
+        if step in resample_steps_eff:
+            dead_mask = (steps_since_fired >= max(500, reset_threshold_eff - 250))
             n_dead = int(dead_mask.sum().item())
             n_res = resample_dead_neurons(dead_mask, [t.to(device) for t in err_buffer])
             if n_res > 0:
