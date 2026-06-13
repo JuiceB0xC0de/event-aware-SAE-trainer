@@ -22,7 +22,7 @@ REPO_REF = "main"  # pin to branch/tag/commit if you need a specific version
 
 # Bust the Modal image cache on every push: the commit SHA is hardcoded below
 # and updated locally before each push, so the run_commands layer hash changes.
-_BUILD_VERSION = "ca023e3"
+_BUILD_VERSION = "9ee7bd0"
 
 image = (
     Image.debian_slim(python_version="3.11")
@@ -112,7 +112,7 @@ class SAETainerK50:
         capture: str = "rolling",
         expansion: int = 16,
         pool_batches: int = 500,
-        max_steps: int = 3000,
+        max_steps: int = 10_000,
         microbatch_tokens: int = 32768,
         target_l0: int = 50,
         resume_from: str | None = None,
@@ -125,8 +125,8 @@ class SAETainerK50:
             layer_range: "start,end" e.g. "0,3" or "0,15"
             capture: "rolling" (layers 0-14) or "auto" (any layer)
             expansion: SAE expansion factor (default 16 for K=50; 32 is overkill at this sparsity)
-            pool_batches: activation batches per layer
-            max_steps: training steps per layer
+            pool_batches: activation batches per layer (default 2000)
+            max_steps: training steps per layer (default 10k, gives late layers room)
             microbatch_tokens: tokens per microbatch for gradient accumulation
             target_l0: L0 target K (default 50 for this aggressive test)
             resume_from: optional checkpoint_full.pt for the first trained layer
@@ -149,6 +149,7 @@ class SAETainerK50:
         print(f"  Expansion: {expansion}x")
         print(f"  Pool batches: {pool_batches}")
         print(f"  Max steps/layer: {max_steps}")
+        print(f"  Scratch disk needed: ~{pool_batches * 101 / 1024:.1f}GB per pool")
         print(f"  Microbatch tokens: {microbatch_tokens}")
         print(f"  Target L0 (K): {target_l0}")
         print(f"  Expansion: {expansion}x  (dict size = {expansion * 2560})")
@@ -192,8 +193,8 @@ def main(
     layer_range: str = "0,3",
     capture: str = "rolling",
     expansion: int = 16,
-    pool_batches: int = 500,
-    max_steps: int = 3000,
+    pool_batches: int = 2000,
+    max_steps: int = 10_000,
     microbatch_tokens: int = 32768,
     target_l0: int = 50,
     resume_from: str | None = None,
