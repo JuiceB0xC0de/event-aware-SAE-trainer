@@ -1582,6 +1582,25 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             else:
                 ev_below_peak_streak = 0
 
+            # -- Aggressive-K early stop: when K is small, high EV + L0 near target
+            #    is the real convergence signal. Stop before feature death sets in.
+            if aggressive_k and step >= 750:
+                l0_rel_err = abs(l0_val - K) / max(K, 1.0)
+                if l0_rel_err <= 0.15 and ev >= 0.95:
+                    if not hasattr(sae, "_k_converge_counter"):
+                        sae._k_converge_counter = 0
+                    sae._k_converge_counter += LOG_EVERY
+                    if sae._k_converge_counter >= 500:
+                        scheduler.should_stop = True
+                        scheduler.stop_reason = (
+                            f"Aggressive-K convergence: L0={l0_val:.1f} within 15% of K={K}, "
+                            f"EV={ev:.3f} >= 0.95 for {sae._k_converge_counter} steps"
+                        )
+                        print(f"  [AGGRESSIVE-K STOP @ {step}] {scheduler.stop_reason}")
+                else:
+                    if hasattr(sae, "_k_converge_counter"):
+                        sae._k_converge_counter = 0
+
             metrics["recon_loss"].append(round(recon_val, 6))
             metrics["mean_l0"].append(round(l0_val, 2))
             metrics["dead_pct"].append(round(dead, 2))

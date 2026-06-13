@@ -35,6 +35,7 @@ image = (
         "huggingface_hub",
         "hf_transfer",
         "wandb",
+        "cachebuster",  # forces image rebuild so the git clone below re-runs
     )
     .run_commands(
         f"git clone --depth 1 --branch {REPO_REF} {REPO_URL} /opt/sae-trainer",
