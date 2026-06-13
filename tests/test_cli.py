@@ -33,15 +33,18 @@ def test_defaults(monkeypatch):
     assert kw["hub_id"] is None
     assert kw["wandb_project"] is None
     assert kw["expansion"] is None
+    assert kw["evict_model"] is True
+    assert kw["target_l0"] is None
 
 
 def test_flag_overrides(monkeypatch):
     kw = _capture_main_kwargs(monkeypatch, [
         "--start-layer", "1", "--end-layer", "3", "--seed", "7",
         "--pool-batches", "100", "--max-steps", "10",
-        "--no-pretok", "--no-push",
+        "--no-pretok", "--no-push", "--no-model-evict",
         "--capture", "rolling", "--model-id", "meta-llama/Llama-3.2-1B",
         "--hub-id", "me/my-saes", "--wandb-project", "run1", "--expansion", "16",
+        "--target-l0", "50",
     ])
     assert kw["start_layer"] == 1
     assert kw["end_layer"] == 3
@@ -50,6 +53,8 @@ def test_flag_overrides(monkeypatch):
     assert kw["max_steps"] == 10
     assert kw["use_pretok"] is False
     assert kw["push"] is False
+    assert kw["evict_model"] is False
+    assert kw["target_l0"] == 50
     assert kw["capture"] == "rolling"
     assert kw["model_id"] == "meta-llama/Llama-3.2-1B"
     assert kw["hub_id"] == "me/my-saes"

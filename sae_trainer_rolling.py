@@ -544,7 +544,10 @@ def _find_resume_layer(seed: int, pool_batches: int, model_id: str, capture: str
             m.get("capture") != capture):
             return -1
         rdir = _resume_pool_dir(seed)
-        if not rdir.exists() or not _shard_paths(rdir):
+        n_saved = len(_shard_paths(rdir)) if rdir.exists() else 0
+        # A complete resume pool must have the expected number of shards. A partial
+        # copy (e.g., interrupted save) is treated as absent so we regenerate cleanly.
+        if n_saved != pool_batches:
             return -1
         return int(m.get("last_completed_layer", -1))
     except Exception:
@@ -1647,7 +1650,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
                       hub_id: str = None, wandb_project: str = None, expansion: int = None,
-                      evict_model: bool = True):
+                      evict_model: bool = True, target_l0: int = None):
     """Train one SAE per decoder layer in [start_layer, end_layer).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -1656,6 +1659,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     microbatch_tokens: tokens per microbatch for gradient accumulation (default = no accum)
     resume_from: path to checkpoint_full.pt to resume from
     evict_model: move the LLM to CPU during SAE training to free VRAM (default True).
+    target_l0: override the global L0 target K (default 500). Use for aggressive sparsity tests.
     model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
     max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
     import time
@@ -1663,12 +1667,16 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     # -- config bus: thread runtime overrides into the module globals that the rest of
     #    the code (train_sae_on_activations, dataset builder, paths) already reads ------
-    global MODEL_ID, SAE_DIR, SAE_HUB_ID, WANDB_PROJECT, EXPANSION, N_FEATURES
+    global MODEL_ID, SAE_DIR, SAE_HUB_ID, WANDB_PROJECT, EXPANSION, N_FEATURES, K, K_INIT
     if model_id:
         MODEL_ID = model_id
         SAE_DIR = str(DATA_DIR / "saes" / _slug(MODEL_ID))
     if expansion:
         EXPANSION = int(expansion)
+    if target_l0 is not None and target_l0 > 0:
+        K = int(target_l0)
+        K_INIT = K
+        print(f"  [config] target L0 overridden: K={K}")
     if hub_id is not None:
         SAE_HUB_ID = hub_id
     if wandb_project is not None:
@@ -1821,7 +1829,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 activation_norm_ref = probe_norm
 
         # Bring the LLM back to GPU for the next layer's pool production.
-        model.to(device)
+        if evict_model:
+            model.to(device)
 
         if capture == "rolling":
             # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
@@ -1876,7 +1885,11 @@ def main():
                    help="wandb project name. Off unless set (also needs WANDB_API_KEY).")
     p.add_argument("--no-push", dest="push", action="store_false",
                    help="skip the HuggingFace upload even if --hub-id is set")
-    p.set_defaults(use_pretok=True, push=True)
+    p.add_argument("--no-model-evict", dest="evict_model", action="store_false",
+                   help="keep the LLM on GPU during SAE training (disables VRAM freeing)")
+    p.add_argument("--target-l0", type=int, default=None,
+                   help=f"override the L0 target K (default {K})")
+    p.set_defaults(use_pretok=True, push=True, evict_model=True)
     args = p.parse_args()
 
     res = run_atlas_rolling(
@@ -1885,7 +1898,8 @@ def main():
         use_pretok=args.use_pretok, max_steps=args.max_steps, bdec_batches=args.bdec_batches,
         resume_from=args.resume_from, push=args.push, capture=args.capture,
         model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
-        expansion=args.expansion)
+        expansion=args.expansion, evict_model=args.evict_model,
+        target_l0=args.target_l0)
     print(f"\nDone. {res}")
 
 

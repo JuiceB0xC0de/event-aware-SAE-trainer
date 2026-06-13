@@ -114,7 +114,8 @@ class SAETainer:
     @modal.method()
     def train(self, layer_range: str, capture: str, expansion: int = 32,
               pool_batches: int = 2000, max_steps: int = 15000,
-              microbatch_tokens: int = 32768, resume_from: str | None = None) -> dict:
+              microbatch_tokens: int = 32768, resume_from: str | None = None,
+              evict_model: bool = True) -> dict:
         """
         Train SAEs on a range of layers.
 
@@ -126,6 +127,7 @@ class SAETainer:
             max_steps: max training steps per layer
             microbatch_tokens: for gradient accumulation (default 32k = no accum)
             resume_from: optional /data/.../checkpoint_full.pt for the first trained layer
+            evict_model: move the LLM to CPU during SAE training to free VRAM (default True)
         """
         import os
         import sys
@@ -148,6 +150,7 @@ class SAETainer:
         print(f"  Pool batches: {pool_batches}")
         if resume_from:
             print(f"  Resume: {resume_from}")
+        print(f"  Evict model during training: {evict_model}")
         print(f"{'='*60}\n")
 
         # Run training
@@ -168,6 +171,7 @@ class SAETainer:
             hub_id=None,
             wandb_project=os.environ.get("WANDB_PROJECT"),
             expansion=expansion,
+            evict_model=evict_model,
         )
 
         # Commit volumes
@@ -275,6 +279,7 @@ def main(
     pool_batches: int = 2000,
     max_steps: int = 15000,
     resume_from: str | None = None,
+    evict_model: bool = True,
 ):
     """
     Train SAEs on Gemma-4 E4B layers.
@@ -292,6 +297,7 @@ def main(
         pool_batches=pool_batches,
         max_steps=max_steps,
         resume_from=resume_from,
+        evict_model=evict_model,
     )
     print(f"\nTraining complete: {result['status']}")
     print(f"Layers trained: {result['layers']}")

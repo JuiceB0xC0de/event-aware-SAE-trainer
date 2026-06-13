@@ -32,7 +32,7 @@ activation batches. **How activations are captured is pluggable (`--capture`):**
 | Mode | Works on | Cost | Notes |
 |------|----------|------|-------|
 | `auto` *(default)* | **any `AutoModelForCausalLM`** (+ multimodal text path) | 1 pool of disk, N× forward | Forward-hooks the residual stream. **Correct by construction** — observes the real forward, no reconstruction. |
-| `rolling` | Gemma-3n/4 family | 1 pool of disk, ~1 forward total | Single-block walk: run only block L over the residual cached from block L−1. VRAM/compute-optimized; uses Gemma-specific internals (PLE, attention types, KV sharing → layers 0–14 only). |
+| `rolling` | Gemma-3n/4 family | 1 pool of disk, ~1 forward total | Single-block walk: run only block L over the residual cached from block L−1. VRAM/compute-optimized; uses Gemma-specific internals (PLE, attention types, KV sharing → layers 0–14 only). Persists a resume pool so restarts resume from the last completed layer. |
 
 `d_in` and layer count are auto-detected from the model config; the SAE dictionary is
 `expansion × d_in` (default 32×).
@@ -107,6 +107,7 @@ python sae_trainer_rolling.py --pool-batches 500 --end-layer 4
 |-------|---------|-------|
 | `--expansion` | `32` | SAE dict size = `expansion × d_in` |
 | `K` (target L0) | `500` | the constraint the scheduler converges to |
+| `--target-l0` | `None` | runtime override of `K` without editing source |
 | `BATCH_TOKENS` | `32_768` | tokens per SAE step (accumulated across microbatches) |
 | `--microbatch-tokens` | `32_768` | tokens per microbatch; use 8192 for 4x VRAM savings |
 | `SEQ_LEN` | `2_048` | sequence length into the model |
@@ -131,6 +132,30 @@ To resume after interruption:
 ```bash
 python sae_trainer_rolling.py --resume-from ./data/saes/google_gemma-4-e2b-it/layer_03_s0/checkpoint_full.pt
 ```
+
+### Rolling resume pool
+
+With `--capture rolling`, the trainer automatically persists the last completed layer's
+activation pool to disk. If the run is interrupted, restarting the same command resumes
+the residual chain from that layer instead of regenerating pools from layer 0. Only one
+resume pool is kept on disk at a time.
+
+```bash
+python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it --capture rolling --end-layer 15
+# interrupted, then restart:
+python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it --capture rolling --end-layer 15
+```
+
+### Speed / VRAM optimizations
+
+- The base LLM is moved to CPU during SAE training by default (it is idle), freeing GPU
+  memory for larger microbatches. Disable with `--no-model-evict`.
+- Activation H2D transfers run on a dedicated CUDA stream and overlap with training.
+- Auto capture truncates the decoder stack to `[:layer+1]` per layer instead of relying
+  on hooks + exceptions.
+
+The biggest remaining lever for tok/s is usually `--microbatch-tokens`: use the largest
+value that fits in the freed VRAM.
 
 ## Tests
 

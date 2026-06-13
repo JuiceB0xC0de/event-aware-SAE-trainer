@@ -12,6 +12,9 @@ The trainer now runs on **consumer hardware** with these presets:
 | **100GB disk** | `--pool-batches 1000` | 4x disk reduction (400GB → 100GB) |
 | **50GB disk** | `--pool-batches 500` | 8x disk reduction, more epoching |
 | **Preemption** | `--resume-from ckpt.pt` | Resume model/optimizer/scheduler state |
+| **Crash/restart** | automatic | Rolling resume pool resumes from the last completed layer |
+| **Higher tok/s** | default | LLM evicted during training; activation transfer double-buffered |
+
 
 ## Changes
 
@@ -218,6 +221,39 @@ The implementation casts to fp32 only for:
 - Scheduler signal buffering
 
 This matches the standard mixed-precision training pattern.
+
+## 5. Rolling Resume Pool (Crash / Restart Safety)
+
+Under `--capture rolling`, the trainer now persists the last completed layer's pool to
+`$SAE_SCRATCH_DIR/resume_pool_s<seed>/` and writes a small manifest. If the run is
+interrupted, a restart resumes the residual chain from that layer instead of regenerating
+pools from layer 0.
+
+Only **one** resume pool is kept on disk at a time, so the extra disk cost is exactly
+one layer's pool (~100–400GB depending on `--pool-batches`).
+
+```bash
+# Start training
+python sae_trainer_rolling.py --capture rolling --end-layer 15
+
+# Interrupt at any point, then restart -- no layer-0 regeneration
+python sae_trainer_rolling.py --capture rolling --end-layer 15
+```
+
+The manifest is invalidated if `--pool-batches`, `--seed`, `--model-id`, or `--capture`
+changes, so stale pools are ignored automatically.
+
+## 6. LLM VRAM Eviction + Double-Buffered Transfer
+
+The base LLM is idle during SAE training. The trainer now moves it to CPU by default
+and empties the CUDA cache, giving the SAE the maximum possible VRAM. The model is
+reloaded to GPU before the next layer's pool production. Disable with `--no-model-evict`.
+
+Activation batches are also transferred CPU→GPU on a dedicated CUDA stream while the
+previous step's compute is still running, removing the small per-step H2D bubble.
+
+Combined effect: more headroom to raise `--microbatch-tokens` and reduce gradient
+accumulation steps, which is usually the largest lever for higher tok/s.
 
 ## Future Improvements
 

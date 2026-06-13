@@ -50,3 +50,42 @@ def test_pool_dir_composes_under_rollcache():
     pd = t._pool_dir("tokens_s0")
     assert pd.name == "tokens_s0"
     assert str(pd).startswith(str(t.ROLLCACHE))
+
+
+def test_save_and_find_resume_pool(monkeypatch, tmp_path):
+    monkeypatch.setattr(t, "ROLLCACHE", str(tmp_path))
+    pool_dir = tmp_path / "pool_L05_s0"
+    for i in range(3):
+        t._write_shard(pool_dir, i, torch.randn(2, 3))
+    t._save_resume_pool(pool_dir, layer=5, seed=0, pool_batches=3,
+                        model_id="google/gemma-4-e2b-it", capture="rolling")
+    found = t._find_resume_layer(0, 3, "google/gemma-4-e2b-it", "rolling")
+    assert found == 5
+
+
+def test_find_resume_pool_rejects_mismatched_settings(monkeypatch, tmp_path):
+    monkeypatch.setattr(t, "ROLLCACHE", str(tmp_path))
+    pool_dir = tmp_path / "pool_L05_s0"
+    for i in range(3):
+        t._write_shard(pool_dir, i, torch.randn(2, 3))
+    t._save_resume_pool(pool_dir, layer=5, seed=0, pool_batches=3,
+                        model_id="google/gemma-4-e2b-it", capture="rolling")
+    assert t._find_resume_layer(1, 3, "google/gemma-4-e2b-it", "rolling") == -1
+    assert t._find_resume_layer(0, 4, "google/gemma-4-e2b-it", "rolling") == -1
+    assert t._find_resume_layer(0, 3, "meta-llama/Llama-3.2-1B", "rolling") == -1
+    assert t._find_resume_layer(0, 3, "google/gemma-4-e2b-it", "auto") == -1
+
+
+def test_find_resume_pool_rejects_partial_pool(monkeypatch, tmp_path):
+    monkeypatch.setattr(t, "ROLLCACHE", str(tmp_path))
+    pool_dir = tmp_path / "pool_L05_s0"
+    for i in range(2):  # only 2 shards, but manifest says 3
+        t._write_shard(pool_dir, i, torch.randn(2, 3))
+    t._save_resume_pool(pool_dir, layer=5, seed=0, pool_batches=3,
+                        model_id="google/gemma-4-e2b-it", capture="rolling")
+    # Simulate interrupted save by deleting one shard from the resume dir.
+    rdir = t._resume_pool_dir(0)
+    for p in t._shard_paths(rdir):
+        if "shard_00001" in p.name:
+            p.unlink()
+    assert t._find_resume_layer(0, 3, "google/gemma-4-e2b-it", "rolling") == -1
