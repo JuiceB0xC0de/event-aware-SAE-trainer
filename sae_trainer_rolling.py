@@ -1791,10 +1791,11 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     import shutil
     os.makedirs(ROLLCACHE, exist_ok=True)
     shard_gb = (BATCH_TOKENS // SEQ_LEN) * SEQ_LEN * d_in * 2 / 1e9   # bf16 [n_seqs,SEQ_LEN,d]
-    peak_gb = pool_batches * shard_gb * 1.1 + 2                       # ~one pool + slack
+    # Pipeline keeps two pools (current + pre-produced next) plus resume copy.
+    peak_gb = pool_batches * shard_gb * 2.2 + 4
     free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
     sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
-    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB (one pool of {pool_batches} x "
+    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB (2 pipelined pools of {pool_batches} x "
           f"{shard_gb*1e3:.0f}MB); free={'(overlay: unknown)' if sentinel else f'{free_gb:.0f}GB'}")
     if not sentinel:
         assert free_gb > peak_gb, (
@@ -1866,6 +1867,18 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 consume_src = False
             _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
                           dst_dir, device)
+            # Pipeline: while the LLM is still hot on GPU, pre-produce the next layer's pool.
+            # When training L finishes, pool L+1 is already on disk and we start immediately.
+            pre_produced_next = False
+            if L + 1 < end_layer and capture == "rolling":
+                next_dir = pool_dir_for(L + 1)
+                if len(_shard_paths(next_dir)) < pool_batches:
+                    print(f"  [pipeline] pre-producing pool L{L+1} while model hot ...")
+                    _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
+                                  dst_dir, next_dir, device)
+                    pre_produced_next = True
+                else:
+                    print(f"  [pipeline] pool L{L+1} already present")
             if L < start_layer:
                 # Skip-train layers below the explicit resume target: we produced their
                 # pool but won't train them. Keep their source pool for the next layer.
@@ -1911,10 +1924,13 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
                 _save_resume_pool(dst_dir, L, seed, pool_batches, MODEL_ID, capture)
-            # Pool retention policy: keep the source pool of the layer we just trained (L-1)
-            # and the pool two layers back (L-2) for the next layer's source. Delete L-3.
-            # This caps disk at ~3 pools while guaranteeing crash-resume works.
-            for old_L in range(L - 3, walk_start - 1, -1):
+            # Pool retention policy with pipeline:
+            #   - We just trained L. Pool L+1 was pre-produced from L.
+            #   - We no longer need L-1 as a source (L+1 came from L).
+            #   - Keep L as source for L+2 production.
+            #   - Delete L-1 and below to cap disk at ~2 active pools + resume.
+            cutoff = L - 1 if pre_produced_next else L - 2
+            for old_L in range(cutoff, walk_start - 1, -1):
                 if old_L < 0:
                     continue
                 old_dir = pool_dir_for(old_L)
