@@ -9,6 +9,8 @@ Usage:
     modal run gemma4_sae_k50_test.py
     modal run gemma4_sae_k50_test.py --layer-range 0,5 --pool-batches 1000 --max-steps 5000
 """
+import subprocess
+
 import modal
 from modal import Image, Volume
 
@@ -19,6 +21,13 @@ from modal import Image, Volume
 
 REPO_URL = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer.git"
 REPO_REF = "main"  # pin to branch/tag/commit if you need a specific version
+
+# Bust the Modal image cache on every push: the commit SHA is embedded in the
+# run_commands string, so the layer hash changes whenever main advances.
+_BUILD_VERSION = subprocess.run(
+    ["git", "rev-parse", "--short", "HEAD"],
+    capture_output=True, text=True, check=True,
+).stdout.strip()
 
 image = (
     Image.debian_slim(python_version="3.11")
@@ -35,9 +44,9 @@ image = (
         "huggingface_hub",
         "hf_transfer",
         "wandb",
-        "cachebuster",  # forces image rebuild so the git clone below re-runs
     )
     .run_commands(
+        f"echo 'trainer-build-version={_BUILD_VERSION}' && "
         f"git clone --depth 1 --branch {REPO_REF} {REPO_URL} /opt/sae-trainer",
     )
     .env({
