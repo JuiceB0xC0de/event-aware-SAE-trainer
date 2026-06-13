@@ -1851,14 +1851,13 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     if capture == "rolling":
         if resume_from and explicit_resume_layer >= 0:
             # Explicit --resume-from under rolling: we must regenerate the full residual
-            # chain up to the target layer because the persistent resume pool may not
-            # exist (it is only saved after a layer *completes*). Set walk_start one layer
-            # below the checkpoint so the source pool is regenerated, but only train from
-            # explicit_resume_layer onward.
-            walk_start = max(walk_start, explicit_resume_layer - 1)
+            # chain from L0 up to the target layer because the persistent resume pool is
+            # only saved after a layer *completes*. Keep start_layer at the checkpoint
+            # layer so training skips the lower layers, but produce all pools below it.
+            walk_start = 0
             start_layer = min(start_layer, explicit_resume_layer)
             print(f"  [resume] explicit checkpoint for layer {explicit_resume_layer}; "
-                  f"regenerating chain from L{walk_start} and training from L{explicit_resume_layer}")
+                  f"regenerating chain from L0 and training from L{start_layer}")
         elif not resume_from:
             resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
             if resume_layer >= 0:

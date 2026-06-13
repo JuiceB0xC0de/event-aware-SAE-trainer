@@ -22,7 +22,7 @@ REPO_REF = "main"  # pin to branch/tag/commit if you need a specific version
 
 # Bust the Modal image cache on every push: the commit SHA is hardcoded below
 # and updated locally before each push, so the run_commands layer hash changes.
-_BUILD_VERSION = "2941762"
+_BUILD_VERSION = "6136ab3"
 
 image = (
     Image.debian_slim(python_version="3.11")
