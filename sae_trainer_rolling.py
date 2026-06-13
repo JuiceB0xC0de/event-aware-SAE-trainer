@@ -491,6 +491,66 @@ def _rm_pool(dir_path: Path):
         shutil.rmtree(dir_path, ignore_errors=True)
 
 
+def _resume_pool_dir(seed: int) -> Path:
+    """Persistent rolling-resume directory. Holds the pool of the last completed
+    layer so a restart can resume the residual chain without regenerating from L0."""
+    return Path(ROLLCACHE) / f"resume_pool_s{seed}"
+
+
+def _resume_manifest_path(seed: int) -> Path:
+    return _resume_pool_dir(seed) / "manifest.json"
+
+
+def _save_resume_pool(pool_dir: Path, layer: int, seed: int, pool_batches: int,
+                      model_id: str, capture: str):
+    """Persist pool_dir as the rolling resume checkpoint for `layer`.
+
+    Keeps exactly one resume pool on disk (overwrites the previous one). Copying is
+    O(one pool); on NVMe this is a few seconds per layer vs. hours of training, and
+    it removes any dependency on the transient active pool_dir which gets consumed
+    during the next layer's production.
+    """
+    import json
+    import shutil
+    rdir = _resume_pool_dir(seed)
+    _rm_pool(rdir)
+    rdir.mkdir(parents=True, exist_ok=True)
+    for p in _shard_paths(pool_dir):
+        shutil.copyfile(p, rdir / p.name)
+    manifest = {
+        "last_completed_layer": layer,
+        "seed": seed,
+        "pool_batches": pool_batches,
+        "model_id": model_id,
+        "capture": capture,
+    }
+    with open(_resume_manifest_path(seed), "w") as f:
+        json.dump(manifest, f)
+
+
+def _find_resume_layer(seed: int, pool_batches: int, model_id: str, capture: str) -> int:
+    """Return the last completed layer from a rolling resume checkpoint, or -1 if
+    none exists or it was produced with incompatible settings."""
+    import json
+    mpath = _resume_manifest_path(seed)
+    if not mpath.exists():
+        return -1
+    try:
+        with open(mpath) as f:
+            m = json.load(f)
+        if (m.get("seed") != seed or
+            m.get("pool_batches") != pool_batches or
+            m.get("model_id") != model_id or
+            m.get("capture") != capture):
+            return -1
+        rdir = _resume_pool_dir(seed)
+        if not rdir.exists() or not _shard_paths(rdir):
+            return -1
+        return int(m.get("last_completed_layer", -1))
+    except Exception:
+        return -1
+
+
 # ===========================================================================
 #  Token pool capture  (run once -- the same tokens flow through every layer)
 # ===========================================================================
@@ -536,21 +596,20 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
 # ===========================================================================
 
 def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device):
-    """Model-agnostic capture: run the model forward over the token pool with a
-    forward hook on decoder block `layer`, recording its residual-stream output.
-    Works for any AutoModelForCausalLM (and text-only forwards of multimodal models).
+    """Model-agnostic capture: run the model forward over the token pool and record
+    the residual-stream output of decoder block `layer`.
 
+    Works for any AutoModelForCausalLM (and text-only forwards of multimodal models).
     Correct by construction -- it observes the real forward, so there is no bit-exact
-    risk. The hook raises _EarlyExit so layers after `layer` and the LM head are
-    skipped. Each layer is captured independently (one forward per layer), so disk
-    stays at one pool while compute is N_layers x a (truncated) forward."""
+    risk. Instead of hooks + exceptions we physically truncate the decoder ModuleList to
+    [:layer+1] per layer, so the forward naturally stops after block `layer` and the LM
+    head is never run. The original ModuleList is restored after capture.
+
+    Each layer is captured independently (one forward per layer), so disk stays at one
+    pool while compute is N_layers x a (truncated) forward."""
     import torch
     import time
-
-    class _EarlyExit(Exception):
-        """Raised inside a forward hook to abort the forward once the target layer's
-        residual has been captured -- skips the remaining layers + LM head."""
-        pass
+    import torch.nn as nn
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -559,37 +618,46 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
         print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
         return
 
+    # Locate the parent of decoder_layers so we can truncate and restore it.
+    text_model, attr_name, _ = _find_text_model(model, len(decoder_layers))
+    original_layers = list(decoder_layers)
+    truncated = nn.ModuleList(original_layers[: layer + 1])
+    setattr(text_model, attr_name, truncated)
+
     cap = {}
 
     def _hook(_module, _inp, out):
         cap["h"] = (out[0] if isinstance(out, tuple) else out).detach()
-        raise _EarlyExit
 
-    handle = decoder_layers[layer].register_forward_hook(_hook)
-    print(f"  [produce L{layer}] hook capture over {n} batches ...")
+    handle = truncated[layer].register_forward_hook(_hook)
+    print(f"  [produce L{layer}] truncated capture over {n} batches ...")
     t0 = time.time()
     try:
         for i in range(n):
             ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
-            try:
-                with torch.no_grad():
-                    model(input_ids=ids, use_cache=False)
-            except _EarlyExit:
-                pass
+            with torch.no_grad():
+                model(input_ids=ids, use_cache=False)
             _write_shard(dst_dir, i, cap["h"])
             if (i + 1) % 500 == 0:
                 tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
                 print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     finally:
         handle.remove()
+        setattr(text_model, attr_name, nn.ModuleList(original_layers))
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
-def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_dir, dst_dir, device):
+def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_dir,
+                  dst_dir, device, consume_src: bool = True):
     """Gemma-3n/4 single-block walk. Produce pool[layer] (block-L output for every batch).
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
-    Tokens are always needed for per_layer_inputs (PLE)."""
+    Tokens are always needed for per_layer_inputs (PLE).
+
+    consume_src: if True, delete each src shard after it is used (normal rolling,
+        keeps peak disk at ~one pool). If False, leave src_dir intact -- used when the
+        source is the persistent rolling resume pool.
+    """
     import time
 
     tok_paths = _shard_paths(tok_dir)
@@ -603,8 +671,9 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     # shard i, so we never hold two full pools. Peak disk stays ~one pool (~404GB
     # at 4000 batches) instead of ~800GB -- required because the container overlay
     # fs caps near ~512GB and there is no large local scratch.
+    extra = " (resume src -- not consumed)" if (src_dir is not None and not consume_src) else ""
     print(f"  [produce L{layer}] running block {layer} over {n} batches "
-          f"(incremental src-delete) ...")
+          f"(incremental src-delete){extra} ...")
     t0 = time.time()
     for i in range(n):
         ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
@@ -615,7 +684,7 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
             hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds0"].dtype)
         out = _run_block(decoder_layers, tcfg, layer, hidden, inv)
         _write_shard(dst_dir, i, out)
-        if src_dir is not None:                            # free the consumed src shard now
+        if src_dir is not None and consume_src:            # free the consumed src shard now
             try:
                 (src_dir / f"shard_{i:05d}.pt").unlink()
             except FileNotFoundError:
@@ -686,8 +755,18 @@ class RollingActivationProvider:
                         continue
 
     def next_batch(self):
+        """Return the next activation batch as a CPU pinned bf16 tensor.
+
+        The caller (typically a double-buffer wrapper) controls when and on which
+        CUDA stream the H2D transfer happens, so the transfer can overlap with GPU
+        computation instead of serializing on the default stream.
+        """
         t = self._q.get()
-        return t.to(self.device, non_blocking=True)        # [BATCH_TOKENS, D_IN] bf16
+        return t                                            # [BATCH_TOKENS, D_IN] bf16, CPU pinned
+
+    def next_batch_to_device(self, non_blocking=True):
+        """Convenience path for callers that do not need transfer overlap."""
+        return self.next_batch().to(self.device, non_blocking=non_blocking)
 
     # Stubs retained so any external caller that touches resume_state on a
     # fresh run (e.g. the trainer's checkpoint-restore path) gets a no-op
@@ -708,6 +787,56 @@ class RollingActivationProvider:
             pass
         for t in getattr(self, "_threads", []):
             t.join(timeout=1.0)
+
+
+class _ActivationDoubleBuffer:
+    """Overlap CPU->GPU transfer of batch N+1 with GPU computation on batch N.
+
+    The provider's reader threads keep the next batch in CPU pinned memory.
+    This wrapper moves that batch to GPU on a dedicated transfer stream while the
+    training loop is still processing the current batch on the default stream.
+    """
+
+    def __init__(self, provider: RollingActivationProvider, device):
+        import torch
+        self.provider = provider
+        self.device = device
+        self._transfer_stream = torch.cuda.Stream(device=device)
+        self._next_gpu = None
+        self._ready_event = None
+        self._prefetch()
+
+    def _prefetch(self):
+        import torch
+        cpu = self.provider.next_batch()                   # CPU pinned bf16
+        gpu = None
+        with torch.cuda.stream(self._transfer_stream):
+            gpu = cpu.to(self.device, non_blocking=True)  # H2D on transfer stream
+        self._next_gpu = gpu
+        self._ready_event = torch.cuda.Event()
+        self._ready_event.record(self._transfer_stream)
+
+    def next_batch(self):
+        """Return a GPU-ready activation batch, then start transferring the next one."""
+        self._ready_event.wait()                           # ensure H2D is done
+        gpu = self._next_gpu
+        # Kick off the next transfer immediately so it overlaps with the upcoming
+        # optimizer/compute work on the default stream.
+        self._prefetch()
+        return gpu
+
+    def next_batch_to_device(self, non_blocking=True):
+        """Passthrough for callers that need the legacy interface."""
+        return self.next_batch()
+
+    def get_state(self):
+        return self.provider.get_state()
+
+    def restore_state(self, state):
+        return self.provider.restore_state(state)
+
+    def close(self):
+        self.provider.close()
 
 
 # ===========================================================================
@@ -990,7 +1119,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         n_acc = 0
         probe_batch = None
         for _ in range(bdec_batches):
-            a = provider.next_batch()
+            a = provider.next_batch_to_device()
             if probe_batch is None:
                 probe_batch = a
             acc += a.sum(dim=0)
@@ -1089,6 +1218,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 f"pulse={sae_cfg.early_pulse_multiplier:.2f}"
             )
 
+    # Wrap the provider in a double-buffer for CUDA so the next batch's H2D transfer
+    # overlaps with the current step's forward/backward/optimizer work. On CPU this is
+    # a no-op (just passes through).
+    if device.type == "cuda":
+        provider = _ActivationDoubleBuffer(provider, device)
+
     metrics = {"recon_loss": [], "mean_l0": [], "dead_pct": [], "resampled": [],
                "ev": [], "nonlinear_err": [], "linear_err": []}
     total_resampled = 0
@@ -1153,8 +1288,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         accum_aux_loss = 0.0
         fired_accum = torch.zeros(N_FEATURES, device=device, dtype=torch.bool)
 
-        # Get full batch and split into microbatches for accumulation. provider.next_batch
-        # already returns the batch on-device, so no extra H2D copy here.
+        # Get full batch and split into microbatches for accumulation. The double-buffer
+        # wrapper returns the batch already on GPU; its transfer overlapped with the
+        # previous step's compute on a separate CUDA stream.
         full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16, on device
         activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
         microbatch_size = microbatch_tokens  # tokens per microbatch
@@ -1510,7 +1646,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       use_pretok: bool = True, max_steps: int = N_STEPS,
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
-                      hub_id: str = None, wandb_project: str = None, expansion: int = None):
+                      hub_id: str = None, wandb_project: str = None, expansion: int = None,
+                      evict_model: bool = True):
     """Train one SAE per decoder layer in [start_layer, end_layer).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -1518,6 +1655,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     pool_batches: activation batches cached per layer (default 4000; use 500-1000 for limited disk)
     microbatch_tokens: tokens per microbatch for gradient accumulation (default = no accum)
     resume_from: path to checkpoint_full.pt to resume from
+    evict_model: move the LLM to CPU during SAE training to free VRAM (default True).
     model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
     max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
     import time
@@ -1623,12 +1761,30 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # rolling must walk from 0 to build the residual chain; hook capture is independent
     # per layer, so it starts at start_layer.
     walk_start = 0 if capture == "rolling" else start_layer
+
+    # -- rolling resume: if a previous run persisted the last completed layer's pool,
+    #    resume the chain from that layer instead of regenerating everything from 0.
+    resume_layer = -1
+    if capture == "rolling" and not resume_from:
+        resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
+        if resume_layer >= 0:
+            walk_start = max(walk_start, resume_layer + 1)
+            print(f"  [resume] rolling checkpoint found for layer {resume_layer}; "
+                  f"chain resumes at L{walk_start}")
+
     for L in range(walk_start, end_layer):
         dst_dir = pool_dir_for(L)
         if capture == "rolling":
             src_dir = pool_dir_for(L - 1) if L >= 1 else None
-            _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir, dst_dir, device)
-            if src_dir is not None:                       # consumed -> free now
+            consume_src = True
+            if L == resume_layer + 1 and resume_layer >= 0:
+                # The persistent resume pool is the source for the first produced layer.
+                # Do not consume it -- it stays on disk until the next layer finishes.
+                src_dir = _resume_pool_dir(seed)
+                consume_src = False
+            _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
+                          dst_dir, device, consume_src=consume_src)
+            if src_dir is not None and consume_src:       # consumed -> free now
                 _rm_pool(src_dir)
             if L < start_layer:
                 print(f"  [skip-train] L{L} pool produced; below start_layer={start_layer}")
@@ -1636,12 +1792,20 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         else:
             _produce_pool_hooked(model, decoder_layers, L, tok_dir, dst_dir, device)
 
+        # The LLM is idle during SAE training. Evict it from GPU memory so the SAE
+        # can use the freed VRAM for a larger microbatch / less gradient accumulation.
+        # Reload before the next layer's pool production.
+        if evict_model:
+            model.to("cpu")
+            torch.cuda.empty_cache()
+
         provider = RollingActivationProvider(dst_dir, device, seed=seed)
         try:
             # Determine resume checkpoint for this layer
             layer_resume = None
             if resume_from:
-                # Check if the checkpoint is for this specific layer
+                # Only apply the explicit resume to the layer the checkpoint belongs to.
+                # The orchestrator skips earlier layers via resume_layer / walk_start above.
                 layer_resume = resume_from
             res = train_sae_on_activations(L, d_in, seed, provider,
                                            max_steps=max_steps, bdec_batches=bdec_batches,
@@ -1655,6 +1819,15 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             probe_norm = res.get("activation_norm_probe") if isinstance(res, dict) else None
             if probe_norm:
                 activation_norm_ref = probe_norm
+
+        # Bring the LLM back to GPU for the next layer's pool production.
+        model.to(device)
+
+        if capture == "rolling":
+            # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
+            # the previous resume pool, so we keep exactly one layer on disk for restarts.
+            if L >= start_layer:
+                _save_resume_pool(dst_dir, L, seed, pool_batches, MODEL_ID, capture)
 
         if capture == "auto":                             # independent capture -> free now
             _rm_pool(dst_dir)

@@ -80,8 +80,9 @@ def test_hooked_capture_matches_manual_forward(tmp_path):
     assert torch.allclose(captured, expected.to(torch.bfloat16).float(), atol=1e-3)
 
 
-def test_produce_pool_hooked_catches_early_exit(tmp_path, monkeypatch):
-    """Verify that _produce_pool_hooked catches _EarlyExit and halts the forward pass early."""
+def test_produce_pool_hooked_truncates_and_runs_forward(tmp_path, monkeypatch):
+    """Verify that _produce_pool_hooked truncates the layer stack and runs the forward
+    to completion (no exception), recording the target layer's residual."""
     d = 8
     model = _FakeModel(3, d).eval()
 
@@ -100,11 +101,10 @@ def test_produce_pool_hooked_catches_early_exit(tmp_path, monkeypatch):
 
     monkeypatch.setattr(model, "forward", spy_forward)
 
-    # Should succeed without raising the exception to the top level,
-    # because _produce_pool_hooked catches _EarlyExit.
+    # Should succeed without raising any exception and write the pool.
     t._produce_pool_hooked(model, model.layers, 0, tok, dst, torch.device("cpu"))
 
-    assert not forward_completed, "Model forward should have been interrupted by _EarlyExit"
+    assert forward_completed, "Truncated forward should run to completion"
     assert len(t._shard_paths(dst)) == 1
 
 
