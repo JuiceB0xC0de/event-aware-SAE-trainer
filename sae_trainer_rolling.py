@@ -1831,13 +1831,39 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     # -- rolling resume: if a previous run persisted the last completed layer's pool,
     #    resume the chain from that layer instead of regenerating everything from 0.
+    #    Also handle explicit --resume-from: read the checkpoint's layer and start there.
     resume_layer = -1
-    if capture == "rolling" and not resume_from:
-        resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
-        if resume_layer >= 0:
-            walk_start = max(walk_start, resume_layer + 1)
-            print(f"  [resume] rolling checkpoint found for layer {resume_layer}; "
-                  f"chain resumes at L{walk_start}")
+    explicit_resume_layer = -1
+    if resume_from:
+        try:
+            import torch as _torch
+            _tmp = _torch.load(resume_from, map_location="cpu", weights_only=False)
+            explicit_resume_layer = int(_tmp.get("layer", _tmp.get("sae_state", {}).get("layer", -1)))
+            if explicit_resume_layer < 0:
+                # best-effort: infer from path like .../layer_02_s0/checkpoint_full.pt
+                import re
+                _m = re.search(r"layer_(\d+)", str(resume_from))
+                if _m:
+                    explicit_resume_layer = int(_m.group(1))
+        except Exception:
+            pass
+
+    if capture == "rolling":
+        if resume_from:
+            # Explicit resume under rolling: we must regenerate the pool for the target
+            # layer, but we should start the chain walk at that layer. The persistent
+            # resume pool of layer-1 is the source.
+            if explicit_resume_layer >= 0:
+                resume_layer = explicit_resume_layer - 1
+                walk_start = max(walk_start, explicit_resume_layer)
+                print(f"  [resume] explicit checkpoint for layer {explicit_resume_layer}; "
+                      f"chain resumes at L{walk_start}")
+        else:
+            resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
+            if resume_layer >= 0:
+                walk_start = max(walk_start, resume_layer + 1)
+                print(f"  [resume] rolling checkpoint found for layer {resume_layer}; "
+                      f"chain resumes at L{walk_start}")
 
     for L in range(walk_start, end_layer):
         dst_dir = pool_dir_for(L)
