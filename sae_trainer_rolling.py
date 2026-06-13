@@ -1288,9 +1288,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             alive_mask = ~dead_mask
             alive_norm = sae.W_enc.weight[alive_mask].norm(dim=1).mean() if alive_mask.any() \
                 else torch.tensor(1.0, device=candidates.device)
-            sae.W_enc.weight.data[dead_mask] = (samples / norms) * RESAMPLE_SCALE * alive_norm
+            resampled_rows = ((samples / norms) * RESAMPLE_SCALE * alive_norm).to(sae.W_enc.weight.dtype)
+            sae.W_enc.weight.data[dead_mask] = resampled_rows
             sae.W_enc.bias.data[dead_mask] = 0.0
-            rand_dec = torch.randn(sae.d_in, n_dead, device=candidates.device)
+            rand_dec = torch.randn(sae.d_in, n_dead, device=candidates.device, dtype=sae.W_dec.weight.dtype)
             rand_dec = rand_dec / rand_dec.norm(dim=0, keepdim=True).clamp(min=1e-8)
             sae.W_dec.weight.data[:, dead_mask] = rand_dec
             for group in optimizer.param_groups:
