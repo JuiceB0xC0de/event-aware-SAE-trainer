@@ -673,15 +673,15 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
 
 
 def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_dir,
-                  dst_dir, device, consume_src: bool = True):
+                  dst_dir, device):
     """Gemma-3n/4 single-block walk. Produce pool[layer] (block-L output for every batch).
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
     Tokens are always needed for per_layer_inputs (PLE).
 
-    consume_src: if True, delete each src shard after it is used (normal rolling,
-        keeps peak disk at ~one pool). If False, leave src_dir intact -- used when the
-        source is the persistent rolling resume pool.
+    Source pools are NOT deleted during production. This keeps the previous layer's
+    pool intact so a crash during the next layer's training can resume from it. Pool
+    retention is managed by the orchestrator (keeps last 3 pools, deletes older ones).
     """
     import time
 
@@ -692,13 +692,7 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     if len(_shard_paths(dst_dir)) >= n:
         print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
         return
-    # Incremental source deletion: delete src shard i right after producing dst
-    # shard i, so we never hold two full pools. Peak disk stays ~one pool (~404GB
-    # at 4000 batches) instead of ~800GB -- required because the container overlay
-    # fs caps near ~512GB and there is no large local scratch.
-    extra = " (resume src -- not consumed)" if (src_dir is not None and not consume_src) else ""
-    print(f"  [produce L{layer}] running block {layer} over {n} batches "
-          f"(incremental src-delete){extra} ...")
+    print(f"  [produce L{layer}] running block {layer} over {n} batches ...")
     t0 = time.time()
     for i in range(n):
         ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
@@ -709,11 +703,6 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
             hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds0"].dtype)
         out = _run_block(decoder_layers, tcfg, layer, hidden, inv)
         _write_shard(dst_dir, i, out)
-        if src_dir is not None and consume_src:            # free the consumed src shard now
-            try:
-                (src_dir / f"shard_{i:05d}.pt").unlink()
-            except FileNotFoundError:
-                pass
         if (i + 1) % 500 == 0:
             tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
             print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
@@ -1876,10 +1865,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 src_dir = _resume_pool_dir(seed)
                 consume_src = False
             _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
-                          dst_dir, device, consume_src=consume_src)
-            if src_dir is not None and consume_src:       # consumed -> free now
-                _rm_pool(src_dir)
+                          dst_dir, device)
             if L < start_layer:
+                # Skip-train layers below the explicit resume target: we produced their
+                # pool but won't train them. Keep their source pool for the next layer.
                 print(f"  [skip-train] L{L} pool produced; below start_layer={start_layer}")
                 continue
         else:
@@ -1922,6 +1911,16 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
                 _save_resume_pool(dst_dir, L, seed, pool_batches, MODEL_ID, capture)
+            # Pool retention policy: keep the source pool of the layer we just trained (L-1)
+            # and the pool two layers back (L-2) for the next layer's source. Delete L-3.
+            # This caps disk at ~3 pools while guaranteeing crash-resume works.
+            for old_L in range(L - 3, walk_start - 1, -1):
+                if old_L < 0:
+                    continue
+                old_dir = pool_dir_for(old_L)
+                if old_dir.exists():
+                    _rm_pool(old_dir)
+                    print(f"  [cleanup] deleted pool L{old_L}")
 
         if capture == "auto":                             # independent capture -> free now
             _rm_pool(dst_dir)
