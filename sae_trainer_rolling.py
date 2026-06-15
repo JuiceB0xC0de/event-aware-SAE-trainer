@@ -1527,6 +1527,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             dead_indices = torch.where(dead_mask_aux)[0]
             eff_k = min(aux_k_eff, n_dead)
 
+        buffer_err_this_step = revival.should_buffer_err(step, K)
+        err_candidates = [] if buffer_err_this_step else None
+
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
             end_idx = start_idx + microbatch_size
@@ -1583,6 +1586,21 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             accum_aux_loss += aux_loss.detach().item() * accum_steps
             with torch.no_grad():
                 fired_accum |= (feat_acts.detach() > 0).any(dim=0)
+
+            # Collect high-error activation candidates for the upcoming resample.
+            # Reuses the main forward's residual (computed above) instead of running a
+            # second full encode/decode pass, which was a major tok/s sink near
+            # resample steps.
+            if buffer_err_this_step:
+                with torch.no_grad():
+                    per_tok_err = residual_float.detach().pow(2).sum(dim=-1)
+                    k = min(64, per_tok_err.numel())
+                    if k > 0:
+                        topk_vals, topk_idx = per_tok_err.topk(k)
+                        err_candidates.append((
+                            acts_mb[topk_idx].detach().cpu(),
+                            topk_vals.detach().cpu(),
+                        ))
 
         if do_timing:
             timing["evt_fwd_bwd_end"] = _new_cuda_event()
@@ -1646,15 +1664,19 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     print(f"  [RESET @ {step}] theta->{INIT_THRESHOLD} for {n_reset} dead")
                 revival.record_reset(n_reset)
 
-        if revival.should_buffer_err(step, K):
+        if buffer_err_this_step:
             if do_timing:
                 t_errbuf_start = time.perf_counter()
             with torch.no_grad():
-                per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
-                top_err_idx = per_token_err.topk(min(64, len(per_token_err))).indices
-                err_buffer.append(full_batch[top_err_idx].detach().cpu())
-                if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
-                    err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
+                if err_candidates:
+                    cand_acts = torch.cat([acts for acts, _ in err_candidates], dim=0)
+                    cand_errs = torch.cat([errs for _, errs in err_candidates], dim=0)
+                    k = min(64, cand_errs.numel())
+                    if k > 0:
+                        top_idx = cand_errs.topk(k).indices
+                        err_buffer.append(cand_acts[top_idx].cpu())
+                    if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
+                        err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
             if do_timing:
                 t_errbuf_elapsed = time.perf_counter() - t_errbuf_start
                 timing["t_errbuf"] += t_errbuf_elapsed

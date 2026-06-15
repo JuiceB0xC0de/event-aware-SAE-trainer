@@ -32,7 +32,8 @@ image = (
         "hf_transfer",
         "wandb",
         "bitsandbytes",
-        "json"
+        "colorama",  # cache-bust + harmless
+        force_build=True,  # rebuild this layer every deploy; remove when stable
     )
     # Bake the local trainer modules into the image so the container
     # always sees the working tree (Modal 1.4 dropped cls-level mounts).
