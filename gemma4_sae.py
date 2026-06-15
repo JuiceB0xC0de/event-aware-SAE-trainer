@@ -221,17 +221,22 @@ PRETOK_OUT = "/data/pretok/fineweb-edu"
 )
 def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
                       model_path: str = "/data/models/gemma-4-e4b") -> int:
-    """Stream a disjoint slice of FineWeb-Edu, tokenize it, and write one 1-D int32
-    token shard to /data/pretok/fineweb-edu/shard_NN.npy. Parallelized across
-    containers via .starmap (one container per shard). Idempotent: skips a shard
-    that already has >= tokens_per_shard tokens."""
+    """Stream a disjoint slice of FineWeb-Edu, tokenize it with the target model's
+    tokenizer, and write one 1-D int32 token shard to
+    /data/pretok/<model_slug>/shard_NN.npy.  Parallelized across containers via
+    .starmap (one container per shard). Idempotent: skips a shard that already
+    has >= tokens_per_shard tokens."""
     import os
+    import json
     import numpy as np
+    from pathlib import Path
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    os.makedirs(PRETOK_OUT, exist_ok=True)
-    shard_path = f"{PRETOK_OUT}/shard_{shard_idx:02d}.npy"
+    model_slug = Path(model_path).name
+    out_dir = f"/data/pretok/{model_slug}"
+    os.makedirs(out_dir, exist_ok=True)
+    shard_path = f"{out_dir}/shard_{shard_idx:02d}.npy"
     if os.path.exists(shard_path):
         existing = np.load(shard_path, mmap_mode="r")
         if existing.shape[0] >= tokens_per_shard:
@@ -266,31 +271,53 @@ def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
 
 
 @app.function(image=image, volumes={"/data": data_volume})
-def _write_pretok_manifest(n_shards: int):
+def _write_pretok_manifest(n_shards: int, model_slug: str, vocab_size: int):
     import json
     import os
-    os.makedirs(PRETOK_OUT, exist_ok=True)
-    with open(f"{PRETOK_OUT}/manifest.json", "w") as f:
-        json.dump({"n_shards": n_shards}, f)
+    out_dir = f"/data/pretok/{model_slug}"
+    os.makedirs(out_dir, exist_ok=True)
+    with open(f"{out_dir}/manifest.json", "w") as f:
+        json.dump({"n_shards": n_shards, "vocab_size": vocab_size}, f)
     data_volume.commit()
-    print(f"  [pretok] manifest -> n_shards={n_shards}")
+    print(f"  [pretok] manifest -> n_shards={n_shards} vocab_size={vocab_size}")
 
 
 @app.local_entrypoint()
-def pretokenize(n_shards: int = 16, tokens_per_shard: int = 12_000_000):
+def pretokenize(
+    n_shards: int = 16,
+    tokens_per_shard: int = 12_000_000,
+    model_id: str = "google/gemma-4-e4b-it",
+):
     """Build the pretokenized FineWeb-Edu shards the trainer reads with use_pretok=True.
-    Run ONCE (the Gemma-4 model must already be cached on /data from a prior run):
+    Run once per tokenizer:
 
         modal run gemma4_sae.py::pretokenize
-        modal run gemma4_sae.py::pretokenize --n-shards 24 --tokens-per-shard 10000000
+        modal run gemma4_sae.py::pretokenize --model-id meta-llama/Llama-3.2-1B
 
     16 shards x 12M tok = ~192M tokens (~770MB int32). Containers run in parallel,
     so wall time is ~one shard's tokenize pass, not the sum."""
-    args = [(i, n_shards, tokens_per_shard) for i in range(n_shards)]
+    from transformers import AutoTokenizer
+    from pathlib import Path
+    import os
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    model_slug = model_id.replace("/", "_")
+    volume_model_path = f"/data/models/{model_slug}"
+
+    if not os.path.exists(volume_model_path) or not os.listdir(volume_model_path):
+        print(f"Model not cached at {volume_model_path}; downloading ...")
+        from huggingface_hub import snapshot_download
+        os.makedirs(volume_model_path, exist_ok=True)
+        snapshot_download(model_id, local_dir=volume_model_path, token=hf_token)
+
+    tok = AutoTokenizer.from_pretrained(volume_model_path, local_files_only=True)
+    vocab_size = tok.vocab_size
+
+    args = [(i, n_shards, tokens_per_shard, volume_model_path) for i in range(n_shards)]
     done = list(pretokenize_shard.starmap(args))
-    _write_pretok_manifest.remote(n_shards)
+    _write_pretok_manifest.remote(n_shards, model_slug, vocab_size)
     print(f"\nPretokenize complete: {len(done)} shards x {tokens_per_shard/1e6:.0f}M tok "
-          f"-> {PRETOK_OUT}")
+          f"-> /data/pretok/{model_slug}")
 
 
 # =============================================================================

@@ -677,10 +677,12 @@ class PreTokenizedDataset(IterableDataset):
 
 
 def _build_token_dataset(hf_token, batch_tokens, seed: int = 0,
-                         use_pretok: bool = False, pretok_dir: str = PRETOK_DIR):
+                         use_pretok: bool = False, pretok_dir=None):
     """Construct the streaming dataset. If `use_pretok=True`, reads pre-tokenized
     memmap shards (faster); otherwise streams + tokenizes FineWeb-Edu on the fly."""
     if use_pretok:
+        if pretok_dir is None:
+            pretok_dir = PRETOK_DIR
         return PreTokenizedDataset(pretok_dir=pretok_dir, batch_tokens=batch_tokens, seed=seed)
     return StreamingBatchDataset(
         hf_token=hf_token, model_id=MODEL_ID,
@@ -888,13 +890,19 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
               f"(ids not in [0,{vocab_size})); regenerating")
         _rm_pool(tok_dir)
 
+    # Resolve model-specific pretok dir when one is provided.
+    # PRETOK_DIR is the legacy default; callers can pass a model-specific path.
+    if use_pretok and pretok_dir is None:
+        from pathlib import Path as _Path
+        pretok_dir = str(_Path(PRETOK_DIR).parent / _slug(model_id or MODEL_ID))
+
     # Pre-tokenized shards are model-specific.  If their vocab doesn't match, fall
     # back to on-the-fly tokenization with the correct tokenizer.
     if use_pretok and vocab_size is not None:
         try:
             import json
             from pathlib import Path as _Path
-            with open(_Path(PRETOK_DIR) / "manifest.json") as f:
+            with open(_Path(pretok_dir) / "manifest.json") as f:
                 manifest = json.load(f)
             pretok_vocab = manifest.get("vocab_size")
             if pretok_vocab is not None and pretok_vocab != vocab_size:
@@ -905,7 +913,8 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
             pass
 
     dataset = _build_token_dataset(
-        hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=use_pretok)
+        hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=use_pretok,
+        pretok_dir=pretok_dir)
     it = iter(dataset)                                     # main-process iteration
 
     # Pre-tokenized shards are tokenizer-specific.  Validate the first batch against
