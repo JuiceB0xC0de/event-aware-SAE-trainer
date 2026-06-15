@@ -1557,7 +1557,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             timing["evt_fwd_bwd_start"] = _new_cuda_event()
             if timing["evt_fwd_bwd_start"] is not None:
                 timing["evt_fwd_bwd_start"].record()
-        activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
+        # Activation norm feeds the scheduler's LR-adaptation EMA (alpha=0.95, slow)
+        # and is otherwise nearly stationary within a layer. Computing it every step
+        # is a full-tensor cast+reduce+sync for a number that barely moves -- refresh
+        # every 50 steps and pass None otherwise (the scheduler guards on None). Log
+        # steps (LOG_EVERY=250, divisible by 50) always land on a refresh.
+        if step % 50 == 0:
+            activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
+        else:
+            activation_norm_step = None
         microbatch_size = microbatch_tokens  # tokens per microbatch
 
         # Pre-compute dead feature parameters for the aux loss. L0/sparsity stay
