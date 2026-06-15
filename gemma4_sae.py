@@ -56,6 +56,8 @@ image = (
         "SAE_SCRATCH_DIR": "/root/rollcache",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        # Synchronous CUDA errors so assert/oom tracebacks point at the real line.
+        "CUDA_LAUNCH_BLOCKING": "1",
     })
 )
 # =============================================================================
