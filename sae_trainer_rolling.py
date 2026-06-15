@@ -116,6 +116,9 @@ ERR_BUFFER_SZ  = 16_384     # high-error activation buffer (tokens)
 RESAMPLE_SCALE = 1.0        # scale of resampled encoder rows vs mean alive norm
 DEFAULT_SEED   = 0
 
+# Numeric encoding of scheduler phase for W&B plotting (string is logged too).
+_PHASE_IDX = {"DESCENT": 0, "PIN": 1, "FINETUNE": 2}
+
 
 def _aggressive_k_aux_k(target_l0: int) -> int:
     """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
@@ -141,6 +144,139 @@ def _aggressive_k_resample_steps(target_l0: int):
 # Pool sizing: T batches of fresh activations per layer. Early-stop converges
 # ~3500 steps, so T=4000 gives fresh-every-step (no epoching) with headroom.
 POOL_BATCHES_DEFAULT = 4000
+
+
+class RevivalController:
+    """Owns dead-feature revival state and bookkeeping.
+
+    Branch 5A scope: ownership of the fire/dead trackers, dead-percent
+    calculation, and checkpoint pack/unpack only. The AuxK dead-mask policy
+    (5B) and threshold-reset / resample policy (5C) move in here in later
+    passes. Behavior is identical to the previous inline trackers.
+
+    Revival is always-on and independent of scheduler mode/phase.
+    """
+
+    AUX_K_POLICIES = ("legacy", "feature_fraction")
+
+    def __init__(self, n_features: int, device, aux_k_policy: str = "legacy"):
+        import torch  # lazy import: this module imports torch inside scopes only
+        if aux_k_policy not in self.AUX_K_POLICIES:
+            raise ValueError(
+                f"unknown aux_k_policy {aux_k_policy!r}; "
+                f"expected one of {self.AUX_K_POLICIES}")
+        self.n_features = n_features
+        self.aux_k_policy = aux_k_policy
+        self.feature_fire_counts = torch.zeros(n_features, device=device, dtype=torch.long)
+        self.steps_since_fired = torch.zeros(n_features, device=device, dtype=torch.long)
+        # Revival metrics (per-layer running totals; not checkpointed -- matches
+        # the previous inline behavior where these reset on resume).
+        self.total_resampled = 0
+        self.last_dead_count = 0
+        self.last_reset_count = 0
+        self.last_resampled_count = 0
+        self.last_resample_dead_count = 0
+
+    # -- AuxK dead-feature revival policy (Branch 5B) -------------------------
+    def aux_dead_mask(self):
+        """Boolean mask of features eligible for aux-loss revival this step."""
+        return self.steps_since_fired >= AUX_DEAD_THRESHOLD
+
+    def effective_k_aux(self, target_l0) -> int:
+        """Top-k dead features per token to revive, per the configured policy.
+
+        legacy           -> max(8, min(AUX_K, target_l0 // 2))  (low-L0 safety cap)
+        feature_fraction  -> min(512, n_features // 64)
+        """
+        if self.aux_k_policy == "legacy":
+            return _aggressive_k_aux_k(int(target_l0))
+        if self.aux_k_policy == "feature_fraction":
+            return min(512, self.n_features // 64)
+        raise ValueError(f"unknown aux_k_policy {self.aux_k_policy!r}")
+
+    def revival_metrics(self, target_l0) -> dict:
+        """Lightweight metrics for logging."""
+        return {
+            "aux_k_policy": self.aux_k_policy,
+            "effective_aux_k": self.effective_k_aux(target_l0),
+            "target_l0": int(target_l0),
+            "n_features": self.n_features,
+            "dead_count": self.last_dead_count,
+            "reset_count": self.last_reset_count,
+            "resampled_count": self.last_resampled_count,
+            "total_resampled": self.total_resampled,
+        }
+
+    # -- threshold-reset and resample scheduling decisions (Branch 5C) --------
+    # These own the *decisions*; the model-weight mutations stay inline in the
+    # training loop, readable and close to the existing implementation.
+    def reset_threshold_for(self, target_l0) -> int:
+        return _aggressive_k_reset_threshold(int(target_l0))
+
+    def resample_schedule(self, target_l0):
+        return _aggressive_k_resample_steps(int(target_l0))
+
+    def should_reset(self, step: int) -> bool:
+        return step % RESET_EVERY == 0 and step > 0
+
+    def very_dead_mask(self, target_l0):
+        """Features silent long enough to qualify for a theta reset."""
+        return self.steps_since_fired >= self.reset_threshold_for(target_l0)
+
+    def resample_dead_mask(self, target_l0):
+        """Features dead enough to qualify for full W_enc/W_dec resample."""
+        return self.steps_since_fired >= max(500, self.reset_threshold_for(target_l0) - 250)
+
+    def should_buffer_err(self, step: int, target_l0) -> bool:
+        """True when a resample step is near enough to start buffering high-error acts."""
+        schedule = self.resample_schedule(target_l0)
+        nxt = min((s for s in schedule if s >= step), default=None)
+        return nxt is not None and (nxt - step) <= ERR_BUFFER_SZ // 64
+
+    def is_resample_step(self, step: int, target_l0) -> bool:
+        return step in self.resample_schedule(target_l0)
+
+    def clear_silence(self, mask):
+        """Reset the silence counter for the masked features (post reset/resample).
+
+        Keeps the controller the sole owner of steps_since_fired mutations even
+        though the model-weight mutation it accompanies stays inline in the loop.
+        """
+        self.steps_since_fired[mask] = 0
+
+    def record_reset(self, n_reset: int):
+        self.last_reset_count = n_reset
+
+    def record_resample(self, n_dead: int, n_resampled: int):
+        self.last_resample_dead_count = n_dead
+        self.last_resampled_count = n_resampled
+        self.total_resampled += n_resampled
+
+    def update_fire_state(self, fired_accum):
+        """Advance per-feature silence counters using this step's fired mask."""
+        self.steps_since_fired += 1
+        self.steps_since_fired[fired_accum] = 0
+        self.feature_fire_counts += fired_accum.long()
+
+    def dead_pct(self, window: int) -> float:
+        """Percent of features silent for at least `window` steps."""
+        return (self.steps_since_fired >= window).float().mean().item() * 100
+
+    def fire_rate(self, window: int):
+        """Per-feature fire rate over the accumulation window."""
+        return self.feature_fire_counts.float() / max(window, 1)
+
+    def reset_fire_counts(self):
+        self.feature_fire_counts.zero_()
+
+    # -- checkpoint pack/unpack (keeps the legacy top-level key names) --------
+    def state_tensors(self):
+        """Return (feature_fire_counts, steps_since_fired) for checkpointing."""
+        return self.feature_fire_counts, self.steps_since_fired
+
+    def load_state(self, feature_fire_counts, steps_since_fired):
+        self.feature_fire_counts = feature_fire_counts
+        self.steps_since_fired = steps_since_fired
 
 
 # ===========================================================================
@@ -186,6 +322,47 @@ def _ensure_sae_classes():
             sum_dims = tuple(range(grad_output.ndim - 1))
             masked_vals = torch.where(in_band_mask, pre * grad_output, 0.0)
             grad_threshold = -(masked_vals.sum(dim=sum_dims) / (2 * eps))
+            grad_log_threshold = grad_threshold * threshold
+            return grad_pre, grad_log_threshold, None
+
+    class _JumpReLUWithGate(torch.autograd.Function):
+        """Fused JumpReLU activation + L0 indicator.
+
+        Returns (feat_acts, gate) from a single pass: threshold.exp() and the
+        (pre > threshold) gate are computed once instead of once each in
+        _JumpReLU and _L0Indicator, and backward shares one in-band STE mask
+        across both threshold-gradient contributions. Mathematically identical
+        to applying _JumpReLU and _L0Indicator separately to the same
+        (pre, log_threshold) -- see test_fused_jumprelu_matches_separate.
+        """
+        @staticmethod
+        def forward(ctx, pre, log_threshold, bandwidth):
+            threshold = log_threshold.exp()
+            gate = (pre > threshold).to(pre.dtype)
+            ctx.save_for_backward(pre, threshold, gate)
+            ctx.bandwidth = bandwidth
+            return pre * gate, gate
+
+        @staticmethod
+        def backward(ctx, grad_feat, grad_gate):
+            pre, threshold, gate = ctx.saved_tensors
+            eps = ctx.bandwidth
+            # grad w.r.t. pre: only the feat path (the L0 gate is a step fn -> 0).
+            grad_pre = grad_feat * gate if grad_feat is not None else None
+            # grad w.r.t. log_threshold: both STE contributions share one mask.
+            #   feat path: where(in_band, pre * grad_feat)
+            #   gate path: where(in_band, grad_gate)
+            combined = None
+            if grad_feat is not None:
+                combined = pre * grad_feat
+            if grad_gate is not None:
+                combined = grad_gate if combined is None else combined + grad_gate
+            if combined is None:
+                return grad_pre, None, None
+            in_band = (pre - threshold).abs() < eps
+            sum_dims = tuple(range(pre.ndim - 1))
+            masked = torch.where(in_band, combined, 0.0)
+            grad_threshold = -(masked.sum(dim=sum_dims) / (2 * eps))
             grad_log_threshold = grad_threshold * threshold
             return grad_pre, grad_log_threshold, None
 
@@ -252,6 +429,10 @@ def _ensure_sae_classes():
 
         def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
             return _L0Indicator.apply(pre, self.log_threshold, self.ste_bandwidth)
+
+        def jumprelu_with_gate(self, pre: "torch.Tensor"):
+            """Fused activation + L0 gate: returns (feat_acts, gate) in one pass."""
+            return _JumpReLUWithGate.apply(pre, self.log_threshold, self.ste_bandwidth)
 
         def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
             return self.W_dec(acts) + self.b_dec
@@ -896,6 +1077,7 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
             "transition_log": scheduler.transition_log[-100:],  # last 100 transitions
             "_lambda_history": scheduler._lambda_history,
             "_activation_norm_ema": getattr(scheduler, "_activation_norm_ema", None),
+            "_activation_norm_preflight": getattr(scheduler, "_activation_norm_preflight", None),
             "_prev_l0": getattr(scheduler, "_prev_l0", None),
             "_l0_progress_fast": getattr(scheduler, "_l0_progress_fast", None),
             "_l0_progress_slow": getattr(scheduler, "_l0_progress_slow", None),
@@ -903,6 +1085,13 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
             "_stall_pulse_multiplier": getattr(scheduler, "_stall_pulse_multiplier", 1.0),
             "_last_stall_pulse_step": getattr(scheduler, "_last_stall_pulse_step", -10**9),
             "_energy_dampen": getattr(scheduler, "_energy_dampen", 1.0),
+            # Phase control state (observable; gated in later branches).
+            "phase": getattr(scheduler, "phase", "DESCENT"),
+            "phase_step": getattr(scheduler, "phase_step", 0),
+            "pin_entry_step": getattr(scheduler, "pin_entry_step", None),
+            "pinned_lambda": getattr(scheduler, "pinned_lambda", None),
+            "pin_ev_count": getattr(scheduler, "pin_ev_count", 0),
+            "pin_retry_count": getattr(scheduler, "pin_retry_count", 0),
             "energy_config": {
                 k: getattr(scheduler.config, k)
                 for k in energy_config_keys
@@ -936,6 +1125,7 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
         scheduler.transition_log = sched_state["transition_log"]
         scheduler._lambda_history = sched_state.get("_lambda_history", [])
         scheduler._activation_norm_ema = sched_state.get("_activation_norm_ema")
+        scheduler._activation_norm_preflight = sched_state.get("_activation_norm_preflight")
         scheduler._prev_l0 = sched_state.get("_prev_l0")
         scheduler._l0_progress_fast = sched_state.get("_l0_progress_fast")
         scheduler._l0_progress_slow = sched_state.get("_l0_progress_slow")
@@ -943,6 +1133,14 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
         scheduler._stall_pulse_multiplier = sched_state.get("_stall_pulse_multiplier", 1.0)
         scheduler._last_stall_pulse_step = sched_state.get("_last_stall_pulse_step", -10**9)
         scheduler._energy_dampen = sched_state.get("_energy_dampen", 1.0)
+        # Phase control state — backward-compatible defaults for old checkpoints
+        # saved before the phase machine existed.
+        scheduler.phase = sched_state.get("phase", "DESCENT")
+        scheduler.phase_step = sched_state.get("phase_step", 0)
+        scheduler.pin_entry_step = sched_state.get("pin_entry_step", None)
+        scheduler.pinned_lambda = sched_state.get("pinned_lambda", None)
+        scheduler.pin_ev_count = sched_state.get("pin_ev_count", 0)
+        scheduler.pin_retry_count = sched_state.get("pin_retry_count", 0)
         default_constraint_lr_floor = scheduler.config.constraint_lr_floor
         energy_config = sched_state.get("energy_config", {})
         for k, v in energy_config.items():
@@ -1103,7 +1301,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
          {"params": [sae.b_dec], "weight_decay": 0},
          {"params": [sae.log_threshold], "weight_decay": 0}],
         lr=LR, betas=(0.9, 0.999), fused=True)
-    scheduler = SAEEventControlScheduler(optimizer, sae_cfg, mode_label=f"L{layer:02d}")
+    scheduler = SAEEventControlScheduler(optimizer, sae_cfg, mode_label=f"L{layer:02d}",
+                                         layer=layer)
 
     preflight_stats = {
         "activation_norm_probe": None,
@@ -1116,16 +1315,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     # -- Resume from checkpoint -----------------------------------------------
     start_step = 1
-    feature_fire_counts = torch.zeros(N_FEATURES, device=device, dtype=torch.long)
-    steps_since_fired = torch.zeros(N_FEATURES, device=device, dtype=torch.long)
+    revival = RevivalController(N_FEATURES, device,
+                                aux_k_policy=getattr(sae_cfg, "aux_k_policy", "legacy"))
     err_buffer = []
 
     if resume_from and Path(resume_from).exists():
         loaded = _load_full_checkpoint(resume_from, sae, optimizer, scheduler, device)
         if loaded:
             start_step = loaded["step"] + 1
-            feature_fire_counts = loaded["feature_fire_counts"]
-            steps_since_fired = loaded["steps_since_fired"]
+            revival.load_state(loaded["feature_fire_counts"], loaded["steps_since_fired"])
             # Restore RNG states
             if "cuda" in loaded["rng_state"]:
                 torch.cuda.set_rng_state(loaded["rng_state"]["cuda"])
@@ -1224,6 +1422,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             sae_cfg.initial_lr_multiplier = initial_lr_mult
             sae_cfg.early_pulse_multiplier = min(1.45, early_pulse_mult)
             scheduler._activation_norm_ema = activation_norm
+            # Freeze the preflight norm for deterministic slingshot gain scaling
+            # (distinct from the live EMA, which stays for LR adaptation only).
+            scheduler._activation_norm_preflight = activation_norm
             # Seed lambda proportional to initial L0 overshoot so the AL
             # integrator doesn't start from zero when L0 is 4-8x above target.
             scheduler.seed_lambda(initial_l0)
@@ -1242,6 +1443,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 f"initial_L0={initial_l0:.1f} lr_mult={sae_cfg.initial_lr_multiplier:.2f} "
                 f"pulse={sae_cfg.early_pulse_multiplier:.2f}"
             )
+            print(
+                f"  [SLINGSHOT] base={sae_cfg.al_slingshot_gain_max:.1f} "
+                f"floor={sae_cfg.deep_layer_slingshot_gain:.1f} "
+                f"ref={ref_norm:.4f} probe={activation_norm:.4f} "
+                f"ratio={norm_ratio:.3f} alpha={sae_cfg.slingshot_norm_alpha:.2f} "
+                f"gain={scheduler._effective_slingshot_gain():.1f}"
+            )
 
     # Wrap the provider in a double-buffer for CUDA so the next batch's H2D transfer
     # overlaps with the current step's forward/backward/optimizer work. On CPU this is
@@ -1251,9 +1459,29 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     metrics = {"recon_loss": [], "mean_l0": [], "dead_pct": [], "resampled": [],
                "ev": [], "nonlinear_err": [], "linear_err": []}
-    total_resampled = 0
     log_window_start = time.time()
     log_window_tokens = 0
+
+    # -- optional step-level timing (set SAE_TIMING=1 to enable) -----------------
+    do_timing = os.environ.get("SAE_TIMING", "").lower() in ("1", "true", "yes", "on")
+    if do_timing:
+        timing = {
+            "t_provider": 0.0,      # wall-time accumulator (last LOG_EVERY steps)
+            "t_errbuf": 0.0,
+            "t_overhead": 0.0,
+            "n_steps": 0,
+            "_last_provider": 0.0,
+            "_last_errbuf": 0.0,
+            "evt_fwd_bwd_start": None,
+            "evt_fwd_bwd_end": None,
+            "evt_opt_start": None,
+            "evt_opt_end": None,
+        }
+        def _new_cuda_event():
+            import torch
+            return torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+    else:
+        timing = None
 
     best_ev = -float("inf"); best_ev_step = 0; best_ev_l0 = 0.0
     best_state_in_memory = None; best_state_pending = False
@@ -1298,6 +1526,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     last_step = start_step - 1
     for step in range(start_step, n_steps + 1):
         last_step = step
+        if do_timing:
+            t_step_start = time.perf_counter()
         if scheduler.should_stop:
             print(f"  EARLY STOP @ step {step}: {scheduler.stop_reason}")
             if use_wandb:
@@ -1317,21 +1547,41 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # Get full batch and split into microbatches for accumulation. The double-buffer
         # wrapper returns the batch already on GPU; its transfer overlapped with the
         # previous step's compute on a separate CUDA stream.
+        if do_timing:
+            t_provider_start = time.perf_counter()
         full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16, on device
-        activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
+        if do_timing:
+            t_provider_elapsed = time.perf_counter() - t_provider_start
+            timing["t_provider"] += t_provider_elapsed
+            timing["_last_provider"] = t_provider_elapsed
+            timing["evt_fwd_bwd_start"] = _new_cuda_event()
+            if timing["evt_fwd_bwd_start"] is not None:
+                timing["evt_fwd_bwd_start"].record()
+        # Activation norm feeds the scheduler's LR-adaptation EMA (alpha=0.95, slow)
+        # and is otherwise nearly stationary within a layer. Computing it every step
+        # is a full-tensor cast+reduce+sync for a number that barely moves -- refresh
+        # every 50 steps and pass None otherwise (the scheduler guards on None). Log
+        # steps (LOG_EVERY=250, divisible by 50) always land on a refresh.
+        if step % 50 == 0:
+            activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
+        else:
+            activation_norm_step = None
         microbatch_size = microbatch_tokens  # tokens per microbatch
 
         # Pre-compute dead feature parameters for the aux loss. L0/sparsity stay
         # inside each microbatch forward so the JumpReLU threshold gradient is live.
         # At aggressive low L0, cap AUX_K to a fraction of the target so the aux loss
         # doesn't try to revive more features than the sparsity budget allows.
-        aux_k_eff = _aggressive_k_aux_k(K)
-        reset_threshold_eff = _aggressive_k_reset_threshold(K)
-        dead_mask_aux = (steps_since_fired >= AUX_DEAD_THRESHOLD)
+        aux_k_eff = revival.effective_k_aux(K)
+        dead_mask_aux = revival.aux_dead_mask()
         n_dead = int(dead_mask_aux.sum().item())
+        revival.last_dead_count = n_dead
         if n_dead > 0:
             dead_indices = torch.where(dead_mask_aux)[0]
             eff_k = min(aux_k_eff, n_dead)
+
+        buffer_err_this_step = revival.should_buffer_err(step, K)
+        err_candidates = [] if buffer_err_this_step else None
 
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
@@ -1344,7 +1594,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # bracket this loop (one for L0, one for the fired mask) are gone.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pre = sae.encode_pre(acts_mb)
-                feat_acts = sae.apply_jumprelu(pre)
+                # Fused JumpReLU + L0 gate: one (pre > threshold) pass instead of
+                # two (apply_jumprelu + l0_indicator over the full activation tensor).
+                feat_acts, gate = sae.jumprelu_with_gate(pre)
                 x_hat = sae.decode(feat_acts)
 
                 # Cast to fp32 only for loss computation (numerical stability)
@@ -1357,7 +1609,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 # ZERO gradient, nothing pushed the thresholds up, and L0 ran away to
                 # n_features (the all-features-active degeneracy). Augmented-Lagrangian
                 # hinge for the inequality constraint L0_avg <= target.
-                gate = sae.l0_indicator(pre)
                 # Optimization: accumulate sum in float32 directly to save an intermediate cast operation
                 l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
                 slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
@@ -1390,6 +1641,30 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 fired_accum |= (feat_acts.detach() > 0).any(dim=0)
 
+            # Collect high-error activation candidates for the upcoming resample.
+            # Reuses the main forward's residual (computed above) instead of running a
+            # second full encode/decode pass, which was a major tok/s sink near
+            # resample steps.
+            if buffer_err_this_step:
+                with torch.no_grad():
+                    per_tok_err = residual_float.detach().pow(2).sum(dim=-1)
+                    k = min(64, per_tok_err.numel())
+                    if k > 0:
+                        topk_vals, topk_idx = per_tok_err.topk(k)
+                        err_candidates.append((
+                            acts_mb[topk_idx].detach().cpu(),
+                            topk_vals.detach().cpu(),
+                        ))
+
+        if do_timing:
+            timing["evt_fwd_bwd_end"] = _new_cuda_event()
+            if timing["evt_fwd_bwd_end"] is not None:
+                timing["evt_fwd_bwd_end"].record()
+            timing["evt_opt_start"] = _new_cuda_event()
+            if timing["evt_opt_start"] is not None:
+                timing["evt_opt_start"].record()
+            t_opt_start = time.perf_counter()
+
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
 
@@ -1413,43 +1688,59 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             enc_norms = sae.W_enc.weight.norm(dim=1, keepdim=True).clamp(min=1e-8)
             sae.W_enc.weight.div_(enc_norms)
 
-        # Use accumulated values for logging
-        recon_loss = torch.tensor(accum_recon_loss / accum_steps, device=device)
-        l0 = torch.tensor(accum_l0 / accum_steps, device=device)  # average L0 across microbatches
+        if do_timing:
+            timing["evt_opt_end"] = _new_cuda_event()
+            if timing["evt_opt_end"] is not None:
+                timing["evt_opt_end"].record()
+
+        # accum_recon_loss / accum_l0 are already Python floats (summed from the
+        # microbatch .item() calls); use them directly instead of bouncing through
+        # a GPU tensor and back, which forced two extra device syncs per step.
 
         # Dead/fired bookkeeping reuses the fired mask gathered during the forward
         # passes above -- no extra encode of the full batch.
         with torch.no_grad():
-            steps_since_fired += 1
-            steps_since_fired[fired_accum] = 0
-            feature_fire_counts += fired_accum.long()
+            revival.update_fire_state(fired_accum)
             log_window_tokens += BATCH_TOKENS
 
-        # Use K-aware reset/resample cadence for aggressive low-L0 runs.
-        resample_steps_eff = _aggressive_k_resample_steps(K)
-        if step % RESET_EVERY == 0 and step > 0:
+        # K-aware reset/resample cadence (decisions owned by RevivalController;
+        # the model-weight mutations stay inline here for readability).
+        if revival.should_reset(step):
             with torch.no_grad():
-                very_dead = (steps_since_fired >= reset_threshold_eff)
+                very_dead = revival.very_dead_mask(K)
                 n_reset = int(very_dead.sum().item())
                 if n_reset > 0:
                     sae.log_threshold.data[very_dead] = math.log(INIT_THRESHOLD)
                     state = optimizer.state.get(sae.log_threshold, {})
                     if "exp_avg" in state:
                         state["exp_avg"][very_dead] = 0.0; state["exp_avg_sq"][very_dead] = 0.0
-                    steps_since_fired[very_dead] = 0
+                    revival.clear_silence(very_dead)
                     print(f"  [RESET @ {step}] theta->{INIT_THRESHOLD} for {n_reset} dead")
+                revival.record_reset(n_reset)
 
-        next_resample_step = min((s for s in resample_steps_eff if s >= step), default=None)
-        if next_resample_step is not None and (next_resample_step - step) <= ERR_BUFFER_SZ // 64:
+        if buffer_err_this_step:
+            if do_timing:
+                t_errbuf_start = time.perf_counter()
             with torch.no_grad():
-                per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
-                top_err_idx = per_token_err.topk(min(64, len(per_token_err))).indices
-                err_buffer.append(full_batch[top_err_idx].detach().cpu())
-                if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
-                    err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
+                if err_candidates:
+                    cand_acts = torch.cat([acts for acts, _ in err_candidates], dim=0)
+                    cand_errs = torch.cat([errs for _, errs in err_candidates], dim=0)
+                    k = min(64, cand_errs.numel())
+                    if k > 0:
+                        top_idx = cand_errs.topk(k).indices
+                        err_buffer.append(cand_acts[top_idx].cpu())
+                    if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
+                        err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
+            if do_timing:
+                t_errbuf_elapsed = time.perf_counter() - t_errbuf_start
+                timing["t_errbuf"] += t_errbuf_elapsed
+                timing["_last_errbuf"] = t_errbuf_elapsed
+        else:
+            if do_timing:
+                timing["_last_errbuf"] = 0.0
 
-        if step in resample_steps_eff:
-            dead_mask = (steps_since_fired >= max(500, reset_threshold_eff - 250))
+        if revival.is_resample_step(step, K):
+            dead_mask = revival.resample_dead_mask(K)
             n_dead = int(dead_mask.sum().item())
             n_res = resample_dead_neurons(dead_mask, [t.to(device) for t in err_buffer])
             if n_res > 0:
@@ -1458,18 +1749,26 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     state = optimizer.state.get(sae.log_threshold, {})
                     if "exp_avg" in state:
                         state["exp_avg"][dead_mask] = 0.0; state["exp_avg_sq"][dead_mask] = 0.0
-                steps_since_fired[dead_mask] = 0
-            total_resampled += n_res
+                revival.clear_silence(dead_mask)
+            revival.record_resample(n_dead, n_res)
             print(f"  [RESAMPLE @ {step}] reinit {n_res}/{n_dead} dead")
             err_buffer = []
 
-        recon_val = recon_loss.detach().item()
+        recon_val = accum_recon_loss / accum_steps
         grad_norm_val = grad_norm_t.item()
-        l0_val = l0.detach().item()
+        l0_val = accum_l0 / accum_steps
+
+        if do_timing:
+            t_step_total = time.perf_counter() - t_step_start
+            timing["t_overhead"] += max(
+                0.0,
+                t_step_total - timing["_last_provider"] - timing["_last_errbuf"]
+            )
+            timing["n_steps"] += 1
 
         is_log_step = (step % LOG_EVERY == 0)
         if is_log_step:
-            dead = (steps_since_fired >= LOG_EVERY).float().mean().item() * 100
+            dead = revival.dead_pct(LOG_EVERY)
             with torch.no_grad():
                 total_var = full_batch.float().var().item()  # .item(): keep ev a python float
                 ev = 1.0 - (recon_val / total_var) if total_var > 0 else 0.0
@@ -1526,12 +1825,42 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if step % LOG_EVERY == 0:
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
-                fire_rate = feature_fire_counts.float() / max(LOG_EVERY, 1)
+                fire_rate = revival.fire_rate(LOG_EVERY)
                 ultra_active = (fire_rate > 0.10).float().sum().item()
             now = time.time()
             tokens_per_sec = log_window_tokens / max(now - log_window_start, 1e-6)
             log_window_start = now; log_window_tokens = 0
-            feature_fire_counts.zero_()
+            revival.reset_fire_counts()
+
+            if do_timing:
+                import torch
+                # Synchronize CUDA events only on log steps
+                cuda_ms = {}
+                for key, (start, end) in (
+                    ("fwd_bwd", (timing["evt_fwd_bwd_start"], timing["evt_fwd_bwd_end"])),
+                    ("opt", (timing["evt_opt_start"], timing["evt_opt_end"])),
+                ):
+                    if start is not None and end is not None:
+                        start.synchronize()
+                        end.synchronize()
+                        cuda_ms[key] = start.elapsed_time(end)
+                    else:
+                        cuda_ms[key] = 0.0
+                # Average wall-time buckets over the last LOG_EVERY steps
+                n = max(1, timing["n_steps"])
+                t_provider_avg = timing["t_provider"] / n
+                t_errbuf_avg = timing["t_errbuf"] / n
+                t_overhead_avg = timing["t_overhead"] / n
+                print(f"  [TIMING @ {step}] per_step "
+                      f"provider={t_provider_avg*1000:.1f}ms "
+                      f"fwd_bwd_cuda={cuda_ms['fwd_bwd']:.1f}ms "
+                      f"opt_cuda={cuda_ms['opt']:.1f}ms "
+                      f"errbuf={t_errbuf_avg*1000:.1f}ms "
+                      f"overhead={t_overhead_avg*1000:.1f}ms "
+                      f"(n={n})")
+                # Reset accumulators for the next window
+                for k in ("t_provider", "t_errbuf", "t_overhead", "n_steps"):
+                    timing[k] = 0.0
 
             if ev > best_ev:
                 best_ev = ev; best_ev_step = step; best_ev_l0 = l0_val
@@ -1594,9 +1923,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             metrics["recon_loss"].append(round(recon_val, 6))
             metrics["mean_l0"].append(round(l0_val, 2))
             metrics["dead_pct"].append(round(dead, 2))
-            metrics["resampled"].append(total_resampled)
+            metrics["resampled"].append(revival.total_resampled)
             metrics["ev"].append(ev)
-            print(f"  step={step:>5} mode={scheduler.mode:<9s} recon={recon_val:.5f} "
+            print(f"  step={step:>5} mode={scheduler.mode:<9s} phase={scheduler.phase:<8s} "
+                  f"recon={recon_val:.5f} "
                   f"L0={l0_val:.1f} dead={dead:.1f}% ev={ev:.3f} thr={thr.mean().item():.3f} "
                   f"ultra={int(ultra_active):>4d} lr={scheduler.optimizer.param_groups[0]['lr']:.2e} "
                   f"lam={scheduler.lambda_l0:.2e} tok/s={tokens_per_sec/1e3:.1f}k "
@@ -1613,13 +1943,28 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            "train/best_ev_so_far": best_ev,
                            "features/ultra_active_count": ultra_active,
                            "timing/tokens_per_sec": tokens_per_sec,
-                           "scheduler/mode": scheduler.mode}, step=step)
+                           "scheduler/mode": scheduler.mode,
+                           "scheduler/phase": scheduler.phase,
+                           "scheduler/phase_idx": _PHASE_IDX.get(scheduler.phase, -1),
+                           "scheduler/effective_slingshot_gain": scheduler._effective_slingshot_gain(),
+                           "scheduler/activation_norm_preflight": scheduler._activation_norm_preflight,
+                           "timing/tokens_per_sec": tokens_per_sec,
+                           **({f"timing/{k}": v for k, v in {
+                               "provider_ms": t_provider_avg * 1000,
+                               "fwd_bwd_cuda_ms": cuda_ms["fwd_bwd"],
+                               "opt_cuda_ms": cuda_ms["opt"],
+                               "errbuf_ms": t_errbuf_avg * 1000,
+                               "overhead_ms": t_overhead_avg * 1000,
+                           }.items()} if do_timing else {}),
+                           **{f"revival/{k}": v for k, v in revival.revival_metrics(K).items()}},
+                          step=step)
 
         if step % CHECKPOINT_EVERY == 0:
             rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
             provider_state = provider.get_state() if hasattr(provider, "get_state") else None
             _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
-                                  feature_fire_counts.clone(), steps_since_fired.clone(),
+                                  revival.feature_fire_counts.clone(),
+                                  revival.steps_since_fired.clone(),
                                   provider_state)
             print(f"  [CHECKPOINT @ {step}] {out_dir / 'checkpoint_full.pt'}")
 
@@ -1645,6 +1990,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             "n_steps": step, "lr": LR, "lambda_l0": scheduler.lambda_l0, "tier": tier,
             "preflight": preflight_stats,
             "scheduler_mode": scheduler.mode,
+            "scheduler_phase": sched_summary["phase"],
+            "scheduler_phase_summary": {
+                k: sched_summary[k] for k in
+                ("phase", "phase_step", "pin_entry_step", "pinned_lambda",
+                 "pin_ev_count", "pin_retry_count")
+            },
             "scheduler_transitions": sched_summary["transitions"],
             "total_tokens": step * BATCH_TOKENS, "early_stopped": scheduler.should_stop,
             "path": "rolling", "best_ev": best_ev, "best_ev_step": best_ev_step,
@@ -1657,7 +2008,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
     provider_state = provider.get_state() if hasattr(provider, "get_state") else None
     _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
-                          feature_fire_counts.clone(), steps_since_fired.clone(), provider_state)
+                          revival.feature_fire_counts.clone(),
+                          revival.steps_since_fired.clone(), provider_state)
 
     print(f"Saved: {out_dir}/sae.pt + meta.json + checkpoint_full.pt")
 
@@ -1791,11 +2143,16 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     import shutil
     os.makedirs(ROLLCACHE, exist_ok=True)
     shard_gb = (BATCH_TOKENS // SEQ_LEN) * SEQ_LEN * d_in * 2 / 1e9   # bf16 [n_seqs,SEQ_LEN,d]
-    # Pipeline keeps two pools (current + pre-produced next) plus resume copy.
-    peak_gb = pool_batches * shard_gb * 2.2 + 4
+    # Rolling pipelines two pools (current + pre-produced next) plus a resume copy.
+    # Auto/hook capture is independent per layer -- only one pool is on disk at a
+    # time (plus resume-copy headroom), so the 2x pipeline term over-estimates peak
+    # and would falsely block valid auto runs.
+    pool_multiplier = 2.2 if capture == "rolling" else 1.2
+    n_pools_desc = "2 pipelined pools" if capture == "rolling" else "1 pool"
+    peak_gb = pool_batches * shard_gb * pool_multiplier + 4
     free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
     sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
-    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB (2 pipelined pools of {pool_batches} x "
+    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB ({n_pools_desc} of {pool_batches} x "
           f"{shard_gb*1e3:.0f}MB); free={'(overlay: unknown)' if sentinel else f'{free_gb:.0f}GB'}")
     if not sentinel:
         assert free_gb > peak_gb, (

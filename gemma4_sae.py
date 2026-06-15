@@ -31,6 +31,9 @@ image = (
         "huggingface_hub",
         "hf_transfer",
         "wandb",
+        "bitsandbytes",
+        "colorama",  # cache-bust + harmless
+        force_build=True,  # rebuild this layer every deploy; remove when stable
     )
     # Bake the local trainer modules into the image so the container
     # always sees the working tree (Modal 1.4 dropped cls-level mounts).
@@ -80,7 +83,7 @@ app = modal.App("gemma4-sae-train", image=image)
 
 
 @app.cls(
-    gpu="RTX-PRO-6000",
+    gpu="H100",
     volumes={"/data": data_volume},          # /scratch removed: pool lives on local NVMe now
     ephemeral_disk=1_048_576,                 # 1 TiB container-local NVMe for the activation pool
     secrets=[modal.Secret.from_name("huggingface")],
@@ -115,7 +118,8 @@ class SAETainer:
     def train(self, layer_range: str, capture: str, expansion: int = 32,
               pool_batches: int = 2000, max_steps: int = 15000,
               microbatch_tokens: int = 32768, resume_from: str | None = None,
-              evict_model: bool = True) -> dict:
+              evict_model: bool = True, target_l0: int | None = None,
+              timing: bool = False) -> dict:
         """
         Train SAEs on a range of layers.
 
@@ -151,7 +155,13 @@ class SAETainer:
         if resume_from:
             print(f"  Resume: {resume_from}")
         print(f"  Evict model during training: {evict_model}")
+        print(f"  Target L0: {target_l0 if target_l0 is not None else 'default'}")
+        print(f"  Timing: {timing}")
         print(f"{'='*60}\n")
+
+        import os as _os
+        if timing:
+            _os.environ["SAE_TIMING"] = "1"
 
         # Run training
         results = run_atlas_rolling(
@@ -172,6 +182,7 @@ class SAETainer:
             wandb_project=os.environ.get("WANDB_PROJECT"),
             expansion=expansion,
             evict_model=evict_model,
+            target_l0=target_l0,
         )
 
         # Commit volumes
@@ -280,6 +291,8 @@ def main(
     max_steps: int = 15000,
     resume_from: str | None = None,
     evict_model: bool = True,
+    target_l0: int | None = None,
+    timing: bool = False,
 ):
     """
     Train SAEs on Gemma-4 E4B layers.
@@ -298,6 +311,8 @@ def main(
         max_steps=max_steps,
         resume_from=resume_from,
         evict_model=evict_model,
+        target_l0=target_l0,
+        timing=timing,
     )
     print(f"\nTraining complete: {result['status']}")
     print(f"Layers trained: {result['layers']}")

@@ -1,5 +1,7 @@
 """Tests for the AECS scheduler -- focus on the Augmented-Lagrangian lambda
 integrator, which is the part the trainer depends on for sparsity convergence."""
+import pytest
+
 import sae_scheduler as s
 from conftest import make_dummy_optimizer
 
@@ -287,3 +289,190 @@ def test_early_stop_requires_sparse_side_crossing():
     for l0 in [475.0, 475.0, 475.0]:
         crossed.step({**_sig(l0=l0), "ev": 0.99})
     assert crossed.should_stop is True
+
+
+# -- Phase observability (Branch 1) -------------------------------------------
+
+def test_scheduler_starts_in_descent():
+    sched = _make_scheduler()
+    assert sched.phase == "DESCENT"
+    assert sched.phase_step == 0
+    assert sched.pin_entry_step is None
+    assert sched.summary()["phase"] == "DESCENT"
+
+
+def test_descent_enters_pin_when_l0_in_band():
+    sched = _make_scheduler(target_l0=500.0, pin_l0_band_abs=0.5)
+    assert sched.phase == "DESCENT"
+    # Outside the band -> stays in DESCENT.
+    sched._maybe_update_phase(l0=600.0, ev=0.90)
+    assert sched.phase == "DESCENT"
+    # Inside the band -> transitions to PIN and captures entry state.
+    sched.lambda_l0 = 1e-3
+    sched._maybe_update_phase(l0=500.2, ev=0.90)
+    assert sched.phase == "PIN"
+    assert sched.phase_step == 0
+    assert sched.pin_entry_step == sched.total_steps
+    assert sched.pinned_lambda == 1e-3
+
+
+def test_old_checkpoint_without_phase_fields_restores_safely(tiny_sae, tmp_path):
+    """A checkpoint saved before the phase machine existed (no phase keys in
+    scheduler_state) must restore with safe defaults, not raise."""
+    import torch
+    import sae_trainer_rolling as t
+
+    sae = tiny_sae
+    opt = torch.optim.Adam(sae.parameters(), lr=1e-3)
+    sched = _make_scheduler()
+    # Dirty the phase state so we can prove the restore overwrites it.
+    sched.phase = "PIN"
+    sched.phase_step = 7
+    sched.pin_ev_count = 2
+
+    n = sum(1 for _ in sae.parameters())  # any size; roundtrip only needs a tensor
+    ffc = torch.zeros(8, dtype=torch.long)
+    ssf = torch.zeros(8, dtype=torch.long)
+    rng = {"cuda": None, "cpu": torch.get_rng_state()}
+    path = t._save_full_checkpoint(tmp_path, 100, sae, opt, sched, rng, ffc, ssf, None)
+
+    # Emulate an OLD checkpoint: strip every phase key from scheduler_state.
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    for k in ("phase", "phase_step", "pin_entry_step", "pinned_lambda",
+              "pin_ev_count", "pin_retry_count"):
+        ckpt["scheduler_state"].pop(k, None)
+    torch.save(ckpt, path)
+
+    # Restore into a fresh (also dirtied) scheduler.
+    sched2 = _make_scheduler()
+    sched2.phase = "FINETUNE"
+    sched2.phase_step = 999
+    loaded = t._load_full_checkpoint(path, sae, opt, sched2, device="cpu")
+    assert loaded is not None, "old-style checkpoint failed to load"
+    assert sched2.phase == "DESCENT"
+    assert sched2.phase_step == 0
+    assert sched2.pin_entry_step is None
+    assert sched2.pinned_lambda is None
+    assert sched2.pin_ev_count == 0
+    assert sched2.pin_retry_count == 0
+
+
+# -- PIN lambda gates (Branch 2) ----------------------------------------------
+
+def test_dual_update_frozen_in_pin():
+    sched = _make_scheduler(al_dual_step=1.0, lambda_l0_max=1.0)
+    sched.total_steps = 10
+    sched.lambda_l0 = 2e-3
+    # DESCENT: the integrator moves lambda when L0 is above target.
+    sched.phase = "DESCENT"
+    sched._dual_update(600.0)
+    assert sched.lambda_l0 > 2e-3
+    # PIN: lambda is frozen regardless of L0 error (no windup).
+    pinned = sched.lambda_l0
+    sched.phase = "PIN"
+    for l0 in (600.0, 1200.0, 300.0):
+        sched._dual_update(l0)
+        assert sched.lambda_l0 == pinned
+
+
+def test_live_tune_lambda_override_ignored_in_pin(tmp_path):
+    import json
+    lt = tmp_path / "live_tune.json"
+    lt.write_text(json.dumps({"lambda_l0_override": 0.5}))
+    missing_alt = str(tmp_path / "does_not_exist.json")  # avoid stray /tmp/live_tune.json
+
+    # DESCENT: the override is applied (sets lambda directly).
+    sched = _make_scheduler(lambda_l0_max=1.0)
+    sched.config.live_tune_path = str(lt)
+    sched.config.live_tune_path_alt = missing_alt
+    sched.phase = "DESCENT"
+    sched._live_tune_mtime = 0.0
+    sched._apply_live_tune()
+    assert sched.lambda_l0 == 0.5
+
+    # PIN: the same override is ignored, lambda unchanged.
+    sched2 = _make_scheduler(lambda_l0_max=1.0)
+    sched2.config.live_tune_path = str(lt)
+    sched2.config.live_tune_path_alt = missing_alt
+    sched2.phase = "PIN"
+    sched2.lambda_l0 = 3e-3
+    sched2._live_tune_mtime = 0.0
+    sched2._apply_live_tune()
+    assert sched2.lambda_l0 == 3e-3
+
+
+def test_finetune_entry_repins_lambda_ceiling():
+    # Ceiling lowered below pinned lambda -> FINETUNE entry raises it back up.
+    sched = _make_scheduler(lambda_l0_max=0.1)
+    sched.phase = "PIN"
+    sched.pinned_lambda = 0.5
+    sched._enter_phase("FINETUNE", "test")
+    assert sched.phase == "FINETUNE"
+    assert sched.config.lambda_l0_max == 0.5  # raised to pinned_lambda
+
+    # Ceiling already above pinned lambda -> left unchanged.
+    sched2 = _make_scheduler(lambda_l0_max=0.8)
+    sched2.phase = "PIN"
+    sched2.pinned_lambda = 0.5
+    sched2._enter_phase("FINETUNE", "test")
+    assert sched2.config.lambda_l0_max == 0.8
+
+
+# -- Threshold nudge gate (Branch 3) ------------------------------------------
+
+def test_threshold_nudge_suppressed_in_pin():
+    sched = _make_scheduler()  # target_l0=500, default nudge gain 0.08
+    # DESCENT: L0 well above target and outside the deadband -> nudge fires.
+    sched.phase = "DESCENT"
+    nudge, should_apply = sched.compute_threshold_nudge(current_l0=600.0, step=0)
+    assert should_apply is True
+    assert nudge > 0.0
+    # PIN: identical inputs -> fully suppressed.
+    sched.phase = "PIN"
+    assert sched.compute_threshold_nudge(current_l0=600.0, step=0) == (0.0, False)
+
+
+def test_threshold_nudge_active_outside_pin():
+    # DESCENT nudges when L0 is outside the deadband.
+    sched = _make_scheduler()
+    sched.phase = "DESCENT"
+    nudge, should_apply = sched.compute_threshold_nudge(current_l0=650.0, step=0)
+    assert should_apply is True and nudge > 0.0
+    # FINETUNE still allows the nudge (gate is PIN-only, not global).
+    sched.phase = "FINETUNE"
+    nudge_f, should_apply_f = sched.compute_threshold_nudge(current_l0=650.0, step=0)
+    assert should_apply_f is True and nudge_f > 0.0
+
+
+# -- Deep-layer slingshot gain scaling (Branch 4) -----------------------------
+
+def _slingshot_sched(ref=None, probe=None, layer=None):
+    sched = _make_scheduler(al_slingshot_gain_max=24.0, deep_layer_slingshot_gain=8.0,
+                            slingshot_norm_alpha=-0.5)
+    sched.config.activation_norm_ref = ref
+    sched._activation_norm_preflight = probe
+    sched.layer = layer
+    return sched
+
+
+def test_slingshot_gain_norm_scaled_from_preflight():
+    # ref/probe 1/1 -> full gain 24.
+    assert _slingshot_sched(ref=1.0, probe=1.0)._effective_slingshot_gain() == 24.0
+    # ratio 4, alpha -0.5 -> 4**-0.5 = 0.5 -> 24 * 0.5 = 12.
+    assert _slingshot_sched(ref=1.0, probe=4.0)._effective_slingshot_gain() == 12.0
+    # ratio 100 -> 0.1 < floor_scale (8/24) -> floors at deep_layer_slingshot_gain.
+    assert _slingshot_sched(ref=1.0, probe=100.0)._effective_slingshot_gain() == pytest.approx(8.0)
+
+
+def test_slingshot_gain_uses_landing_path():
+    # The norm-scaled gain is what the dual update sees while L0 is above target.
+    sched = _slingshot_sched(ref=1.0, probe=4.0)
+    assert sched._landing_lambda_gain(current_l0=600.0, control_error=150.0) == 12.0
+
+
+def test_slingshot_gain_fallback_without_preflight_stats():
+    # Missing preflight stats -> deterministic layer-number fallback.
+    assert _slingshot_sched(ref=None, probe=None, layer=3)._effective_slingshot_gain() == 8.0
+    assert _slingshot_sched(ref=None, probe=None, layer=24)._effective_slingshot_gain() == 8.0
+    assert _slingshot_sched(ref=None, probe=None, layer=2)._effective_slingshot_gain() == 24.0
+    assert _slingshot_sched(ref=None, probe=None, layer=None)._effective_slingshot_gain() == 24.0

@@ -98,6 +98,11 @@ class SAEAECSConfig:
     dead_emergency_cooldown: int = 5000   # min steps between dead emergency triggers
     dead_emergency_resample_trigger: bool = True  # auto-trigger resample on emergency
 
+    # -- Revival AuxK policy -----------------------------------------------
+    # "legacy"          -> max(8, min(128, target_l0 // 2))  (current behavior, default)
+    # "feature_fraction"-> min(512, n_features // 64)        (new; A/B only)
+    aux_k_policy: str = "legacy"
+
     # -- L0 stabilization detection ----------------------------------------
     l0_stabilize_window: int = 3          # consecutive windows to detect stabilization
     l0_stabilize_std_thresh: float = 0.5  # std of L0 window below this -> stabilize
@@ -217,6 +222,24 @@ class SAEAECSConfig:
     live_tune_path: Optional[str] = None
     live_tune_path_alt: str = "/tmp/live_tune.json"  # fallback: always container-local
     live_tune_every: int = 50        # check for overrides every N steps
+
+    # -- Phase control (DESCENT / PIN / FINETUNE) -----------------------------
+    # Strategic phase machine layered on top of AECS disturbance handling:
+    #   DESCENT  — drive L0 into the band around target (existing behavior).
+    #   PIN      — L0 in band; freeze sparsity pressure (lambda + threshold
+    #              nudge) and let EV catch up.
+    #   FINETUNE — release lambda gently to settle on the final equilibrium.
+    # These knobs are config-only until the corresponding gates are wired in
+    # later branches; the legacy ev_stop_thresh/ev_stop_patience above stay
+    # authoritative for stopping until FINETUNE is implemented.
+    pin_l0_band_abs: float = 0.5        # |L0 - target| <= this -> DESCENT enters PIN
+    pin_timeout_steps: int = 2000       # max steps in PIN before bailing back to DESCENT
+    pin_ev_thresh: float = 0.95         # EV window counts toward PIN success above this
+    pin_ev_patience: int = 3            # consecutive good EV windows -> ready for FINETUNE
+    finetune_dual_step: float = 1e-9    # dual ascent step used during FINETUNE
+    finetune_lambda_release_frac: float = 0.10  # lambda set to this fraction of pinned on release
+    deep_layer_slingshot_gain: float = 8.0      # slingshot gain floor (deep-layer fallback)
+    slingshot_norm_alpha: float = -0.5          # exponent for activation-norm slingshot scaling
 
 
 class SAESignalBuffer:
@@ -343,10 +366,12 @@ class SAEEventControlScheduler:
 
     MODES = ["BASELINE", "RECOVERY", "EXPLORE", "STABILIZE"]
 
-    def __init__(self, optimizer, config: SAEAECSConfig = None, mode_label: str = ""):
+    def __init__(self, optimizer, config: SAEAECSConfig = None, mode_label: str = "",
+                 layer: Optional[int] = None):
         self.config = config or SAEAECSConfig()
         self.optimizer = optimizer
         self.mode_label = mode_label  # "L0", "L1", etc. for logging
+        self.layer = layer            # decoder layer index; drives deep-layer gain scaling
 
         # Base AECS state
         self.buffer = SAESignalBuffer(
@@ -379,6 +404,9 @@ class SAEEventControlScheduler:
         self.stop_reason: str = ""
         self._lambda_history: list = []     # rolling lambda readings for plateau detection
         self._activation_norm_ema: Optional[float] = None
+        # Frozen preflight activation norm — drives the deterministic slingshot
+        # gain scaling. Distinct from the live EMA (which is for LR adaptation).
+        self._activation_norm_preflight: Optional[float] = None
         self._prev_l0: Optional[float] = None
         self._l0_progress_fast: Optional[float] = None
         self._l0_progress_slow: Optional[float] = None
@@ -390,6 +418,16 @@ class SAEEventControlScheduler:
         # Live-tune state
         self._live_tune_mtime: float = 0.0
         self._live_tune_applied: Dict[str, object] = {}
+
+        # Phase control state (DESCENT / PIN / FINETUNE).
+        # Observable only at this branch: tracked, summarized, and checkpointed
+        # but does not yet gate any actuator.
+        self.phase: str = "DESCENT"
+        self.phase_step: int = 0           # steps since the current phase was entered
+        self.pin_entry_step: Optional[int] = None  # total_steps at PIN entry
+        self.pinned_lambda: Optional[float] = None  # lambda captured on PIN entry
+        self.pin_ev_count: int = 0         # consecutive good-EV windows seen in PIN
+        self.pin_retry_count: int = 0      # times PIN timed out back to DESCENT
 
     def seed_lambda(self, initial_l0: float):
         """Seed lambda proportional to initial L0 overshoot.
@@ -416,6 +454,78 @@ class SAEEventControlScheduler:
                 print(f"{prefix}[LAMBDA WARMUP] lambda {old:.3e} -> {seed:.3e} "
                       f"(initial_l0={initial_l0:.1f}, target={target:.0f}, "
                       f"overshoot_ratio={overshoot_ratio:.2f}x)")
+
+    # -- Phase machine (DESCENT / PIN / FINETUNE) -----------------------------
+    # Observation-only at this branch: transitions and counters are tracked and
+    # logged, but no actuator (lambda dual update, threshold nudge, stop) reads
+    # self.phase yet. Gating lands in later branches.
+
+    def _l0_in_pin_band(self, current_l0: float) -> bool:
+        """True when L0 is within the PIN band (+/- pin_l0_band_abs) of target."""
+        return abs(current_l0 - self.config.target_l0) <= self.config.pin_l0_band_abs
+
+    def _enter_phase(self, new_phase: str, reason: str):
+        """Transition the phase machine, reset phase_step, capture PIN entry state.
+
+        No actuator reads self.phase at this branch, so a transition has no
+        behavioral effect beyond logging and bookkeeping.
+        """
+        if new_phase == self.phase:
+            return
+        old = self.phase
+        self.phase = new_phase
+        self.phase_step = 0
+        if new_phase == "PIN":
+            self.pin_entry_step = self.total_steps
+            self.pinned_lambda = self.lambda_l0
+            self.pin_ev_count = 0
+        prefix = f"[{self.mode_label}] " if self.mode_label else ""
+        if new_phase == "FINETUNE" and self.pinned_lambda is not None:
+            # Re-pin the ceiling so a stale/lowered lambda_l0_max (e.g. from a live
+            # tune during PIN) cannot clip the pinned lambda downward on the first
+            # re-enabled dual update after release.
+            old_max = self.config.lambda_l0_max
+            new_max = max(old_max, self.pinned_lambda)
+            if new_max != old_max:
+                self.config.lambda_l0_max = new_max
+                print(f"{prefix}[PHASE] re-pin lambda_l0_max {old_max:.3e} -> {new_max:.3e} "
+                      f"(>= pinned_lambda {self.pinned_lambda:.3e})")
+        print(f"{prefix}[PHASE] {old} -> {new_phase} @ step {self.total_steps} "
+              f"(lambda={self.lambda_l0:.3e}; {reason})")
+
+    def _maybe_update_phase(self, l0, ev):
+        """Observation-only phase detection.
+
+        - DESCENT -> PIN when L0 enters the band around target.
+        - In PIN, count consecutive EV windows at/above pin_ev_thresh, and LOG
+          (but do not act on) FINETUNE readiness and PIN timeout. Actual FINETUNE
+          release (Task 6A) and timeout return-to-DESCENT (Task 6C) land later.
+        """
+        if l0 is None:
+            return
+        cfg = self.config
+        prefix = f"[{self.mode_label}] " if self.mode_label else ""
+        if self.phase == "DESCENT":
+            if self._l0_in_pin_band(float(l0)):
+                self._enter_phase(
+                    "PIN",
+                    f"L0={l0:.2f} within +/-{cfg.pin_l0_band_abs} of target {cfg.target_l0:.1f}",
+                )
+        elif self.phase == "PIN":
+            if ev is not None:
+                if ev >= cfg.pin_ev_thresh:
+                    self.pin_ev_count += 1
+                else:
+                    self.pin_ev_count = 0
+            if self.pin_ev_count >= cfg.pin_ev_patience:
+                print(f"{prefix}[PHASE] PIN ready for FINETUNE @ step {self.total_steps} "
+                      f"(pin_ev_count={self.pin_ev_count} >= {cfg.pin_ev_patience}) "
+                      f"[observe-only: no lambda release yet]")
+            if (self.pin_entry_step is not None
+                    and self.total_steps - self.pin_entry_step >= cfg.pin_timeout_steps):
+                print(f"{prefix}[PHASE] PIN would timeout @ step {self.total_steps} "
+                      f"({self.total_steps - self.pin_entry_step} >= {cfg.pin_timeout_steps} steps) "
+                      f"[observe-only: no return to DESCENT yet]")
 
     def step(self, signals: Dict) -> str:
         """Advance scheduler one step.
@@ -449,6 +559,7 @@ class SAEEventControlScheduler:
         self.buffer.push_base(loss, grad_norm)
         self.total_steps += 1
         self.mode_steps += 1
+        self.phase_step += 1   # steps since current phase entered (reset on _enter_phase)
 
         # -- Live-tune: pick up runtime parameter overrides from JSON file --
         if self.config.live_tune_path and self.total_steps % max(1, self.config.live_tune_every) == 0:
@@ -470,6 +581,10 @@ class SAEEventControlScheduler:
 
         # -- SAE-specific event detection (uses log-window-rate EV signal) --
         sae_event = self._detect_sae_events(signals) if ev_check_due else None
+
+        # -- Phase machine (observation only; no actuator reads self.phase) --
+        if ev_check_due:
+            self._maybe_update_phase(l0, ev)
 
         # -- LAMBDA update: Augmented Lagrangian dual ascent (default) OR legacy P-ctrl --
         if l0 is not None:
@@ -527,6 +642,14 @@ class SAEEventControlScheduler:
         which has proper convergence theory (vs the ad-hoc P-controller).
         """
         cfg = self.config
+        # PIN freezes sparsity pressure: lambda is pinned at PIN entry and the
+        # phase machine owns it, so the integrator must not move it. This early
+        # return is the single guarantee against lambda windup during PIN.
+        if self.phase == "PIN":
+            if cfg.verbose and self.total_steps % max(1, cfg.al_log_every) == 0:
+                print(f"  [AL @ step {self.total_steps}] PIN: dual update frozen "
+                      f"(lambda={self.lambda_l0:.3e})")
+            return
         error = current_l0 - cfg.target_l0   # signed (negative means we're below target)
         control_target = self._dual_control_target(current_l0)
         control_error = current_l0 - control_target
@@ -551,12 +674,40 @@ class SAEEventControlScheduler:
             return cfg.target_l0 * (1.0 - cfg.al_slingshot_overshoot_rel)
         return cfg.target_l0
 
+    def _effective_slingshot_gain(self) -> float:
+        """Slingshot dual-gain, scaled by frozen preflight activation norm.
+
+        Plant-aware: deeper layers have larger activation norms and overshoot
+        lambda under the early-layer slingshot. Scale the gain down by the
+        preflight norm ratio (probe/ref) ** slingshot_norm_alpha, with the floor
+        derived from deep_layer_slingshot_gain so the curve asymptotes to the
+        validated deep-layer value. Uses the FROZEN preflight norm (deterministic),
+        never the live EMA. Falls back to the layer-number rule when preflight
+        stats are missing.
+        """
+        cfg = self.config
+        max_gain = cfg.al_slingshot_gain_max
+        floor_gain = min(max_gain, cfg.deep_layer_slingshot_gain)
+
+        ref = cfg.activation_norm_ref
+        probe = self._activation_norm_preflight
+
+        if ref is not None and ref > 0 and probe is not None and probe > 0:
+            floor_scale = floor_gain / max(max_gain, 1e-12)
+            ratio = probe / ref
+            scale = max(floor_scale, min(1.0, ratio ** cfg.slingshot_norm_alpha))
+            return max_gain * scale
+
+        if self.layer is not None and self.layer >= 3:
+            return floor_gain
+        return max_gain
+
     def _landing_lambda_gain(self, current_l0: float, control_error: float) -> float:
         cfg = self.config
         if control_error <= 0:
             return 1.0
         if current_l0 > cfg.target_l0:
-            return cfg.al_slingshot_gain_max
+            return self._effective_slingshot_gain()
         target = max(cfg.target_l0, 1e-8)
         error_rel = control_error / target
         if error_rel <= cfg.l0_tolerance:
@@ -619,6 +770,11 @@ class SAEEventControlScheduler:
           - Dead band: suppress nudge within tolerance of target.
         """
         cfg = self.config
+        # PIN freezes direct threshold manipulation while EV catches up — the
+        # phase machine owns the actuators here. This gate is PIN-only: the nudge
+        # stays fully available in DESCENT and FINETUNE and is NOT disabled globally.
+        if self.phase == "PIN":
+            return 0.0, False
         if cfg.threshold_nudge_gain <= 0:
             return 0.0, False
 
@@ -1122,6 +1278,15 @@ class SAEEventControlScheduler:
             except (ValueError, TypeError):
                 continue
             if key == "lambda_l0_override":
+                if self.phase == "PIN":
+                    # PIN owns lambda; an external hot-tune file must not silently
+                    # steal lambda ownership while sparsity pressure is frozen.
+                    if cfg.verbose:
+                        prefix = f"[{self.mode_label}] " if self.mode_label else ""
+                        print(f"  {prefix}[live-tune @ step {self.total_steps}] IGNORED "
+                              f"lambda_l0_override={val:.3e} during PIN "
+                              f"(lambda pinned at {self.lambda_l0:.3e})")
+                    continue
                 # Directly set lambda, bypass integrator
                 self.lambda_l0 = val
                 applied[key] = val
@@ -1245,6 +1410,12 @@ class SAEEventControlScheduler:
     def summary(self) -> Dict:
         return {
             "mode": self.mode,
+            "phase": self.phase,
+            "phase_step": self.phase_step,
+            "pin_entry_step": self.pin_entry_step,
+            "pinned_lambda": self.pinned_lambda,
+            "pin_ev_count": self.pin_ev_count,
+            "pin_retry_count": self.pin_retry_count,
             "total_steps": self.total_steps,
             "lambda_l0": self.lambda_l0,
             "transitions": len(self.transition_log),
@@ -1252,6 +1423,8 @@ class SAEEventControlScheduler:
             "ev_below_floor": self._ev_below_floor_count,
             "ev_above_floor": self._ev_above_floor_count,
             "activation_norm_ema": self._activation_norm_ema,
+            "activation_norm_preflight": self._activation_norm_preflight,
+            "effective_slingshot_gain": self._effective_slingshot_gain(),
             "l0_progress_fast": self._l0_progress_fast,
             "l0_progress_slow": self._l0_progress_slow,
             "stall_pulse_remaining": self._stall_pulse_remaining,
