@@ -236,6 +236,14 @@ class RevivalController:
     def is_resample_step(self, step: int, target_l0) -> bool:
         return step in self.resample_schedule(target_l0)
 
+    def clear_silence(self, mask):
+        """Reset the silence counter for the masked features (post reset/resample).
+
+        Keeps the controller the sole owner of steps_since_fired mutations even
+        though the model-weight mutation it accompanies stays inline in the loop.
+        """
+        self.steps_since_fired[mask] = 0
+
     def record_reset(self, n_reset: int):
         self.last_reset_count = n_reset
 
@@ -1409,6 +1417,27 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     log_window_start = time.time()
     log_window_tokens = 0
 
+    # -- optional step-level timing (set SAE_TIMING=1 to enable) -----------------
+    do_timing = os.environ.get("SAE_TIMING", "").lower() in ("1", "true", "yes", "on")
+    if do_timing:
+        timing = {
+            "t_provider": 0.0,      # wall-time accumulator (last LOG_EVERY steps)
+            "t_errbuf": 0.0,
+            "t_overhead": 0.0,
+            "n_steps": 0,
+            "_last_provider": 0.0,
+            "_last_errbuf": 0.0,
+            "evt_fwd_bwd_start": None,
+            "evt_fwd_bwd_end": None,
+            "evt_opt_start": None,
+            "evt_opt_end": None,
+        }
+        def _new_cuda_event():
+            import torch
+            return torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+    else:
+        timing = None
+
     best_ev = -float("inf"); best_ev_step = 0; best_ev_l0 = 0.0
     best_state_in_memory = None; best_state_pending = False
     best_ev_persist_margin = 0.005
@@ -1452,6 +1481,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     last_step = start_step - 1
     for step in range(start_step, n_steps + 1):
         last_step = step
+        if do_timing:
+            t_step_start = time.perf_counter()
         if scheduler.should_stop:
             print(f"  EARLY STOP @ step {step}: {scheduler.stop_reason}")
             if use_wandb:
@@ -1471,7 +1502,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # Get full batch and split into microbatches for accumulation. The double-buffer
         # wrapper returns the batch already on GPU; its transfer overlapped with the
         # previous step's compute on a separate CUDA stream.
+        if do_timing:
+            t_provider_start = time.perf_counter()
         full_batch = provider.next_batch()  # [BATCH_TOKENS, d_in] bf16, on device
+        if do_timing:
+            t_provider_elapsed = time.perf_counter() - t_provider_start
+            timing["t_provider"] += t_provider_elapsed
+            timing["_last_provider"] = t_provider_elapsed
+            timing["evt_fwd_bwd_start"] = _new_cuda_event()
+            if timing["evt_fwd_bwd_start"] is not None:
+                timing["evt_fwd_bwd_start"].record()
         activation_norm_step = full_batch.float().pow(2).mean().sqrt().item()
         microbatch_size = microbatch_tokens  # tokens per microbatch
 
@@ -1544,6 +1584,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 fired_accum |= (feat_acts.detach() > 0).any(dim=0)
 
+        if do_timing:
+            timing["evt_fwd_bwd_end"] = _new_cuda_event()
+            if timing["evt_fwd_bwd_end"] is not None:
+                timing["evt_fwd_bwd_end"].record()
+            timing["evt_opt_start"] = _new_cuda_event()
+            if timing["evt_opt_start"] is not None:
+                timing["evt_opt_start"].record()
+            t_opt_start = time.perf_counter()
+
         # Single optimizer step after accumulation
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
 
@@ -1567,6 +1616,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             enc_norms = sae.W_enc.weight.norm(dim=1, keepdim=True).clamp(min=1e-8)
             sae.W_enc.weight.div_(enc_norms)
 
+        if do_timing:
+            timing["evt_opt_end"] = _new_cuda_event()
+            if timing["evt_opt_end"] is not None:
+                timing["evt_opt_end"].record()
+
         # Use accumulated values for logging
         recon_loss = torch.tensor(accum_recon_loss / accum_steps, device=device)
         l0 = torch.tensor(accum_l0 / accum_steps, device=device)  # average L0 across microbatches
@@ -1588,17 +1642,26 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     state = optimizer.state.get(sae.log_threshold, {})
                     if "exp_avg" in state:
                         state["exp_avg"][very_dead] = 0.0; state["exp_avg_sq"][very_dead] = 0.0
-                    revival.steps_since_fired[very_dead] = 0
+                    revival.clear_silence(very_dead)
                     print(f"  [RESET @ {step}] theta->{INIT_THRESHOLD} for {n_reset} dead")
                 revival.record_reset(n_reset)
 
         if revival.should_buffer_err(step, K):
+            if do_timing:
+                t_errbuf_start = time.perf_counter()
             with torch.no_grad():
                 per_token_err = (full_batch.float() - sae.decode(sae.apply_jumprelu(sae.encode_pre(full_batch.to(device)))).detach().float()).pow(2).sum(dim=-1)
                 top_err_idx = per_token_err.topk(min(64, len(per_token_err))).indices
                 err_buffer.append(full_batch[top_err_idx].detach().cpu())
                 if sum(t.shape[0] for t in err_buffer) > ERR_BUFFER_SZ:
                     err_buffer = err_buffer[-ERR_BUFFER_SZ // 64:]
+            if do_timing:
+                t_errbuf_elapsed = time.perf_counter() - t_errbuf_start
+                timing["t_errbuf"] += t_errbuf_elapsed
+                timing["_last_errbuf"] = t_errbuf_elapsed
+        else:
+            if do_timing:
+                timing["_last_errbuf"] = 0.0
 
         if revival.is_resample_step(step, K):
             dead_mask = revival.resample_dead_mask(K)
@@ -1610,7 +1673,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     state = optimizer.state.get(sae.log_threshold, {})
                     if "exp_avg" in state:
                         state["exp_avg"][dead_mask] = 0.0; state["exp_avg_sq"][dead_mask] = 0.0
-                revival.steps_since_fired[dead_mask] = 0
+                revival.clear_silence(dead_mask)
             revival.record_resample(n_dead, n_res)
             print(f"  [RESAMPLE @ {step}] reinit {n_res}/{n_dead} dead")
             err_buffer = []
@@ -1618,6 +1681,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         recon_val = recon_loss.detach().item()
         grad_norm_val = grad_norm_t.item()
         l0_val = l0.detach().item()
+
+        if do_timing:
+            t_step_total = time.perf_counter() - t_step_start
+            timing["t_overhead"] += max(
+                0.0,
+                t_step_total - timing["_last_provider"] - timing["_last_errbuf"]
+            )
+            timing["n_steps"] += 1
 
         is_log_step = (step % LOG_EVERY == 0)
         if is_log_step:
@@ -1684,6 +1755,36 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             tokens_per_sec = log_window_tokens / max(now - log_window_start, 1e-6)
             log_window_start = now; log_window_tokens = 0
             revival.reset_fire_counts()
+
+            if do_timing:
+                import torch
+                # Synchronize CUDA events only on log steps
+                cuda_ms = {}
+                for key, (start, end) in (
+                    ("fwd_bwd", (timing["evt_fwd_bwd_start"], timing["evt_fwd_bwd_end"])),
+                    ("opt", (timing["evt_opt_start"], timing["evt_opt_end"])),
+                ):
+                    if start is not None and end is not None:
+                        start.synchronize()
+                        end.synchronize()
+                        cuda_ms[key] = start.elapsed_time(end)
+                    else:
+                        cuda_ms[key] = 0.0
+                # Average wall-time buckets over the last LOG_EVERY steps
+                n = max(1, timing["n_steps"])
+                t_provider_avg = timing["t_provider"] / n
+                t_errbuf_avg = timing["t_errbuf"] / n
+                t_overhead_avg = timing["t_overhead"] / n
+                print(f"  [TIMING @ {step}] per_step "
+                      f"provider={t_provider_avg*1000:.1f}ms "
+                      f"fwd_bwd_cuda={cuda_ms['fwd_bwd']:.1f}ms "
+                      f"opt_cuda={cuda_ms['opt']:.1f}ms "
+                      f"errbuf={t_errbuf_avg*1000:.1f}ms "
+                      f"overhead={t_overhead_avg*1000:.1f}ms "
+                      f"(n={n})")
+                # Reset accumulators for the next window
+                for k in ("t_provider", "t_errbuf", "t_overhead", "n_steps"):
+                    timing[k] = 0.0
 
             if ev > best_ev:
                 best_ev = ev; best_ev_step = step; best_ev_l0 = l0_val
@@ -1769,6 +1870,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            "scheduler/mode": scheduler.mode,
                            "scheduler/phase": scheduler.phase,
                            "scheduler/phase_idx": _PHASE_IDX.get(scheduler.phase, -1),
+                           "scheduler/effective_slingshot_gain": scheduler._effective_slingshot_gain(),
+                           "scheduler/activation_norm_preflight": scheduler._activation_norm_preflight,
+                           "timing/tokens_per_sec": tokens_per_sec,
+                           **({f"timing/{k}": v for k, v in {
+                               "provider_ms": t_provider_avg * 1000,
+                               "fwd_bwd_cuda_ms": cuda_ms["fwd_bwd"],
+                               "opt_cuda_ms": cuda_ms["opt"],
+                               "errbuf_ms": t_errbuf_avg * 1000,
+                               "overhead_ms": t_overhead_avg * 1000,
+                           }.items()} if do_timing else {}),
                            **{f"revival/{k}": v for k, v in revival.revival_metrics(K).items()}},
                           step=step)
 
