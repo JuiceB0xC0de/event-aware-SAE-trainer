@@ -85,3 +85,35 @@ def test_normalize_decoder_restores_unit_columns(tiny_sae):
     tiny_sae._normalize_decoder()
     col_norms = tiny_sae.W_dec.weight.norm(dim=0)
     assert torch.allclose(col_norms, torch.ones(8), atol=1e-5)
+
+
+def test_fused_jumprelu_matches_separate(tiny_sae):
+    """The fused JumpReLU+L0 path must be numerically identical (forward AND
+    both gradient paths) to applying apply_jumprelu + l0_indicator separately."""
+    sae = tiny_sae
+    # Spread inputs so some pre-activations land inside the STE band and some
+    # straddle the threshold -- exercises both the gate and the in-band mask.
+    torch.manual_seed(1)
+    x = torch.randn(32, sae.d_in) * 0.5
+
+    # Separate path.
+    sae.zero_grad(set_to_none=True)
+    pre_s = sae.encode_pre(x)
+    feat_s = sae.apply_jumprelu(pre_s)
+    gate_s = sae.l0_indicator(pre_s)
+    (feat_s.pow(2).sum() + 0.37 * gate_s.sum()).backward()
+    g_thr_s = sae.log_threshold.grad.clone()
+    g_wenc_s = sae.W_enc.weight.grad.clone()
+
+    # Fused path.
+    sae.zero_grad(set_to_none=True)
+    pre_f = sae.encode_pre(x)
+    feat_f, gate_f = sae.jumprelu_with_gate(pre_f)
+    (feat_f.pow(2).sum() + 0.37 * gate_f.sum()).backward()
+    g_thr_f = sae.log_threshold.grad.clone()
+    g_wenc_f = sae.W_enc.weight.grad.clone()
+
+    assert torch.allclose(feat_s, feat_f)
+    assert torch.allclose(gate_s, gate_f)
+    assert torch.allclose(g_thr_s, g_thr_f, atol=1e-6)
+    assert torch.allclose(g_wenc_s, g_wenc_f, atol=1e-6)

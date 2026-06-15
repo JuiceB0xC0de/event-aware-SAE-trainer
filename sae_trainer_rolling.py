@@ -325,6 +325,47 @@ def _ensure_sae_classes():
             grad_log_threshold = grad_threshold * threshold
             return grad_pre, grad_log_threshold, None
 
+    class _JumpReLUWithGate(torch.autograd.Function):
+        """Fused JumpReLU activation + L0 indicator.
+
+        Returns (feat_acts, gate) from a single pass: threshold.exp() and the
+        (pre > threshold) gate are computed once instead of once each in
+        _JumpReLU and _L0Indicator, and backward shares one in-band STE mask
+        across both threshold-gradient contributions. Mathematically identical
+        to applying _JumpReLU and _L0Indicator separately to the same
+        (pre, log_threshold) -- see test_fused_jumprelu_matches_separate.
+        """
+        @staticmethod
+        def forward(ctx, pre, log_threshold, bandwidth):
+            threshold = log_threshold.exp()
+            gate = (pre > threshold).to(pre.dtype)
+            ctx.save_for_backward(pre, threshold, gate)
+            ctx.bandwidth = bandwidth
+            return pre * gate, gate
+
+        @staticmethod
+        def backward(ctx, grad_feat, grad_gate):
+            pre, threshold, gate = ctx.saved_tensors
+            eps = ctx.bandwidth
+            # grad w.r.t. pre: only the feat path (the L0 gate is a step fn -> 0).
+            grad_pre = grad_feat * gate if grad_feat is not None else None
+            # grad w.r.t. log_threshold: both STE contributions share one mask.
+            #   feat path: where(in_band, pre * grad_feat)
+            #   gate path: where(in_band, grad_gate)
+            combined = None
+            if grad_feat is not None:
+                combined = pre * grad_feat
+            if grad_gate is not None:
+                combined = grad_gate if combined is None else combined + grad_gate
+            if combined is None:
+                return grad_pre, None, None
+            in_band = (pre - threshold).abs() < eps
+            sum_dims = tuple(range(pre.ndim - 1))
+            masked = torch.where(in_band, combined, 0.0)
+            grad_threshold = -(masked.sum(dim=sum_dims) / (2 * eps))
+            grad_log_threshold = grad_threshold * threshold
+            return grad_pre, grad_log_threshold, None
+
     class _L0Indicator(torch.autograd.Function):
         """Step function H(pre - theta) with STE for L0 sparsity loss."""
         @staticmethod
@@ -388,6 +429,10 @@ def _ensure_sae_classes():
 
         def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
             return _L0Indicator.apply(pre, self.log_threshold, self.ste_bandwidth)
+
+        def jumprelu_with_gate(self, pre: "torch.Tensor"):
+            """Fused activation + L0 gate: returns (feat_acts, gate) in one pass."""
+            return _JumpReLUWithGate.apply(pre, self.log_threshold, self.ste_bandwidth)
 
         def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
             return self.W_dec(acts) + self.b_dec
@@ -1541,7 +1586,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # bracket this loop (one for L0, one for the fired mask) are gone.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pre = sae.encode_pre(acts_mb)
-                feat_acts = sae.apply_jumprelu(pre)
+                # Fused JumpReLU + L0 gate: one (pre > threshold) pass instead of
+                # two (apply_jumprelu + l0_indicator over the full activation tensor).
+                feat_acts, gate = sae.jumprelu_with_gate(pre)
                 x_hat = sae.decode(feat_acts)
 
                 # Cast to fp32 only for loss computation (numerical stability)
@@ -1554,7 +1601,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 # ZERO gradient, nothing pushed the thresholds up, and L0 ran away to
                 # n_features (the all-features-active degeneracy). Augmented-Lagrangian
                 # hinge for the inequality constraint L0_avg <= target.
-                gate = sae.l0_indicator(pre)
                 # Optimization: accumulate sum in float32 directly to save an intermediate cast operation
                 l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
                 slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
