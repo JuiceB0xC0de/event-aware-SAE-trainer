@@ -1391,7 +1391,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # poison the graph. Custom autograd Functions cause graph breaks around
     # the JumpReLU, but the matmuls still get fused/optimized. If compile
     # fails or slows things, disable with SAE_COMPILE=0.
-    use_compile = os.environ.get("SAE_COMPILE", "1").lower() in ("1", "true", "yes", "on")
+    use_compile = os.environ.get("SAE_COMPILE", "0").lower() in ("1", "true", "yes", "on")
     if use_compile and device.type == "cuda":
         try:
             import torch
