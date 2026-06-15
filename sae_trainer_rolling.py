@@ -503,10 +503,13 @@ def _ensure_sae_classes():
             # combined gradient (pre * grad_feat + grad_gate) when both paths are
             # used, which is exactly what the STE needs.
             feat_acts = pre * gate
-            self._saved_pre = pre.detach()
-            feat_acts.register_hook(self._feat_hook_save_grad)
-            if need_gate:
-                gate.register_hook(self._gate_hook_save_grad)
+            # Hooks are only needed during training forward (with gradients). In
+            # torch.no_grad() contexts like preflight probes, skip them.
+            if torch.is_grad_enabled():
+                self._saved_pre = pre.detach()
+                feat_acts.register_hook(self._feat_hook_save_grad)
+                if need_gate:
+                    gate.register_hook(self._gate_hook_save_grad)
             return (feat_acts, gate) if need_gate else feat_acts
 
         def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
