@@ -857,7 +857,8 @@ def _find_resume_layer(seed: int, pool_batches: int, model_id: str, capture: str
 #  Token pool capture  (run once -- the same tokens flow through every layer)
 # ===========================================================================
 
-def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path, bos_token_id):
+def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path, bos_token_id,
+                        model_id=None, vocab_size=None):
     """Materialize T batches of BOS-prepended [n_seqs, SEQ_LEN] token shards so
     every layer trains on identical tokens (residual pool[L]=block L output == input
     to block L+1 requires this).
@@ -865,12 +866,43 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
     Iterates the IterableDataset DIRECTLY in the main process -- no DataLoader worker
     procs. A persistent-worker spawn DataLoader crashes the interpreter on teardown
     (PyGILState_Release during finalization). With use_pretok the dataset is memmap
-    reads (instant); live streaming is single-threaded but this is a one-time capture."""
+    reads (instant); live streaming is single-threaded but this is a one-time capture.
+
+    Token shards are validated against `vocab_size`; stale caches (e.g. from a
+    previous model) are discarded and regenerated.  Pre-tokenized shards are only
+    used when their manifest vocab size matches the target model; otherwise we fall
+    back to streaming tokenization.
+    """
     import torch
 
-    if _shard_paths(tok_dir) and len(_shard_paths(tok_dir)) >= pool_batches:
-        print(f"  [tokens] reusing {len(_shard_paths(tok_dir))} cached token shards")
-        return
+    paths = _shard_paths(tok_dir)
+    if paths and len(paths) >= pool_batches:
+        if vocab_size is None:
+            print(f"  [tokens] reusing {len(paths)} cached token shards")
+            return
+        sample = _read_shard(tok_dir, 0)
+        if sample.min() >= 0 and sample.max() < vocab_size:
+            print(f"  [tokens] reusing {len(paths)} cached token shards")
+            return
+        print(f"  [tokens] cached shards invalid for {model_id} "
+              f"(ids not in [0,{vocab_size})); regenerating")
+        _rm_pool(tok_dir)
+
+    # Pre-tokenized shards are model-specific.  If their vocab doesn't match, fall
+    # back to on-the-fly tokenization with the correct tokenizer.
+    if use_pretok and vocab_size is not None:
+        try:
+            import json
+            from pathlib import Path as _Path
+            with open(_Path(PRETOK_DIR) / "manifest.json") as f:
+                manifest = json.load(f)
+            pretok_vocab = manifest.get("vocab_size")
+            if pretok_vocab is not None and pretok_vocab != vocab_size:
+                print(f"  [tokens] pretok vocab_size {pretok_vocab} != model {vocab_size}; "
+                      f"falling back to streaming")
+                use_pretok = False
+        except Exception:
+            pass
 
     dataset = _build_token_dataset(
         hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=use_pretok)
@@ -2307,8 +2339,12 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             f"Lower --pool-batches or set $SAE_SCRATCH_DIR to a bigger disk.")
 
     # -- token pool (once -- same tokens flow through every layer) ------------
-    tok_dir = _pool_dir(f"tokens_s{seed}")
-    _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir, bos_token_id)
+    # Token ids are model-specific; cache them under the model slug so switching
+    # models doesn't reuse a stale pool.
+    vocab_size = tokenizer.vocab_size or getattr(tcfg, "vocab_size", None)
+    tok_dir = _pool_dir(f"tokens_{_slug(MODEL_ID)}_s{seed}")
+    _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir, bos_token_id,
+                        model_id=MODEL_ID, vocab_size=vocab_size)
 
     marker_path = Path(SAE_DIR) / f"atlas_marker_s{seed}.json"
     marker_path.parent.mkdir(parents=True, exist_ok=True)
