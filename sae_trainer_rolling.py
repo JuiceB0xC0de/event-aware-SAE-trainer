@@ -1685,9 +1685,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             if timing["evt_opt_end"] is not None:
                 timing["evt_opt_end"].record()
 
-        # Use accumulated values for logging
-        recon_loss = torch.tensor(accum_recon_loss / accum_steps, device=device)
-        l0 = torch.tensor(accum_l0 / accum_steps, device=device)  # average L0 across microbatches
+        # accum_recon_loss / accum_l0 are already Python floats (summed from the
+        # microbatch .item() calls); use them directly instead of bouncing through
+        # a GPU tensor and back, which forced two extra device syncs per step.
 
         # Dead/fired bookkeeping reuses the fired mask gathered during the forward
         # passes above -- no extra encode of the full batch.
@@ -1746,9 +1746,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             print(f"  [RESAMPLE @ {step}] reinit {n_res}/{n_dead} dead")
             err_buffer = []
 
-        recon_val = recon_loss.detach().item()
+        recon_val = accum_recon_loss / accum_steps
         grad_norm_val = grad_norm_t.item()
-        l0_val = l0.detach().item()
+        l0_val = accum_l0 / accum_steps
 
         if do_timing:
             t_step_total = time.perf_counter() - t_step_start
