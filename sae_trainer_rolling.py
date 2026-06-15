@@ -119,6 +119,9 @@ DEFAULT_SEED   = 0
 # Numeric encoding of scheduler phase for W&B plotting (string is logged too).
 _PHASE_IDX = {"DESCENT": 0, "PIN": 1, "FINETUNE": 2}
 
+# Triton fused kernel flag - set via env var SAE_USE_TRITON=1
+USE_TRITON = os.environ.get("SAE_USE_TRITON", "0").lower() in ("1", "true", "yes", "on")
+
 
 def _aggressive_k_aux_k(target_l0: int) -> int:
     """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
@@ -1754,6 +1757,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         if do_timing:
             t_fwd_bwd_wall_start = time.perf_counter()
+        # Triton fused forward - optional drop-in replacement
+        use_triton_fwd = USE_TRITON and device.type == "cuda"
+        if use_triton_fwd:
+            try:
+                from triton_sae_kernel import fused_sae_forward
+                print(f"  [TRITON] Using fused SAE kernel")
+            except ImportError:
+                use_triton_fwd = False
+                print(f"  [TRITON] Kernel not available, falling back to PyTorch")
+
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
             end_idx = start_idx + microbatch_size
@@ -1764,44 +1777,59 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # from THIS forward -- the two extra full-batch encode passes that used to
             # bracket this loop (one for L0, one for the fired mask) are gone.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pre = sae.encode_pre(acts_mb)
-                # Fused JumpReLU + L0 gate: one (pre > threshold) pass instead of
-                # two (apply_jumprelu + l0_indicator over the full activation tensor).
-                feat_acts, gate = sae.jumprelu_with_gate(pre)
-                x_hat = sae.decode(feat_acts)
-
-                # Cast to fp32 only for loss computation (numerical stability)
-                residual_float = acts_mb.float() - x_hat.float()
-                recon_loss = residual_float.pow(2).mean() / accum_steps
-
-                # Sparsity penalty -- IN-GRAPH so the L0 straight-through estimator
-                # actually trains the JumpReLU thresholds. This used to be computed
-                # under torch.no_grad() and added as a detached constant: lambda exerted
-                # ZERO gradient, nothing pushed the thresholds up, and L0 ran away to
-                # n_features (the all-features-active degeneracy). Augmented-Lagrangian
-                # hinge for the inequality constraint L0_avg <= target.
-                # Optimization: accumulate sum in float32 directly to save an intermediate cast operation
-                l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
-                slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
-                sparsity_loss = (
-                    scheduler.lambda_l0 * slack
-                    + 0.5 * sae_cfg.al_mu * slack * slack
-                ) / accum_steps
-
-                # Aux loss for dead features (scaled by accum_steps)
-                if n_dead > 0:
-                    pre_dead = pre[:, dead_indices].relu()
-                    topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
-                    aux_acts = torch.zeros_like(pre_dead)
-                    aux_acts.scatter_(-1, topk_idx, topk_vals)
-                    W_dec_dead = sae.W_dec.weight.t()[dead_indices]
-                    x_aux = aux_acts @ W_dec_dead
-                    residual_target = residual_float.detach()
-                    aux_loss = ((residual_target - x_aux.float()).pow(2).mean() * AUX_COEFF) / accum_steps
-                else:
+                if use_triton_fwd:
+                    # Triton fused forward - returns x_hat and per-token L0
+                    x_hat, l0_per_token = fused_sae_forward(acts_mb, sae)
+                    l0_mb = l0_per_token.mean()
+                    # Compute recon loss
+                    residual_float = acts_mb.float() - x_hat.float()
+                    recon_loss = residual_float.pow(2).mean() / accum_steps
+                    # Sparsity penalty
+                    slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
+                    sparsity_loss = (
+                        scheduler.lambda_l0 * slack
+                        + 0.5 * sae_cfg.al_mu * slack * slack
+                    ) / accum_steps
+                    # No aux loss in Triton path yet (simplified)
                     aux_loss = torch.zeros((), device=acts_mb.device, dtype=torch.float32)
+                    loss = recon_loss + sparsity_loss + aux_loss
+                    # For fired_accum, we need to recompute gate (Triton doesn't return it)
+                    with torch.no_grad():
+                        pre = sae.encode_pre(acts_mb)
+                        fired_accum |= (sae.l0_indicator(pre) > 0).any(dim=0)
+                else:
+                    # Standard PyTorch forward
+                    pre = sae.encode_pre(acts_mb)
+                    feat_acts, gate = sae.jumprelu_with_gate(pre)
+                    x_hat = sae.decode(feat_acts)
 
-                loss = recon_loss + sparsity_loss + aux_loss
+                    # Cast to fp32 only for loss computation (numerical stability)
+                    residual_float = acts_mb.float() - x_hat.float()
+                    recon_loss = residual_float.pow(2).mean() / accum_steps
+
+                    # Sparsity penalty -- IN-GRAPH so the L0 straight-through estimator
+                    # actually trains the JumpReLU thresholds.
+                    l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
+                    slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
+                    sparsity_loss = (
+                        scheduler.lambda_l0 * slack
+                        + 0.5 * sae_cfg.al_mu * slack * slack
+                    ) / accum_steps
+
+                    # Aux loss for dead features (scaled by accum_steps)
+                    if n_dead > 0:
+                        pre_dead = pre[:, dead_indices].relu()
+                        topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
+                        aux_acts = torch.zeros_like(pre_dead)
+                        aux_acts.scatter_(-1, topk_idx, topk_vals)
+                        W_dec_dead = sae.W_dec.weight.t()[dead_indices]
+                        x_aux = aux_acts @ W_dec_dead
+                        residual_target = residual_float.detach()
+                        aux_loss = ((residual_target - x_aux.float()).pow(2).mean() * AUX_COEFF) / accum_steps
+                    else:
+                        aux_loss = torch.zeros((), device=acts_mb.device, dtype=torch.float32)
+
+                    loss = recon_loss + sparsity_loss + aux_loss
 
             loss.backward()
 

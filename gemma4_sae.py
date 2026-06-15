@@ -32,8 +32,14 @@ image = (
         "hf_transfer",
         "wandb",
         "bitsandbytes",
-        "colorama",  # cache-bust + harmless  # rebuild this layer every deploy; remove when stable
+        "triton>=2.0.0",  # For fused SAE kernels
+        "colorama",
     )
+    .env({
+        "TRITON_CACHE_DIR": "/tmp/triton-cache",  # Avoid permission issues
+        "SAE_USE_TRITON": "1",  # Enable Triton fused kernel experiment
+    })
+    .env({
     # Bake the local trainer modules into the image so the container
     # always sees the working tree (Modal 1.4 dropped cls-level mounts).
     .add_local_file(

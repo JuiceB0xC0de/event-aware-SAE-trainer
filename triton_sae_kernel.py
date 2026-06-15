@@ -1,6 +1,6 @@
 """
-Triton fused SAE kernel - fuses encode + JumpReLU + decode + loss into one kernel.
-Avoids intermediate VRAM writes, reduces memory bandwidth bottlenecks.
+Triton fused SAE kernel - fuses encode + JumpReLU + decode + loss.
+Reduces memory bandwidth by avoiding intermediate VRAM writes.
 """
 import torch
 import triton
@@ -8,137 +8,126 @@ import triton.language as tl
 
 
 @triton.jit
-def fused_sae_step_kernel(
-    # Pointers to inputs
-    X_ptr,           # Input activations [n_tokens, d_in]
-    W_enc_ptr,       # Encoder weights [d_in, n_features]
-    W_dec_ptr,       # Decoder weights [n_features, d_in]
-    B_enc_ptr,       # Encoder bias [n_features]
-    B_dec_ptr,       # Decoder bias [d_in]
-    Threshold_ptr,   # JumpReLU thresholds [n_features]
-    # Output pointers
-    Loss_ptr,        # Per-token loss [n_tokens]
-    L0_ptr,          # Per-token L0 [n_tokens]
+def fused_sae_encode_decode_kernel(
+    # Inputs
+    X_ptr,           # [n_tokens, d_in]
+    W_enc_ptr,       # [d_in, n_features]
+    W_dec_ptr,       # [n_features, d_in]
+    B_enc_ptr,       # [n_features]
+    B_dec_ptr,       # [d_in]
+    Threshold_ptr,   # [n_features]
+    # Outputs
+    Out_ptr,         # [n_tokens, d_in] - reconstructed
+    Gate_sum_ptr,    # [n_tokens] - L0 per token
+    # Strides
+    stride_x_d: tl.constexpr,
+    stride_wenc_d: tl.constexpr,
+    stride_wdec_f: tl.constexpr,
+    stride_out_d: tl.constexpr,
     # Dimensions
     n_tokens: tl.constexpr,
     d_in: tl.constexpr,
     n_features: tl.constexpr,
     # Block sizes
-    BLOCK_D_IN: tl.constexpr,
-    BLOCK_FEATURES: tl.constexpr,
-    # Hyperparameters
-    target_l0,
-    lambda_l0,
-    al_mu,
+    BLOCK_D: tl.constexpr,
+    BLOCK_F: tl.constexpr,
 ):
-    """Fused SAE forward + loss computation.
+    """Fused SAE forward: encode → JumpReLU → decode.
 
-    Each program handles one token, computing:
-    1. pre = X @ W_enc + B_enc
-    2. gate = pre > threshold.exp()
-    3. acts = pre * gate
-    4. x_hat = acts @ W_dec + B_dec
-    5. loss = ||X - x_hat||^2 + lambda * max(0, sum(gate) - target)^2
+    Each program handles BLOCK_D elements of one token's output.
     """
-    # Program ID = token index
+    # Token index and output dimension index
     token_idx = tl.program_id(0)
+    d_start = tl.program_id(1) * BLOCK_D
 
-    # Load input token [1, d_in]
-    d_in_range = tl.arange(0, BLOCK_D_IN)
-    mask_d_in = d_in_range < d_in
-    x = tl.load(X_ptr + token_idx * d_in + d_in_range, mask=mask_d_in, other=0.0)
+    d_range = d_start + tl.arange(0, BLOCK_D)
+    mask_d = d_range < d_in
+
+    # Load input token
+    x = tl.load(X_ptr + token_idx * stride_x_d + d_range, mask=mask_d, other=0.0)
 
     # === ENCODE: pre = X @ W_enc + B_enc ===
-    # For each feature block, compute dot product
-    pre_acc = tl.zeros([BLOCK_FEATURES], dtype=tl.float32)
-    for d_block in range(0, d_in, BLOCK_D_IN):
-        d_offset = d_block + d_in_range
-        mask = (d_offset < d_in) & mask_d_in
-        x_block = tl.load(X_ptr + token_idx * d_in + d_offset, mask=mask, other=0.0)
-        w_enc_block = tl.load(W_enc_ptr + d_offset * n_features + tl.arange(0, BLOCK_FEATURES),
-                               mask=mask[:, None] & (tl.arange(0, BLOCK_FEATURES) < n_features),
-                               other=0.0)
-        pre_acc += tl.dot(x_block[None, :], w_enc_block[:, None])
+    # Accumulate over d_in dimension, output is [n_features]
+    pre = tl.zeros([BLOCK_F], dtype=tl.float32)
+    for d_block in range(0, d_in, BLOCK_D):
+        d_off = d_block + tl.arange(0, BLOCK_D)
+        mask_d_block = (d_off < d_in)
+        x_block = tl.load(X_ptr + token_idx * stride_x_d + d_off,
+                          mask=mask_d_block, other=0.0)
+        # Load W_enc slice [BLOCK_D, BLOCK_F]
+        w_enc = tl.load(W_enc_ptr + d_off * stride_wenc_d + tl.arange(0, BLOCK_F),
+                        mask=mask_d_block[:, None] & (tl.arange(0, BLOCK_F) < n_features),
+                        other=0.0)
+        pre += tl.dot(x_block[None, :], w_enc)
 
-    b_enc = tl.load(B_enc_ptr + tl.arange(0, BLOCK_FEATURES),
-                    mask=tl.arange(0, BLOCK_FEATURES) < n_features, other=0.0)
-    pre = pre_acc + b_enc
+    b_enc = tl.load(B_enc_ptr + tl.arange(0, BLOCK_F),
+                    mask=tl.arange(0, BLOCK_F) < n_features, other=0.0)
+    pre += b_enc
 
-    # === JumpReLU: gate = pre > threshold ===
-    threshold = tl.load(Threshold_ptr + tl.arange(0, BLOCK_FEATURES),
-                        mask=tl.arange(0, BLOCK_FEATURES) < n_features, other=0.0).exp()
-    gate = tl.where(pre > threshold, 1.0, 0.0)
-    acts = pre * gate
+    # === JumpReLU ===
+    threshold = tl.load(Threshold_ptr + tl.arange(0, BLOCK_F),
+                        mask=tl.arange(0, BLOCK_F) < n_features, other=1.0).exp()
+    gate = tl.where(pre > threshold, pre, 0.0)  # ReLU-style, zero if below threshold
 
-    # L0 count for this token
-    l0 = tl.sum(gate)
+    # Count active features (L0)
+    l0 = tl.sum(gate > 0)
 
-    # === DECODE: x_hat = acts @ W_dec + B_dec ===
-    x_hat = tl.zeros([BLOCK_D_IN], dtype=tl.float32)
-    for f_block in range(0, n_features, BLOCK_FEATURES):
-        f_offset = f_block + tl.arange(0, BLOCK_FEATURES)
-        mask_f = f_offset < n_features
-        acts_block = tl.load(acts + f_offset, mask=mask_f, other=0.0)
-        w_dec_block = tl.load(W_dec_ptr + f_offset * d_in + d_in_range,
-                               mask=mask_f[:, None] & mask_d_in[None, :], other=0.0)
-        x_hat += tl.dot(acts_block[None, :], w_dec_block[:, None])
+    # === DECODE: out = gate @ W_dec + B_dec ===
+    out = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for f_block in range(0, n_features, BLOCK_F):
+        f_off = f_block + tl.arange(0, BLOCK_F)
+        mask_f = f_off < n_features
+        gate_block = tl.load(gate + f_off, mask=mask_f, other=0.0)
+        w_dec = tl.load(W_dec_ptr + f_off * stride_wdec_f + d_range,
+                        mask=mask_f[:, None] & mask_d[None, :], other=0.0)
+        out += tl.dot(gate_block[None, :], w_dec)
 
-    b_dec = tl.load(B_dec_ptr + d_in_range, mask=mask_d_in, other=0.0)
-    x_hat += b_dec
+    b_dec = tl.load(B_dec_ptr + d_range, mask=mask_d, other=0.0)
+    out += b_dec
 
-    # === LOSS: recon + sparsity ===
-    residual = x - x_hat
-    recon_loss = tl.sum(residual * residual)
+    # Write output
+    tl.store(Out_ptr + token_idx * stride_out_d + d_range, out, mask=mask_d)
 
-    # Sparsity penalty (hinge)
-    slack = tl.maximum(0.0, l0 - target_l0)
-    sparsity_loss = lambda_l0 * slack + 0.5 * al_mu * slack * slack
-
-    total_loss = recon_loss + sparsity_loss
-
-    # Write outputs
-    tl.store(Loss_ptr + token_idx, total_loss)
-    tl.store(L0_ptr + token_idx, l0)
+    # Write L0 (only first program per token does this)
+    if d_start == 0:
+        tl.store(Gate_sum_ptr + token_idx, l0)
 
 
-def fused_sae_step(x, sae, target_l0, lambda_l0, al_mu):
-    """Launch fused SAE kernel.
+def fused_sae_forward(x, sae):
+    """Fused SAE forward pass.
 
     Args:
-        x: Input activations [n_tokens, d_in]
+        x: [n_tokens, d_in] input activations
         sae: JumpReLUSAE module
-        target_l0: Target sparsity
-        lambda_l0: Current lambda
-        al_mu: AL mu parameter
 
     Returns:
-        loss: Total loss (scalar)
-        l0: Mean L0 (scalar)
+        x_hat: [n_tokens, d_in] reconstructed
+        l0: [n_tokens] L0 per token
     """
     n_tokens, d_in = x.shape
     n_features = sae.n_features
 
-    # Allocate output buffers
-    loss_buf = torch.empty(n_tokens, dtype=torch.float32, device=x.device)
+    # Block sizes - tune these
+    BLOCK_D = 64
+    BLOCK_F = 128
+
+    # Output buffers
+    x_hat = torch.empty_like(x)
     l0_buf = torch.empty(n_tokens, dtype=torch.float32, device=x.device)
 
-    # Block size tuning - fit in shared memory
-    BLOCK_D_IN = triton.next_power_of_2(d_in)
-    BLOCK_FEATURES = triton.next_power_of_2(n_features)
+    # Launch grid: (n_tokens, ceil(d_in / BLOCK_D))
+    grid = (n_tokens, triton.cdiv(d_in, BLOCK_D))
 
-    # Cap block sizes to avoid register pressure
-    BLOCK_D_IN = min(BLOCK_D_IN, 256)
-    BLOCK_FEATURES = min(BLOCK_FEATURES, 256)
-
-    # Launch kernel - one program per token
-    grid = (n_tokens,)
-    fused_sae_step_kernel[grid](
+    fused_sae_encode_decode_kernel[grid](
         x, sae.W_enc.weight, sae.W_dec.weight,
         sae.W_enc.bias, sae.b_dec, sae.log_threshold,
-        loss_buf, l0_buf,
+        x_hat, l0_buf,
+        stride_x_d=x.stride(0),
+        stride_wenc_d=sae.W_enc.weight.stride(0),
+        stride_wdec_f=sae.W_dec.weight.stride(0),
+        stride_out_d=x_hat.stride(0),
         n_tokens=n_tokens, d_in=d_in, n_features=n_features,
-        BLOCK_D_IN=BLOCK_D_IN, BLOCK_FEATURES=BLOCK_FEATURES,
-        target_l0=target_l0, lambda_l0=lambda_l0, al_mu=al_mu,
+        BLOCK_D=BLOCK_D, BLOCK_F=BLOCK_F,
     )
 
-    return loss_buf.mean(), l0_buf.mean()
+    return x_hat, l0_buf
