@@ -1439,9 +1439,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     if use_compile and device.type == "cuda":
         try:
             import torch
+            # default mode: balanced compile time vs runtime speed
             # fullgraph=False allows graph breaks at the custom autograd Function.
-            sae = torch.compile(sae, mode="reduce-overhead", fullgraph=False, dynamic=False)
-            print(f"  torch.compile enabled on SAE (reduce-overhead, fullgraph=False)")
+            sae = torch.compile(sae, mode="default", fullgraph=False, dynamic=False)
+            print(f"  torch.compile enabled on SAE (default, fullgraph=False)")
         except Exception as e:
             print(f"  WARNING: torch.compile failed ({e}), falling back to eager SAE")
     else:
@@ -2507,6 +2508,12 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
         if capture == "auto":                             # independent capture -> free now
             _rm_pool(dst_dir)
+
+        # Force GPU memory cleanup between layers to prevent OOM
+        import gc
+        if device.type == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
 
         import json
         with open(marker_path, "w") as f:

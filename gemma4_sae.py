@@ -32,8 +32,7 @@ image = (
         "hf_transfer",
         "wandb",
         "bitsandbytes",
-        "colorama",  # cache-bust + harmless
-        force_build=True,  # rebuild this layer every deploy; remove when stable
+        "colorama",  # cache-bust + harmless  # rebuild this layer every deploy; remove when stable
     )
     # Bake the local trainer modules into the image so the container
     # always sees the working tree (Modal 1.4 dropped cls-level mounts).
@@ -119,6 +118,7 @@ class SAETainer:
             print(f"Cached to volume at: {volume_model_path}")
 
         self.model_path = volume_model_path
+        self._model_id = model_id  # Keep original HF model_id for trainer
 
     @modal.method()
     def train(self, layer_range: str, capture: str, expansion: int = 32,
@@ -192,7 +192,7 @@ class SAETainer:
             resume_from=resume_from,
             push=False,  # don't push to HF, save locally
             capture=capture,
-            model_id=self.model_path,
+            model_id=self._model_id,  # Use original HF model_id (not /data/models/... path)
             hub_id=None,
             wandb_project=os.environ.get("WANDB_PROJECT"),
             expansion=expansion,
@@ -220,20 +220,26 @@ PRETOK_OUT = "/data/pretok/fineweb-edu"
     timeout=86400,
 )
 def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
-                      model_path: str = "/data/models/gemma-4-e4b") -> int:
+                      model_id: str, model_path: str, hf_token: str) -> int:
     """Stream a disjoint slice of FineWeb-Edu, tokenize it with the target model's
     tokenizer, and write one 1-D int32 token shard to
     /data/pretok/<model_slug>/shard_NN.npy.  Parallelized across containers via
     .starmap (one container per shard). Idempotent: skips a shard that already
     has >= tokens_per_shard tokens."""
     import os
-    import json
     import numpy as np
     from pathlib import Path
     from datasets import load_dataset
     from transformers import AutoTokenizer
+    from huggingface_hub import snapshot_download
 
-    model_slug = Path(model_path).name
+    # Import _slug from trainer to ensure path matches exactly
+    # The trainer slugs the full MODEL_ID path, not just the model name
+    import sys
+    sys.path.insert(0, "/opt/sae-trainer")
+    from sae_trainer_rolling import _slug
+    # Match trainer's behavior: slug the full model path
+    model_slug = _slug(f"data_models_{model_id.replace('/', '_')}")
     out_dir = f"/data/pretok/{model_slug}"
     os.makedirs(out_dir, exist_ok=True)
     shard_path = f"{out_dir}/shard_{shard_idx:02d}.npy"
@@ -242,6 +248,12 @@ def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
         if existing.shape[0] >= tokens_per_shard:
             print(f"  [pretok {shard_idx:02d}] exists ({existing.shape[0]} tok) -- skip")
             return shard_idx
+
+    # Download model to volume path if not cached
+    if not os.path.exists(model_path) or not os.listdir(model_path):
+        print(f"  [pretok {shard_idx:02d}] downloading model to {model_path}...")
+        os.makedirs(model_path, exist_ok=True)
+        snapshot_download(model_id, local_dir=model_path, token=hf_token)
 
     tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
@@ -297,23 +309,23 @@ def pretokenize(
     16 shards x 12M tok = ~192M tokens (~770MB int32). Containers run in parallel,
     so wall time is ~one shard's tokenize pass, not the sum."""
     from transformers import AutoTokenizer
-    from pathlib import Path
+    from huggingface_hub import snapshot_download
     import os
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     model_slug = model_id.replace("/", "_")
     volume_model_path = f"/data/models/{model_slug}"
 
-    if not os.path.exists(volume_model_path) or not os.listdir(volume_model_path):
-        print(f"Model not cached at {volume_model_path}; downloading ...")
-        from huggingface_hub import snapshot_download
-        os.makedirs(volume_model_path, exist_ok=True)
-        snapshot_download(model_id, local_dir=volume_model_path, token=hf_token)
+    # Download model locally first (to ~/.cache/huggingface), then remote will cache on volume
+    print(f"Downloading {model_id} to local cache...")
+    snapshot_download(model_id, token=hf_token)
 
-    tok = AutoTokenizer.from_pretrained(volume_model_path, local_files_only=True)
+    # Get vocab size locally
+    tok = AutoTokenizer.from_pretrained(model_id, token=hf_token)
     vocab_size = tok.vocab_size
 
-    args = [(i, n_shards, tokens_per_shard, volume_model_path) for i in range(n_shards)]
+    # Remote function handles volume download + pretok
+    args = [(i, n_shards, tokens_per_shard, model_id, volume_model_path, hf_token) for i in range(n_shards)]
     done = list(pretokenize_shard.starmap(args))
     _write_pretok_manifest.remote(n_shards, model_slug, vocab_size)
     print(f"\nPretokenize complete: {len(done)} shards x {tokens_per_shard/1e6:.0f}M tok "
