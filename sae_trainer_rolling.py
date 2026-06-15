@@ -1469,6 +1469,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             "t_provider": 0.0,      # wall-time accumulator (last LOG_EVERY steps)
             "t_errbuf": 0.0,
             "t_overhead": 0.0,
+            "t_fwd_bwd_wall": 0.0,  # CPU wall of the accum loop (fwd+bwd+.item waits)
+            "t_cpu_post": 0.0,      # CPU wall of scheduler.step + nudge + bandwidth
             "n_steps": 0,
             "_last_provider": 0.0,
             "_last_errbuf": 0.0,
@@ -1595,6 +1597,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         buffer_err_this_step = revival.should_buffer_err(step, K)
         err_candidates = [] if buffer_err_this_step else None
 
+        if do_timing:
+            t_fwd_bwd_wall_start = time.perf_counter()
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
             end_idx = start_idx + microbatch_size
@@ -1669,6 +1673,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         ))
 
         if do_timing:
+            timing["t_fwd_bwd_wall"] += time.perf_counter() - t_fwd_bwd_wall_start
             timing["evt_fwd_bwd_end"] = _new_cuda_event()
             if timing["evt_fwd_bwd_end"] is not None:
                 timing["evt_fwd_bwd_end"].record()
@@ -1802,6 +1807,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         else:
             dead = None; ev = None
 
+        if do_timing:
+            t_cpu_post_start = time.perf_counter()
         scheduler.step({"loss": recon_val, "grad_norm": grad_norm_val,
                         "l0": l0_val, "ev": ev, "dead_pct": dead,
                         "activation_norm": activation_norm_step})
@@ -1849,6 +1856,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                       f"(L0={l0_val:.1f}, target={sae_cfg.target_l0:.0f}, "
                       f"overshoot={l0_val/max(sae_cfg.target_l0,1):.2f}x)")
 
+        if do_timing:
+            timing["t_cpu_post"] += time.perf_counter() - t_cpu_post_start
+
         if is_log_step:
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
@@ -1879,16 +1889,25 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 t_provider_avg = timing["t_provider"] / n
                 t_errbuf_avg = timing["t_errbuf"] / n
                 t_overhead_avg = timing["t_overhead"] / n
+                t_fwd_bwd_wall_avg = timing["t_fwd_bwd_wall"] / n
+                t_cpu_post_avg = timing["t_cpu_post"] / n
+                # fwd_bwd_wall - fwd_bwd_cuda = CPU stall/launch overhead in the loop
+                # (CPU blocked on .item() / feeding kernels while GPU could be idle).
+                fwd_bwd_stall = max(0.0, t_fwd_bwd_wall_avg * 1000 - cuda_ms["fwd_bwd"])
                 print(f"  [TIMING @ {step}] per_step "
                       f"provider={t_provider_avg*1000:.1f}ms "
                       f"fwd_bwd_cuda={cuda_ms['fwd_bwd']:.1f}ms "
+                      f"fwd_bwd_wall={t_fwd_bwd_wall_avg*1000:.1f}ms "
+                      f"fwd_bwd_stall={fwd_bwd_stall:.1f}ms "
                       f"opt_cuda={cuda_ms['opt']:.1f}ms "
                       f"norm_cuda={cuda_ms['norm']:.1f}ms "
+                      f"cpu_post={t_cpu_post_avg*1000:.1f}ms "
                       f"errbuf={t_errbuf_avg*1000:.1f}ms "
                       f"overhead={t_overhead_avg*1000:.1f}ms "
                       f"(n={n})")
                 # Reset accumulators for the next window
-                for k in ("t_provider", "t_errbuf", "t_overhead", "n_steps"):
+                for k in ("t_provider", "t_errbuf", "t_overhead",
+                          "t_fwd_bwd_wall", "t_cpu_post", "n_steps"):
                     timing[k] = 0.0
 
             if ev > best_ev:
@@ -1981,8 +2000,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            **({f"timing/{k}": v for k, v in {
                                "provider_ms": t_provider_avg * 1000,
                                "fwd_bwd_cuda_ms": cuda_ms["fwd_bwd"],
+                               "fwd_bwd_wall_ms": t_fwd_bwd_wall_avg * 1000,
+                               "fwd_bwd_stall_ms": fwd_bwd_stall,
                                "opt_cuda_ms": cuda_ms["opt"],
                                "norm_cuda_ms": cuda_ms["norm"],
+                               "cpu_post_ms": t_cpu_post_avg * 1000,
                                "errbuf_ms": t_errbuf_avg * 1000,
                                "overhead_ms": t_overhead_avg * 1000,
                            }.items()} if do_timing else {}),
