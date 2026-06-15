@@ -287,3 +287,69 @@ def test_early_stop_requires_sparse_side_crossing():
     for l0 in [475.0, 475.0, 475.0]:
         crossed.step({**_sig(l0=l0), "ev": 0.99})
     assert crossed.should_stop is True
+
+
+# -- Phase observability (Branch 1) -------------------------------------------
+
+def test_scheduler_starts_in_descent():
+    sched = _make_scheduler()
+    assert sched.phase == "DESCENT"
+    assert sched.phase_step == 0
+    assert sched.pin_entry_step is None
+    assert sched.summary()["phase"] == "DESCENT"
+
+
+def test_descent_enters_pin_when_l0_in_band():
+    sched = _make_scheduler(target_l0=500.0, pin_l0_band_abs=0.5)
+    assert sched.phase == "DESCENT"
+    # Outside the band -> stays in DESCENT.
+    sched._maybe_update_phase(l0=600.0, ev=0.90)
+    assert sched.phase == "DESCENT"
+    # Inside the band -> transitions to PIN and captures entry state.
+    sched.lambda_l0 = 1e-3
+    sched._maybe_update_phase(l0=500.2, ev=0.90)
+    assert sched.phase == "PIN"
+    assert sched.phase_step == 0
+    assert sched.pin_entry_step == sched.total_steps
+    assert sched.pinned_lambda == 1e-3
+
+
+def test_old_checkpoint_without_phase_fields_restores_safely(tiny_sae, tmp_path):
+    """A checkpoint saved before the phase machine existed (no phase keys in
+    scheduler_state) must restore with safe defaults, not raise."""
+    import torch
+    import sae_trainer_rolling as t
+
+    sae = tiny_sae
+    opt = torch.optim.Adam(sae.parameters(), lr=1e-3)
+    sched = _make_scheduler()
+    # Dirty the phase state so we can prove the restore overwrites it.
+    sched.phase = "PIN"
+    sched.phase_step = 7
+    sched.pin_ev_count = 2
+
+    n = sum(1 for _ in sae.parameters())  # any size; roundtrip only needs a tensor
+    ffc = torch.zeros(8, dtype=torch.long)
+    ssf = torch.zeros(8, dtype=torch.long)
+    rng = {"cuda": None, "cpu": torch.get_rng_state()}
+    path = t._save_full_checkpoint(tmp_path, 100, sae, opt, sched, rng, ffc, ssf, None)
+
+    # Emulate an OLD checkpoint: strip every phase key from scheduler_state.
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    for k in ("phase", "phase_step", "pin_entry_step", "pinned_lambda",
+              "pin_ev_count", "pin_retry_count"):
+        ckpt["scheduler_state"].pop(k, None)
+    torch.save(ckpt, path)
+
+    # Restore into a fresh (also dirtied) scheduler.
+    sched2 = _make_scheduler()
+    sched2.phase = "FINETUNE"
+    sched2.phase_step = 999
+    loaded = t._load_full_checkpoint(path, sae, opt, sched2, device="cpu")
+    assert loaded is not None, "old-style checkpoint failed to load"
+    assert sched2.phase == "DESCENT"
+    assert sched2.phase_step == 0
+    assert sched2.pin_entry_step is None
+    assert sched2.pinned_lambda is None
+    assert sched2.pin_ev_count == 0
+    assert sched2.pin_retry_count == 0

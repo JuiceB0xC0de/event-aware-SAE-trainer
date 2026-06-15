@@ -116,6 +116,9 @@ ERR_BUFFER_SZ  = 16_384     # high-error activation buffer (tokens)
 RESAMPLE_SCALE = 1.0        # scale of resampled encoder rows vs mean alive norm
 DEFAULT_SEED   = 0
 
+# Numeric encoding of scheduler phase for W&B plotting (string is logged too).
+_PHASE_IDX = {"DESCENT": 0, "PIN": 1, "FINETUNE": 2}
+
 
 def _aggressive_k_aux_k(target_l0: int) -> int:
     """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
@@ -903,6 +906,13 @@ def _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
             "_stall_pulse_multiplier": getattr(scheduler, "_stall_pulse_multiplier", 1.0),
             "_last_stall_pulse_step": getattr(scheduler, "_last_stall_pulse_step", -10**9),
             "_energy_dampen": getattr(scheduler, "_energy_dampen", 1.0),
+            # Phase control state (observable; gated in later branches).
+            "phase": getattr(scheduler, "phase", "DESCENT"),
+            "phase_step": getattr(scheduler, "phase_step", 0),
+            "pin_entry_step": getattr(scheduler, "pin_entry_step", None),
+            "pinned_lambda": getattr(scheduler, "pinned_lambda", None),
+            "pin_ev_count": getattr(scheduler, "pin_ev_count", 0),
+            "pin_retry_count": getattr(scheduler, "pin_retry_count", 0),
             "energy_config": {
                 k: getattr(scheduler.config, k)
                 for k in energy_config_keys
@@ -943,6 +953,14 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
         scheduler._stall_pulse_multiplier = sched_state.get("_stall_pulse_multiplier", 1.0)
         scheduler._last_stall_pulse_step = sched_state.get("_last_stall_pulse_step", -10**9)
         scheduler._energy_dampen = sched_state.get("_energy_dampen", 1.0)
+        # Phase control state — backward-compatible defaults for old checkpoints
+        # saved before the phase machine existed.
+        scheduler.phase = sched_state.get("phase", "DESCENT")
+        scheduler.phase_step = sched_state.get("phase_step", 0)
+        scheduler.pin_entry_step = sched_state.get("pin_entry_step", None)
+        scheduler.pinned_lambda = sched_state.get("pinned_lambda", None)
+        scheduler.pin_ev_count = sched_state.get("pin_ev_count", 0)
+        scheduler.pin_retry_count = sched_state.get("pin_retry_count", 0)
         default_constraint_lr_floor = scheduler.config.constraint_lr_floor
         energy_config = sched_state.get("energy_config", {})
         for k, v in energy_config.items():
@@ -1596,7 +1614,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             metrics["dead_pct"].append(round(dead, 2))
             metrics["resampled"].append(total_resampled)
             metrics["ev"].append(ev)
-            print(f"  step={step:>5} mode={scheduler.mode:<9s} recon={recon_val:.5f} "
+            print(f"  step={step:>5} mode={scheduler.mode:<9s} phase={scheduler.phase:<8s} "
+                  f"recon={recon_val:.5f} "
                   f"L0={l0_val:.1f} dead={dead:.1f}% ev={ev:.3f} thr={thr.mean().item():.3f} "
                   f"ultra={int(ultra_active):>4d} lr={scheduler.optimizer.param_groups[0]['lr']:.2e} "
                   f"lam={scheduler.lambda_l0:.2e} tok/s={tokens_per_sec/1e3:.1f}k "
@@ -1613,7 +1632,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            "train/best_ev_so_far": best_ev,
                            "features/ultra_active_count": ultra_active,
                            "timing/tokens_per_sec": tokens_per_sec,
-                           "scheduler/mode": scheduler.mode}, step=step)
+                           "scheduler/mode": scheduler.mode,
+                           "scheduler/phase": scheduler.phase,
+                           "scheduler/phase_idx": _PHASE_IDX.get(scheduler.phase, -1)},
+                          step=step)
 
         if step % CHECKPOINT_EVERY == 0:
             rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
@@ -1645,6 +1667,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             "n_steps": step, "lr": LR, "lambda_l0": scheduler.lambda_l0, "tier": tier,
             "preflight": preflight_stats,
             "scheduler_mode": scheduler.mode,
+            "scheduler_phase": sched_summary["phase"],
+            "scheduler_phase_summary": {
+                k: sched_summary[k] for k in
+                ("phase", "phase_step", "pin_entry_step", "pinned_lambda",
+                 "pin_ev_count", "pin_retry_count")
+            },
             "scheduler_transitions": sched_summary["transitions"],
             "total_tokens": step * BATCH_TOKENS, "early_stopped": scheduler.should_stop,
             "path": "rolling", "best_ev": best_ev, "best_ev_step": best_ev_step,
@@ -1791,11 +1819,16 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     import shutil
     os.makedirs(ROLLCACHE, exist_ok=True)
     shard_gb = (BATCH_TOKENS // SEQ_LEN) * SEQ_LEN * d_in * 2 / 1e9   # bf16 [n_seqs,SEQ_LEN,d]
-    # Pipeline keeps two pools (current + pre-produced next) plus resume copy.
-    peak_gb = pool_batches * shard_gb * 2.2 + 4
+    # Rolling pipelines two pools (current + pre-produced next) plus a resume copy.
+    # Auto/hook capture is independent per layer -- only one pool is on disk at a
+    # time (plus resume-copy headroom), so the 2x pipeline term over-estimates peak
+    # and would falsely block valid auto runs.
+    pool_multiplier = 2.2 if capture == "rolling" else 1.2
+    n_pools_desc = "2 pipelined pools" if capture == "rolling" else "1 pool"
+    peak_gb = pool_batches * shard_gb * pool_multiplier + 4
     free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
     sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
-    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB (2 pipelined pools of {pool_batches} x "
+    print(f"  [disk] {ROLLCACHE} peak~{peak_gb:.0f}GB ({n_pools_desc} of {pool_batches} x "
           f"{shard_gb*1e3:.0f}MB); free={'(overlay: unknown)' if sentinel else f'{free_gb:.0f}GB'}")
     if not sentinel:
         assert free_gb > peak_gb, (
