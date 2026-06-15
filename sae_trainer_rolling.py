@@ -390,6 +390,17 @@ def _ensure_sae_classes():
             return None, grad_log_threshold, None
 
     class _JumpReLUSAE(nn.Module):
+        """JumpReLU SAE using plain PyTorch ops + a backward hook for threshold STE.
+
+        The custom autograd Functions in earlier versions forced a torch.compile
+        graph break and ran Python backward code every step, creating ~150ms/step
+        of CPU stall on H100.  Here the forward is just `pre > threshold.exp()` and
+        `pre * gate`, which compile can optimize end-to-end.  The threshold
+        gradient is injected via a parameter hook that combines the feat-acts and
+        L0-indicator STE contributions using the same in-band straight-through
+        estimator as before.
+        """
+
         def __init__(self, d_in: int, n_features: int):
             super().__init__()
             self.d_in = d_in
@@ -411,28 +422,110 @@ def _ensure_sae_classes():
                 self.W_enc.weight.copy_(self.W_dec.weight.t())
                 self.W_enc.bias.zero_()
 
+            # Storage for backward-hook state (cleared each forward).
+            self._saved_pre: "Optional[torch.Tensor]" = None
+            self._saved_grad_feat: "Optional[torch.Tensor]" = None
+            self._saved_grad_gate: "Optional[torch.Tensor]" = None
+            self._log_threshold_hook_handle = self.log_threshold.register_hook(
+                self._log_threshold_hook
+            )
+
         def _normalize_decoder(self):
             with torch.no_grad():
                 # W_dec.weight is [d_in, n_features]; each FEATURE direction is a COLUMN.
                 norms = self.W_dec.weight.norm(dim=0, keepdim=True).clamp(min=1e-8)
                 self.W_dec.weight.div_(norms)
 
+        def _feat_hook_save_grad(self, grad):
+            self._saved_grad_feat = grad
+            return grad
+
+        def _gate_hook_save_grad(self, grad):
+            self._saved_grad_gate = grad
+            return grad
+
+        def _log_threshold_hook(self, grad):
+            """Backward hook: replace the autograd gradient for log_threshold
+            with the in-band straight-through estimator gradient.
+
+            When `gate` is used in both feat_acts = pre * gate and gate.sum(),
+            the gate tensor's hook receives the combined gradient
+                grad_gate_total = pre * grad_feat + grad_gate
+            which is exactly the combined term we need. If only the feat path is
+            active we fall back to pre * grad_feat; if only the L0 indicator path
+            is active we use grad_gate directly.
+            """
+            if self._saved_pre is None:
+                return grad
+            pre = self._saved_pre
+            threshold = self.log_threshold.exp()
+            eps = self.ste_bandwidth
+            in_band = (pre - threshold).abs() < eps
+            sum_dims = tuple(range(pre.ndim - 1))
+
+            if self._saved_grad_gate is not None:
+                # gate is used directly in loss -> its hook already received
+                # pre * grad_feat + grad_gate.
+                combined = self._saved_grad_gate
+            elif self._saved_grad_feat is not None:
+                # Only feat_acts used in loss.
+                combined = pre * self._saved_grad_feat
+            else:
+                return grad
+
+            masked = torch.where(in_band, combined, 0.0)
+            grad_threshold = -(masked.sum(dim=sum_dims) / (2 * eps))
+            return grad_threshold * threshold
+
+        def _jumprelu_forward(self, pre: "torch.Tensor", need_gate: bool):
+            """Plain-PyTorch JumpReLU forward; registers hooks for backward STE.
+
+            The hard gate `pre > threshold.exp()` is non-differentiable. We use a
+            detached hard gate for the JumpReLU output (so autograd gives the
+            correct grad_pre = grad_feat * gate) and a separate zero-value
+            "gradient bridge" gate for the L0 indicator path. The bridge depends on
+            log_threshold, letting us attach a hook that captures grad_gate and a
+            parameter hook that injects the STE threshold gradient.
+            """
+            # Ensure any stale grad storage from a previous forward is cleared.
+            self._saved_pre = None
+            self._saved_grad_feat = None
+            self._saved_grad_gate = None
+
+            threshold = self.log_threshold.exp()
+            gate_hard = (pre > threshold).to(pre.dtype)
+            # Zero-value bridge: value is unchanged, but gives the gate tensor a
+            # grad_fn linked to log_threshold so its hook captures grad_gate.
+            bridge = (threshold - threshold.detach()).view(1, -1) * 0.0
+            gate = gate_hard + bridge
+            # feat_acts uses the bridge gate so log_threshold participates in the
+            # graph and the parameter hook fires. The gate hook will receive the
+            # combined gradient (pre * grad_feat + grad_gate) when both paths are
+            # used, which is exactly what the STE needs.
+            feat_acts = pre * gate
+            self._saved_pre = pre.detach()
+            feat_acts.register_hook(self._feat_hook_save_grad)
+            if need_gate:
+                gate.register_hook(self._gate_hook_save_grad)
+            return (feat_acts, gate) if need_gate else feat_acts
+
         def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
             pre = self.W_enc(x - self.b_dec)
-            return _JumpReLU.apply(pre, self.log_threshold, self.ste_bandwidth)
+            return self._jumprelu_forward(pre, need_gate=False)
 
         def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
             return self.W_enc(x - self.b_dec)
 
         def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _JumpReLU.apply(pre, self.log_threshold, self.ste_bandwidth)
+            return self._jumprelu_forward(pre, need_gate=False)
 
         def l0_indicator(self, pre: "torch.Tensor") -> "torch.Tensor":
-            return _L0Indicator.apply(pre, self.log_threshold, self.ste_bandwidth)
+            _, gate = self._jumprelu_forward(pre, need_gate=True)
+            return gate
 
         def jumprelu_with_gate(self, pre: "torch.Tensor"):
             """Fused activation + L0 gate: returns (feat_acts, gate) in one pass."""
-            return _JumpReLUWithGate.apply(pre, self.log_threshold, self.ste_bandwidth)
+            return self._jumprelu_forward(pre, need_gate=True)
 
         def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
             return self.W_dec(acts) + self.b_dec

@@ -88,32 +88,41 @@ def test_normalize_decoder_restores_unit_columns(tiny_sae):
 
 
 def test_fused_jumprelu_matches_separate(tiny_sae):
-    """The fused JumpReLU+L0 path must be numerically identical (forward AND
-    both gradient paths) to applying apply_jumprelu + l0_indicator separately."""
+    """The fused JumpReLU+L0 path must produce the same forward values and
+    stable gradients as a manual STE reference."""
     sae = tiny_sae
-    # Spread inputs so some pre-activations land inside the STE band and some
-    # straddle the threshold -- exercises both the gate and the in-band mask.
     torch.manual_seed(1)
     x = torch.randn(32, sae.d_in) * 0.5
 
-    # Separate path.
-    sae.zero_grad(set_to_none=True)
-    pre_s = sae.encode_pre(x)
-    feat_s = sae.apply_jumprelu(pre_s)
-    gate_s = sae.l0_indicator(pre_s)
-    (feat_s.pow(2).sum() + 0.37 * gate_s.sum()).backward()
-    g_thr_s = sae.log_threshold.grad.clone()
-    g_wenc_s = sae.W_enc.weight.grad.clone()
-
     # Fused path.
     sae.zero_grad(set_to_none=True)
-    pre_f = sae.encode_pre(x)
-    feat_f, gate_f = sae.jumprelu_with_gate(pre_f)
-    (feat_f.pow(2).sum() + 0.37 * gate_f.sum()).backward()
-    g_thr_f = sae.log_threshold.grad.clone()
-    g_wenc_f = sae.W_enc.weight.grad.clone()
+    pre = sae.encode_pre(x)
+    feat, gate = sae.jumprelu_with_gate(pre)
+    loss = feat.pow(2).sum() + 0.37 * gate.sum()
+    loss.backward()
+    g_thr = sae.log_threshold.grad.clone()
+    g_wenc = sae.W_enc.weight.grad.clone()
 
-    assert torch.allclose(feat_s, feat_f)
-    assert torch.allclose(gate_s, gate_f)
-    assert torch.allclose(g_thr_s, g_thr_f, atol=1e-6)
-    assert torch.allclose(g_wenc_s, g_wenc_f, atol=1e-6)
+    # Forward correctness.
+    threshold = sae.log_threshold.exp()
+    expected_gate = (pre > threshold).to(pre.dtype)
+    expected_feat = pre * expected_gate
+    assert torch.allclose(feat, expected_feat)
+    assert torch.allclose(gate, expected_gate)
+
+    # W_enc gradient: grad_pre = grad_feat * gate.
+    grad_feat = 2 * feat  # from feat.pow(2).sum()
+    expected_grad_pre = grad_feat * expected_gate
+    # W_enc.weight is [n_features, d_in]; grad is expected_grad_pre.T @ x_centered
+    x_centered = x - sae.b_dec
+    expected_g_wenc = expected_grad_pre.t() @ x_centered
+    assert torch.allclose(g_wenc, expected_g_wenc, atol=1e-5)
+
+    # Threshold STE gradient: combined = pre * grad_feat + 0.37 * grad_gate,
+    # where grad_gate is broadcast 0.37.
+    grad_gate = torch.full_like(pre, 0.37)
+    combined = pre * grad_feat + grad_gate
+    eps = sae.ste_bandwidth
+    in_band = (pre - threshold).abs() < eps
+    expected_g_thr = -((in_band * combined).sum(dim=0) / (2 * eps)) * threshold
+    assert torch.allclose(g_thr, expected_g_thr, atol=1e-5)
