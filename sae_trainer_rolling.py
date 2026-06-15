@@ -907,6 +907,23 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
     dataset = _build_token_dataset(
         hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=use_pretok)
     it = iter(dataset)                                     # main-process iteration
+
+    # Pre-tokenized shards are tokenizer-specific.  Validate the first batch against
+    # the model's vocab; if it doesn't fit, stream + tokenize with the right tokenizer.
+    if vocab_size is not None:
+        probe = next(it)
+        if probe.min() < 0 or probe.max() >= vocab_size:
+            print(f"  [tokens] pretok ids out of range (max={probe.max()}, "
+                  f"vocab={vocab_size}); falling back to streaming tokenization")
+            del it, dataset
+            use_pretok = False
+            dataset = _build_token_dataset(
+                hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=False)
+            it = iter(dataset)
+        else:
+            import itertools
+            it = itertools.chain([probe], it)
+
     n_seqs = BATCH_TOKENS // SEQ_LEN
     tok_dir.mkdir(parents=True, exist_ok=True)
     print(f"  [tokens] capturing {pool_batches} token shards ([{n_seqs},{SEQ_LEN}]) ...")
