@@ -119,7 +119,8 @@ class SAETainer:
               pool_batches: int = 2000, max_steps: int = 15000,
               microbatch_tokens: int = 32768, resume_from: str | None = None,
               evict_model: bool = True, target_l0: int | None = None,
-              timing: bool = False) -> dict:
+              timing: bool = False,
+              scratch_dir: str = "/root/rollcache") -> dict:
         """
         Train SAEs on a range of layers.
 
@@ -157,11 +158,14 @@ class SAETainer:
         print(f"  Evict model during training: {evict_model}")
         print(f"  Target L0: {target_l0 if target_l0 is not None else 'default'}")
         print(f"  Timing: {timing}")
+        print(f"  Scratch dir: {scratch_dir}")
         print(f"{'='*60}\n")
 
         import os as _os
         if timing:
             _os.environ["SAE_TIMING"] = "1"
+        if scratch_dir:
+            _os.environ["SAE_SCRATCH_DIR"] = scratch_dir
 
         # Run training
         results = run_atlas_rolling(
@@ -293,6 +297,7 @@ def main(
     evict_model: bool = True,
     target_l0: int | None = None,
     timing: bool = False,
+    scratch_dir: str = "/root/rollcache",
 ):
     """
     Train SAEs on Gemma-4 E4B layers.
@@ -313,6 +318,7 @@ def main(
         evict_model=evict_model,
         target_l0=target_l0,
         timing=timing,
+        scratch_dir=scratch_dir,
     )
     print(f"\nTraining complete: {result['status']}")
     print(f"Layers trained: {result['layers']}")

@@ -1288,12 +1288,26 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     if frozen_decoder:
         sae.W_dec.weight.requires_grad_(False)
 
-    # NO torch.compile here. The original rolling trainer (mapping-corpus)
-    # never compiled -- the SAE is small enough (2560 -> 81920) that PyTorch
-    # eager is fine, and compile + this training loop's non-deterministic
-    # control flow (resample/reset/scheduler branches, dead-mask .item()
-    # syncs) is what killed the H100 container last run (first compile
-    # pass took >60s and tripped the Modal heartbeat).
+    # Try torch.compile on the SAE forward. The timing showed ~200ms/step of
+    # fwd+bwd CPU stall from Python kernel-launch overhead on H100, which
+    # compile is designed to eliminate. We compile only the SAE module, not
+    # the whole training loop, so resample/reset/scheduler branches don't
+    # poison the graph. Custom autograd Functions cause graph breaks around
+    # the JumpReLU, but the matmuls still get fused/optimized. If compile
+    # fails or slows things, disable with SAE_COMPILE=0.
+    use_compile = os.environ.get("SAE_COMPILE", "1").lower() in ("1", "true", "yes", "on")
+    if use_compile and device.type == "cuda":
+        try:
+            import torch
+            # fullgraph=False allows graph breaks at the custom autograd Function.
+            sae = torch.compile(sae, mode="reduce-overhead", fullgraph=False, dynamic=False)
+            print(f"  torch.compile enabled on SAE (reduce-overhead, fullgraph=False)")
+        except Exception as e:
+            print(f"  WARNING: torch.compile failed ({e}), falling back to eager SAE")
+    else:
+        print(f"  torch.compile disabled (SAE_COMPILE={use_compile}, device={device.type})")
+
+    # torch.compile is applied above to the SAE module only, not the whole loop.
 
     optimizer = torch.optim.Adam(
         [{"params": sae.W_enc.parameters(), "weight_decay": 0},
