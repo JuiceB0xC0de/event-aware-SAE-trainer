@@ -125,7 +125,7 @@ class SAETainer:
               pool_batches: int = 2000, max_steps: int = 15000,
               microbatch_tokens: int = 32768, resume_from: str | None = None,
               evict_model: bool = True, target_l0: int | None = None,
-              timing: bool = False,
+              timing: bool = False, compile: bool = False,
               scratch_dir: str = "/root/rollcache",
               model_id: str = "google/gemma-4-e4b-it") -> dict:
         """
@@ -140,6 +140,7 @@ class SAETainer:
             microbatch_tokens: for gradient accumulation (default 32k = no accum)
             resume_from: optional /data/.../checkpoint_full.pt for the first trained layer
             evict_model: move the LLM to CPU during SAE training to free VRAM (default True)
+            compile: enable torch.compile on the SAE (default False)
         """
         import os
         import sys
@@ -165,12 +166,15 @@ class SAETainer:
         print(f"  Evict model during training: {evict_model}")
         print(f"  Target L0: {target_l0 if target_l0 is not None else 'default'}")
         print(f"  Timing: {timing}")
+        print(f"  Compile SAE: {compile}")
         print(f"  Scratch dir: {scratch_dir}")
         print(f"{'='*60}\n")
 
         import os as _os
         if timing:
             _os.environ["SAE_TIMING"] = "1"
+        if compile:
+            _os.environ["SAE_COMPILE"] = "1"
         if scratch_dir:
             _os.environ["SAE_SCRATCH_DIR"] = scratch_dir
 
@@ -306,6 +310,7 @@ def main(
     timing: bool = False,
     scratch_dir: str = "/root/rollcache",
     model_id: str = "google/gemma-4-e4b-it",
+    compile: bool = False,
 ):
     """
     Train SAEs on any HuggingFace causal LM.
@@ -314,6 +319,7 @@ def main(
         modal run gemma4_sae.py --layer-range 0,15 --capture rolling
         modal run gemma4_sae.py --model-id meta-llama/Llama-3.2-1B --layer-range 0,16 --capture auto
         modal run gemma4_sae.py --layer-range 5,10 --capture rolling --resume-from /data/saes/data_models_gemma-4-e4b/layer_05_s0/checkpoint_full.pt
+        modal run gemma4_sae.py --model-id meta-llama/Llama-3.2-1B --layer-range 0,16 --capture auto --compile
     """
     tainer = SAETainer(model_id=model_id)
     result = tainer.train.remote(
@@ -326,6 +332,7 @@ def main(
         evict_model=evict_model,
         target_l0=target_l0,
         timing=timing,
+        compile=compile,
         scratch_dir=scratch_dir,
         model_id=model_id,
     )
