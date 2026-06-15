@@ -909,6 +909,7 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
 
     Each layer is captured independently (one forward per layer), so disk stays at one
     pool while compute is N_layers x a full forward."""
+    import torch
     import time
 
     tok_paths = _shard_paths(tok_dir)
