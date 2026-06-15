@@ -85,16 +85,16 @@ app = modal.App("gemma4-sae-train", image=image)
 
 
 @app.cls(
-    gpu="H100",
-    volumes={"/data": data_volume},          # /scratch removed: pool lives on local NVMe now
-    ephemeral_disk=1_048_576,                 # 1 TiB container-local NVMe for the activation pool
+    gpu="A10G",  # 24GB VRAM - enough for SmolLM2-360M with room to profile
+    volumes={"/data": data_volume},
+    ephemeral_disk=524_288,  # 512 GiB container-local NVMe
     secrets=[modal.Secret.from_name("huggingface")],
-    timeout=86400,  # 24 hours max per Modal limits
+    timeout=86400,  # 24 hours
 )
 class SAETainer:
     """Train SAEs on any HuggingFace causal LM."""
 
-    model_id: str = modal.parameter(default="google/gemma-4-e4b-it")
+    model_id: str = modal.parameter(default="HuggingFaceTB/SmolLM2-360M")
 
     @modal.enter()
     def setup(self):

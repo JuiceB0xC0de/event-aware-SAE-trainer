@@ -875,6 +875,7 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
     used when their manifest vocab size matches the target model; otherwise we fall
     back to streaming tokenization.
     """
+    pretok_dir = None
     import torch
 
     paths = _shard_paths(tok_dir)
