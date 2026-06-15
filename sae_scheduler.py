@@ -98,6 +98,11 @@ class SAEAECSConfig:
     dead_emergency_cooldown: int = 5000   # min steps between dead emergency triggers
     dead_emergency_resample_trigger: bool = True  # auto-trigger resample on emergency
 
+    # -- Revival AuxK policy -----------------------------------------------
+    # "legacy"          -> max(8, min(128, target_l0 // 2))  (current behavior, default)
+    # "feature_fraction"-> min(512, n_features // 64)        (new; A/B only)
+    aux_k_policy: str = "legacy"
+
     # -- L0 stabilization detection ----------------------------------------
     l0_stabilize_window: int = 3          # consecutive windows to detect stabilization
     l0_stabilize_std_thresh: float = 0.5  # std of L0 window below this -> stabilize
@@ -233,7 +238,8 @@ class SAEAECSConfig:
     pin_ev_patience: int = 3            # consecutive good EV windows -> ready for FINETUNE
     finetune_dual_step: float = 1e-9    # dual ascent step used during FINETUNE
     finetune_lambda_release_frac: float = 0.10  # lambda set to this fraction of pinned on release
-    deep_layer_slingshot_gain: float = 8.0      # slingshot gain for deep layers (>=3)
+    deep_layer_slingshot_gain: float = 8.0      # slingshot gain floor (deep-layer fallback)
+    slingshot_norm_alpha: float = -0.5          # exponent for activation-norm slingshot scaling
 
 
 class SAESignalBuffer:
@@ -360,10 +366,12 @@ class SAEEventControlScheduler:
 
     MODES = ["BASELINE", "RECOVERY", "EXPLORE", "STABILIZE"]
 
-    def __init__(self, optimizer, config: SAEAECSConfig = None, mode_label: str = ""):
+    def __init__(self, optimizer, config: SAEAECSConfig = None, mode_label: str = "",
+                 layer: Optional[int] = None):
         self.config = config or SAEAECSConfig()
         self.optimizer = optimizer
         self.mode_label = mode_label  # "L0", "L1", etc. for logging
+        self.layer = layer            # decoder layer index; drives deep-layer gain scaling
 
         # Base AECS state
         self.buffer = SAESignalBuffer(
@@ -396,6 +404,9 @@ class SAEEventControlScheduler:
         self.stop_reason: str = ""
         self._lambda_history: list = []     # rolling lambda readings for plateau detection
         self._activation_norm_ema: Optional[float] = None
+        # Frozen preflight activation norm — drives the deterministic slingshot
+        # gain scaling. Distinct from the live EMA (which is for LR adaptation).
+        self._activation_norm_preflight: Optional[float] = None
         self._prev_l0: Optional[float] = None
         self._l0_progress_fast: Optional[float] = None
         self._l0_progress_slow: Optional[float] = None
@@ -663,12 +674,40 @@ class SAEEventControlScheduler:
             return cfg.target_l0 * (1.0 - cfg.al_slingshot_overshoot_rel)
         return cfg.target_l0
 
+    def _effective_slingshot_gain(self) -> float:
+        """Slingshot dual-gain, scaled by frozen preflight activation norm.
+
+        Plant-aware: deeper layers have larger activation norms and overshoot
+        lambda under the early-layer slingshot. Scale the gain down by the
+        preflight norm ratio (probe/ref) ** slingshot_norm_alpha, with the floor
+        derived from deep_layer_slingshot_gain so the curve asymptotes to the
+        validated deep-layer value. Uses the FROZEN preflight norm (deterministic),
+        never the live EMA. Falls back to the layer-number rule when preflight
+        stats are missing.
+        """
+        cfg = self.config
+        max_gain = cfg.al_slingshot_gain_max
+        floor_gain = min(max_gain, cfg.deep_layer_slingshot_gain)
+
+        ref = cfg.activation_norm_ref
+        probe = self._activation_norm_preflight
+
+        if ref is not None and ref > 0 and probe is not None and probe > 0:
+            floor_scale = floor_gain / max(max_gain, 1e-12)
+            ratio = probe / ref
+            scale = max(floor_scale, min(1.0, ratio ** cfg.slingshot_norm_alpha))
+            return max_gain * scale
+
+        if self.layer is not None and self.layer >= 3:
+            return floor_gain
+        return max_gain
+
     def _landing_lambda_gain(self, current_l0: float, control_error: float) -> float:
         cfg = self.config
         if control_error <= 0:
             return 1.0
         if current_l0 > cfg.target_l0:
-            return cfg.al_slingshot_gain_max
+            return self._effective_slingshot_gain()
         target = max(cfg.target_l0, 1e-8)
         error_rel = control_error / target
         if error_rel <= cfg.l0_tolerance:
@@ -731,6 +770,11 @@ class SAEEventControlScheduler:
           - Dead band: suppress nudge within tolerance of target.
         """
         cfg = self.config
+        # PIN freezes direct threshold manipulation while EV catches up — the
+        # phase machine owns the actuators here. This gate is PIN-only: the nudge
+        # stays fully available in DESCENT and FINETUNE and is NOT disabled globally.
+        if self.phase == "PIN":
+            return 0.0, False
         if cfg.threshold_nudge_gain <= 0:
             return 0.0, False
 
@@ -1379,6 +1423,8 @@ class SAEEventControlScheduler:
             "ev_below_floor": self._ev_below_floor_count,
             "ev_above_floor": self._ev_above_floor_count,
             "activation_norm_ema": self._activation_norm_ema,
+            "activation_norm_preflight": self._activation_norm_preflight,
+            "effective_slingshot_gain": self._effective_slingshot_gain(),
             "l0_progress_fast": self._l0_progress_fast,
             "l0_progress_slow": self._l0_progress_slow,
             "stall_pulse_remaining": self._stall_pulse_remaining,
