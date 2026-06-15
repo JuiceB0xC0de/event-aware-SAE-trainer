@@ -469,6 +469,16 @@ class SAEEventControlScheduler:
             self.pinned_lambda = self.lambda_l0
             self.pin_ev_count = 0
         prefix = f"[{self.mode_label}] " if self.mode_label else ""
+        if new_phase == "FINETUNE" and self.pinned_lambda is not None:
+            # Re-pin the ceiling so a stale/lowered lambda_l0_max (e.g. from a live
+            # tune during PIN) cannot clip the pinned lambda downward on the first
+            # re-enabled dual update after release.
+            old_max = self.config.lambda_l0_max
+            new_max = max(old_max, self.pinned_lambda)
+            if new_max != old_max:
+                self.config.lambda_l0_max = new_max
+                print(f"{prefix}[PHASE] re-pin lambda_l0_max {old_max:.3e} -> {new_max:.3e} "
+                      f"(>= pinned_lambda {self.pinned_lambda:.3e})")
         print(f"{prefix}[PHASE] {old} -> {new_phase} @ step {self.total_steps} "
               f"(lambda={self.lambda_l0:.3e}; {reason})")
 
@@ -621,6 +631,14 @@ class SAEEventControlScheduler:
         which has proper convergence theory (vs the ad-hoc P-controller).
         """
         cfg = self.config
+        # PIN freezes sparsity pressure: lambda is pinned at PIN entry and the
+        # phase machine owns it, so the integrator must not move it. This early
+        # return is the single guarantee against lambda windup during PIN.
+        if self.phase == "PIN":
+            if cfg.verbose and self.total_steps % max(1, cfg.al_log_every) == 0:
+                print(f"  [AL @ step {self.total_steps}] PIN: dual update frozen "
+                      f"(lambda={self.lambda_l0:.3e})")
+            return
         error = current_l0 - cfg.target_l0   # signed (negative means we're below target)
         control_target = self._dual_control_target(current_l0)
         control_error = current_l0 - control_target
@@ -1216,6 +1234,15 @@ class SAEEventControlScheduler:
             except (ValueError, TypeError):
                 continue
             if key == "lambda_l0_override":
+                if self.phase == "PIN":
+                    # PIN owns lambda; an external hot-tune file must not silently
+                    # steal lambda ownership while sparsity pressure is frozen.
+                    if cfg.verbose:
+                        prefix = f"[{self.mode_label}] " if self.mode_label else ""
+                        print(f"  {prefix}[live-tune @ step {self.total_steps}] IGNORED "
+                              f"lambda_l0_override={val:.3e} during PIN "
+                              f"(lambda pinned at {self.lambda_l0:.3e})")
+                    continue
                 # Directly set lambda, bypass integrator
                 self.lambda_l0 = val
                 applied[key] = val

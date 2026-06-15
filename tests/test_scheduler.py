@@ -353,3 +353,64 @@ def test_old_checkpoint_without_phase_fields_restores_safely(tiny_sae, tmp_path)
     assert sched2.pinned_lambda is None
     assert sched2.pin_ev_count == 0
     assert sched2.pin_retry_count == 0
+
+
+# -- PIN lambda gates (Branch 2) ----------------------------------------------
+
+def test_dual_update_frozen_in_pin():
+    sched = _make_scheduler(al_dual_step=1.0, lambda_l0_max=1.0)
+    sched.total_steps = 10
+    sched.lambda_l0 = 2e-3
+    # DESCENT: the integrator moves lambda when L0 is above target.
+    sched.phase = "DESCENT"
+    sched._dual_update(600.0)
+    assert sched.lambda_l0 > 2e-3
+    # PIN: lambda is frozen regardless of L0 error (no windup).
+    pinned = sched.lambda_l0
+    sched.phase = "PIN"
+    for l0 in (600.0, 1200.0, 300.0):
+        sched._dual_update(l0)
+        assert sched.lambda_l0 == pinned
+
+
+def test_live_tune_lambda_override_ignored_in_pin(tmp_path):
+    import json
+    lt = tmp_path / "live_tune.json"
+    lt.write_text(json.dumps({"lambda_l0_override": 0.5}))
+    missing_alt = str(tmp_path / "does_not_exist.json")  # avoid stray /tmp/live_tune.json
+
+    # DESCENT: the override is applied (sets lambda directly).
+    sched = _make_scheduler(lambda_l0_max=1.0)
+    sched.config.live_tune_path = str(lt)
+    sched.config.live_tune_path_alt = missing_alt
+    sched.phase = "DESCENT"
+    sched._live_tune_mtime = 0.0
+    sched._apply_live_tune()
+    assert sched.lambda_l0 == 0.5
+
+    # PIN: the same override is ignored, lambda unchanged.
+    sched2 = _make_scheduler(lambda_l0_max=1.0)
+    sched2.config.live_tune_path = str(lt)
+    sched2.config.live_tune_path_alt = missing_alt
+    sched2.phase = "PIN"
+    sched2.lambda_l0 = 3e-3
+    sched2._live_tune_mtime = 0.0
+    sched2._apply_live_tune()
+    assert sched2.lambda_l0 == 3e-3
+
+
+def test_finetune_entry_repins_lambda_ceiling():
+    # Ceiling lowered below pinned lambda -> FINETUNE entry raises it back up.
+    sched = _make_scheduler(lambda_l0_max=0.1)
+    sched.phase = "PIN"
+    sched.pinned_lambda = 0.5
+    sched._enter_phase("FINETUNE", "test")
+    assert sched.phase == "FINETUNE"
+    assert sched.config.lambda_l0_max == 0.5  # raised to pinned_lambda
+
+    # Ceiling already above pinned lambda -> left unchanged.
+    sched2 = _make_scheduler(lambda_l0_max=0.8)
+    sched2.phase = "PIN"
+    sched2.pinned_lambda = 0.5
+    sched2._enter_phase("FINETUNE", "test")
+    assert sched2.config.lambda_l0_max == 0.8
