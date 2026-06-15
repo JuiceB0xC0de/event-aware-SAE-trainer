@@ -34,10 +34,18 @@ class _FakeModel(nn.Module):
         self.embed = nn.Embedding(64, d)
         self.layers = nn.ModuleList([_FakeLayer(d) for _ in range(n_layers)])
 
-    def forward(self, input_ids=None, use_cache=False, **kwargs):
+    def forward(self, input_ids=None, use_cache=False, output_hidden_states=False, **kwargs):
         h = self.embed(input_ids)
+        hidden_states = [h]
         for lyr in self.layers:
             h = lyr(h)
+            hidden_states.append(h)
+        if output_hidden_states:
+            from transformers.modeling_outputs import CausalLMOutputWithPast
+            return CausalLMOutputWithPast(
+                logits=h,
+                hidden_states=tuple(hidden_states),
+            )
         return h
 
 
@@ -80,9 +88,8 @@ def test_hooked_capture_matches_manual_forward(tmp_path):
     assert torch.allclose(captured, expected.to(torch.bfloat16).float(), atol=1e-3)
 
 
-def test_produce_pool_hooked_truncates_and_runs_forward(tmp_path, monkeypatch):
-    """Verify that _produce_pool_hooked truncates the layer stack and runs the forward
-    to completion (no exception), recording the target layer's residual."""
+def test_produce_pool_hooked_runs_forward_and_writes_pool(tmp_path, monkeypatch):
+    """Verify that _produce_pool_hooked runs a full forward and writes the pool."""
     d = 8
     model = _FakeModel(3, d).eval()
 
@@ -104,26 +111,7 @@ def test_produce_pool_hooked_truncates_and_runs_forward(tmp_path, monkeypatch):
     # Should succeed without raising any exception and write the pool.
     t._produce_pool_hooked(model, model.layers, 0, tok, dst, torch.device("cpu"))
 
-    assert forward_completed, "Truncated forward should run to completion"
-    assert len(t._shard_paths(dst)) == 1
-
-
-def test_early_exit_skips_later_layers(tmp_path):
-    # capturing layer 0 must not require layers 1+ to run -- prove it by tripping a
-    # layer that would error if executed.
-    d = 8
-    model = _FakeModel(3, d).eval()
-
-    class _Boom(nn.Module):
-        def forward(self, *a, **k):
-            raise AssertionError("layers after the captured one should not run")
-
-    model.layers[1] = _Boom()
-    tok = Path(tmp_path) / "tok"
-    dst = Path(tmp_path) / "poolL0"
-    _write_token_shards(tok, n_shards=1, n_seqs=2, seq=4)
-
-    t._produce_pool_hooked(model, model.layers, 0, tok, dst, torch.device("cpu"))
+    assert forward_completed, "Forward should run to completion"
     assert len(t._shard_paths(dst)) == 1
 
 

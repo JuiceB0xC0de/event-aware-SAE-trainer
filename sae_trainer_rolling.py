@@ -903,15 +903,13 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
 
     Works for any AutoModelForCausalLM (and text-only forwards of multimodal models).
     Correct by construction -- it observes the real forward, so there is no bit-exact
-    risk. Instead of hooks + exceptions we physically truncate the decoder ModuleList to
-    [:layer+1] per layer, so the forward naturally stops after block `layer` and the LM
-    head is never run. The original ModuleList is restored after capture.
+    risk. We use output_hidden_states=True to extract the layer output; this is slower
+    than a truncated forward but avoids model-family-specific assumptions about layer
+    truncation (Llama, Qwen, etc. break when decoder_layers is shortened).
 
     Each layer is captured independently (one forward per layer), so disk stays at one
-    pool while compute is N_layers x a (truncated) forward."""
-    import torch
+    pool while compute is N_layers x a full forward."""
     import time
-    import torch.nn as nn
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -920,32 +918,18 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
         print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
         return
 
-    # Locate the parent of decoder_layers so we can truncate and restore it.
-    text_model, attr_name, _ = _find_text_model(model, len(decoder_layers))
-    original_layers = list(decoder_layers)
-    truncated = nn.ModuleList(original_layers[: layer + 1])
-    setattr(text_model, attr_name, truncated)
-
-    cap = {}
-
-    def _hook(_module, _inp, out):
-        cap["h"] = (out[0] if isinstance(out, tuple) else out).detach()
-
-    handle = truncated[layer].register_forward_hook(_hook)
-    print(f"  [produce L{layer}] truncated capture over {n} batches ...")
+    print(f"  [produce L{layer}] hidden-states capture over {n} batches ...")
     t0 = time.time()
-    try:
-        for i in range(n):
-            ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
-            with torch.no_grad():
-                model(input_ids=ids, use_cache=False)
-            _write_shard(dst_dir, i, cap["h"])
-            if (i + 1) % 500 == 0:
-                tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
-                print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
-    finally:
-        handle.remove()
-        setattr(text_model, attr_name, nn.ModuleList(original_layers))
+    for i in range(n):
+        ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
+        with torch.no_grad():
+            out = model(input_ids=ids, use_cache=False, output_hidden_states=True)
+        # hidden_states[0] = embeddings input, hidden_states[k] = output of block k-1
+        hidden = out.hidden_states[layer + 1]
+        _write_shard(dst_dir, i, hidden)
+        if (i + 1) % 500 == 0:
+            tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
+            print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 

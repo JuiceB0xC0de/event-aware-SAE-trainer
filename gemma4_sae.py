@@ -90,7 +90,9 @@ app = modal.App("gemma4-sae-train", image=image)
     timeout=86400,  # 24 hours max per Modal limits
 )
 class SAETainer:
-    """Train SAEs on Gemma-4 layers."""
+    """Train SAEs on any HuggingFace causal LM."""
+
+    model_id: str = modal.parameter(default="google/gemma-4-e4b-it")
 
     @modal.enter()
     def setup(self):
@@ -98,15 +100,17 @@ class SAETainer:
         from huggingface_hub import snapshot_download
 
         hf_token = os.environ.get("HF_TOKEN")
-        volume_model_path = "/data/models/gemma-4-e4b"
+        model_id = self.model_id
+        slug = model_id.replace("/", "_")
+        volume_model_path = f"/data/models/{slug}"
 
         if os.path.exists(volume_model_path) and os.listdir(volume_model_path):
-            print(f"Using cached Gemma-4 E4B from volume: {volume_model_path}")
+            print(f"Using cached {model_id} from volume: {volume_model_path}")
         else:
-            print("Downloading google/gemma-4-e4b-it from HuggingFace (first run, will cache on volume)...")
+            print(f"Downloading {model_id} from HuggingFace (first run, will cache on volume)...")
             os.makedirs(volume_model_path, exist_ok=True)
             snapshot_download(
-                "google/gemma-4-e4b-it",
+                model_id,
                 local_dir=volume_model_path,
                 token=hf_token,
             )
@@ -120,7 +124,8 @@ class SAETainer:
               microbatch_tokens: int = 32768, resume_from: str | None = None,
               evict_model: bool = True, target_l0: int | None = None,
               timing: bool = False,
-              scratch_dir: str = "/root/rollcache") -> dict:
+              scratch_dir: str = "/root/rollcache",
+              model_id: str = "google/gemma-4-e4b-it") -> dict:
         """
         Train SAEs on a range of layers.
 
@@ -298,16 +303,17 @@ def main(
     target_l0: int | None = None,
     timing: bool = False,
     scratch_dir: str = "/root/rollcache",
+    model_id: str = "google/gemma-4-e4b-it",
 ):
     """
-    Train SAEs on Gemma-4 E4B layers.
+    Train SAEs on any HuggingFace causal LM.
 
     Examples:
         modal run gemma4_sae.py --layer-range 0,15 --capture rolling
-        modal run gemma4_sae.py --layer-range 15,42 --capture auto
+        modal run gemma4_sae.py --model-id meta-llama/Llama-3.2-1B --layer-range 0,16 --capture auto
         modal run gemma4_sae.py --layer-range 5,10 --capture rolling --resume-from /data/saes/data_models_gemma-4-e4b/layer_05_s0/checkpoint_full.pt
     """
-    tainer = SAETainer()
+    tainer = SAETainer(model_id=model_id)
     result = tainer.train.remote(
         layer_range=layer_range,
         capture=capture,
@@ -319,6 +325,7 @@ def main(
         target_l0=target_l0,
         timing=timing,
         scratch_dir=scratch_dir,
+        model_id=model_id,
     )
     print(f"\nTraining complete: {result['status']}")
     print(f"Layers trained: {result['layers']}")
