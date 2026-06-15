@@ -1476,6 +1476,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             "evt_fwd_bwd_end": None,
             "evt_opt_start": None,
             "evt_opt_end": None,
+            "evt_norm_start": None,
+            "evt_norm_end": None,
         }
         def _new_cuda_event():
             import torch
@@ -1572,13 +1574,23 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # inside each microbatch forward so the JumpReLU threshold gradient is live.
         # At aggressive low L0, cap AUX_K to a fraction of the target so the aux loss
         # doesn't try to revive more features than the sparsity budget allows.
+        #
+        # Dead-set cadence: recomputing the dead feature set every step costs a GPU
+        # reduce+sync (.sum().item()) plus torch.where. The set evolves slowly, so
+        # refresh it only every AUX_DEAD_THRESHOLD steps (or on the first step).
+        # Between refreshes we reuse the cached dead_indices/eff_k/n_dead.
         aux_k_eff = revival.effective_k_aux(K)
-        dead_mask_aux = revival.aux_dead_mask()
-        n_dead = int(dead_mask_aux.sum().item())
+        n_dead = 0
+        dead_indices = None
+        eff_k = 0
+        if step % AUX_DEAD_THRESHOLD == 1 or step == start_step:
+            dead_mask_aux = revival.aux_dead_mask()
+            n_dead = int(dead_mask_aux.sum().item())
+            if n_dead > 0:
+                dead_indices = torch.where(dead_mask_aux)[0]
+                eff_k = min(aux_k_eff, n_dead)
+        # else: reuse dead_indices, eff_k, n_dead from previous refresh
         revival.last_dead_count = n_dead
-        if n_dead > 0:
-            dead_indices = torch.where(dead_mask_aux)[0]
-            eff_k = min(aux_k_eff, n_dead)
 
         buffer_err_this_step = revival.should_buffer_err(step, K)
         err_candidates = [] if buffer_err_this_step else None
@@ -1665,7 +1677,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 timing["evt_opt_start"].record()
             t_opt_start = time.perf_counter()
 
-        # Single optimizer step after accumulation
+        # Single optimizer step after accumulation.
+        # grad_norm is only needed for logging/W&B, so defer the .item() sync
+        # to log steps. clip_grad_norm_ returns a tensor; we keep it as such.
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
 
         # -- W_enc gradient dampening when L0 >> target -------------------------
@@ -1682,6 +1696,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 sae.W_enc.bias.grad.mul_(wenc_factor)
 
         optimizer.step()
+
+        if do_timing:
+            timing["evt_opt_end"] = _new_cuda_event()
+            if timing["evt_opt_end"] is not None:
+                timing["evt_opt_end"].record()
+            timing["evt_norm_start"] = _new_cuda_event()
+            if timing["evt_norm_start"] is not None:
+                timing["evt_norm_start"].record()
+
         if not frozen_decoder:
             sae._normalize_decoder()
         with torch.no_grad():
@@ -1689,9 +1712,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             sae.W_enc.weight.div_(enc_norms)
 
         if do_timing:
-            timing["evt_opt_end"] = _new_cuda_event()
-            if timing["evt_opt_end"] is not None:
-                timing["evt_opt_end"].record()
+            timing["evt_norm_end"] = _new_cuda_event()
+            if timing["evt_norm_end"] is not None:
+                timing["evt_norm_end"].record()
 
         # accum_recon_loss / accum_l0 are already Python floats (summed from the
         # microbatch .item() calls); use them directly instead of bouncing through
@@ -1755,7 +1778,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             err_buffer = []
 
         recon_val = accum_recon_loss / accum_steps
-        grad_norm_val = grad_norm_t.item()
+        is_log_step = (step % LOG_EVERY == 0)
+        # grad_norm is only needed for logging/W&B; sync it only on log steps.
+        if is_log_step:
+            grad_norm_val = grad_norm_t.item()
+        else:
+            grad_norm_val = 0.0
         l0_val = accum_l0 / accum_steps
 
         if do_timing:
@@ -1766,7 +1794,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             )
             timing["n_steps"] += 1
 
-        is_log_step = (step % LOG_EVERY == 0)
         if is_log_step:
             dead = revival.dead_pct(LOG_EVERY)
             with torch.no_grad():
@@ -1787,9 +1814,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if nudge_apply and abs(nudge_val) > 0:
             with torch.no_grad():
                 sae.log_threshold.data += nudge_val
-            if step % LOG_EVERY == 0:
+            if is_log_step:
                 direction = "UP" if nudge_val > 0 else "DOWN"
-                print(f"  [THRESH NUDGE @ {step}] direction={direction} "
+                print(f"  [THRESH NUDGE @ {step}] direction={direction}"
                       f"nudge={nudge_val:+.5f} L0={l0_val:.1f} "
                       f"target={sae_cfg.target_l0:.0f} "
                       f"new_thr_mean={sae.log_threshold.exp().mean().item():.4f}")
@@ -1817,12 +1844,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if abs(new_bw - sae.ste_bandwidth) > 1e-6:
             old_bw = sae.ste_bandwidth
             sae.ste_bandwidth = new_bw
-            if step % LOG_EVERY == 0:
+            if is_log_step:
                 print(f"  [STE-BW @ {step}] bandwidth {old_bw:.4f} -> {new_bw:.4f} "
                       f"(L0={l0_val:.1f}, target={sae_cfg.target_l0:.0f}, "
                       f"overshoot={l0_val/max(sae_cfg.target_l0,1):.2f}x)")
 
-        if step % LOG_EVERY == 0:
+        if is_log_step:
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
                 fire_rate = revival.fire_rate(LOG_EVERY)
@@ -1839,6 +1866,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 for key, (start, end) in (
                     ("fwd_bwd", (timing["evt_fwd_bwd_start"], timing["evt_fwd_bwd_end"])),
                     ("opt", (timing["evt_opt_start"], timing["evt_opt_end"])),
+                    ("norm", (timing["evt_norm_start"], timing["evt_norm_end"])),
                 ):
                     if start is not None and end is not None:
                         start.synchronize()
@@ -1855,6 +1883,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                       f"provider={t_provider_avg*1000:.1f}ms "
                       f"fwd_bwd_cuda={cuda_ms['fwd_bwd']:.1f}ms "
                       f"opt_cuda={cuda_ms['opt']:.1f}ms "
+                      f"norm_cuda={cuda_ms['norm']:.1f}ms "
                       f"errbuf={t_errbuf_avg*1000:.1f}ms "
                       f"overhead={t_overhead_avg*1000:.1f}ms "
                       f"(n={n})")
@@ -1953,6 +1982,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                                "provider_ms": t_provider_avg * 1000,
                                "fwd_bwd_cuda_ms": cuda_ms["fwd_bwd"],
                                "opt_cuda_ms": cuda_ms["opt"],
+                               "norm_cuda_ms": cuda_ms["norm"],
                                "errbuf_ms": t_errbuf_avg * 1000,
                                "overhead_ms": t_overhead_avg * 1000,
                            }.items()} if do_timing else {}),
