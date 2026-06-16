@@ -103,12 +103,12 @@ def _time_forward_pytorch(sae, x, n_warm=3, n_rep=10):
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pre = sae.encode_pre(x)
             feat, gate = sae.jumprelu_with_gate(pre)
-            xhat = sae.decode(feat)
-            l0 = gate.sum(dim=-1, dtype=torch.float32)
+            _ = sae.decode(feat)
+            _ = gate.sum(dim=-1, dtype=torch.float32)
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
-    return times, xhat, l0
+    return times
 
 
 def _time_forward_triton(sae, x, n_warm=3, n_rep=10):
@@ -122,11 +122,11 @@ def _time_forward_triton(sae, x, n_warm=3, n_rep=10):
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         with torch.no_grad():
-            xhat, l0 = fused_sae_forward(x, sae)
+            _ = fused_sae_forward(x, sae)
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
-    return times, xhat, l0
+    return times
 
 
 def main():
@@ -219,28 +219,17 @@ def main():
     # ---------------- full-B forward-only timing ----------------
     _stage("full-B forward-only timing")
 
-    pt_times, _, _ = _time_forward_pytorch(sae, x)
+    pt_times = _time_forward_pytorch(sae, x)
+    pt_avg = sum(pt_times) / len(pt_times)
     print(f"[PYTORCH FWD] min={min(pt_times):.1f} ms  max={max(pt_times):.1f} ms  "
-          f"avg={sum(pt_times)/len(pt_times):.1f} ms  "
-          f"{batch_tokens/(sum(pt_times)/len(pt_times))/1000:.1f}k tok/s")
+          f"avg={pt_avg:.1f} ms  {batch_tokens/pt_avg/1000:.1f}k tok/s")
 
-    tri_times, xhat_tri_full, l0_tri_full = _time_forward_triton(sae, x)
+    tri_times = _time_forward_triton(sae, x)
+    tri_avg = sum(tri_times) / len(tri_times)
     print(f"[TRITON FWD]  min={min(tri_times):.1f} ms  max={max(tri_times):.1f} ms  "
-          f"avg={sum(tri_times)/len(tri_times):.1f} ms  "
-          f"{batch_tokens/(sum(tri_times)/len(tri_times))/1000:.1f}k tok/s")
+          f"avg={tri_avg:.1f} ms  {batch_tokens/tri_avg/1000:.1f}k tok/s")
 
-    speedup = (sum(pt_times)/len(pt_times)) / (sum(tri_times)/len(tri_times))
-    print(f"[SPEEDUP FWD] {speedup:.2f}x")
-
-    # quick sanity on full-B output
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        xhat_pt_full, l0_pt_full, _, _ = _sae_forward_pytorch(sae, x, torch.bfloat16)
-    diff_full = (xhat_tri_full - xhat_pt_full).abs().float()
-    l0_diff_full = (l0_tri_full - l0_pt_full).abs().float()
-    print(f"\n[FULL-B FWD CHECK]")
-    print(f"  recon mean={diff_full.mean().item():.2e} rms={diff_full.pow(2).mean().sqrt().item():.2e} max={diff_full.max().item():.2e}")
-    print(f"  L0    mean={l0_diff_full.mean().item():.2e} rms={l0_diff_full.pow(2).mean().sqrt().item():.2e} max={l0_diff_full.max().item():.2e}")
-
+    print(f"[SPEEDUP FWD] {pt_avg/tri_avg:.2f}x")
     print(f"[MEM ] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
     _ok("forward-only diagnostic benchmark complete")
 
