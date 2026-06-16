@@ -49,12 +49,11 @@ else:
     # BLOCK_D must divide the activation dimension cleanly; BLOCK_F can be
     # masked at the tail end of the feature dimension.
     # -----------------------------------------------------------------------
+    # Iteration/diagnostic mode: single known-good config to keep compile times
+    # bearable while correctness is being validated.  Re-enable the full sweep
+    # only after the kernel is proven correct.
     _SAE_FWD_CONFIGS = [
-        triton.Config({"BLOCK_D": 64, "BLOCK_F": 64}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_D": 64, "BLOCK_F": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_D": 64, "BLOCK_F": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_D": 32, "BLOCK_F": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_D": 32, "BLOCK_F": 256}, num_warps=8, num_stages=2),
     ]
 
     @triton.autotune(
@@ -165,13 +164,10 @@ else:
     # over token batches and accumulates gradients without ever materialising
     # the full [n_tokens, n_features] pre-activation / activation tensors.
     # -----------------------------------------------------------------------
+    # Iteration/diagnostic mode: single config.  Expand after correctness proof.
     _SAE_BWD_CONFIGS = [
         triton.Config({"BLOCK_B": 16, "BLOCK_F": 64, "BLOCK_D": 64},
                       num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_B": 32, "BLOCK_F": 64, "BLOCK_D": 64},
-                      num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_B": 16, "BLOCK_F": 128, "BLOCK_D": 64},
-                      num_warps=8, num_stages=2),
     ]
 
     @triton.autotune(
