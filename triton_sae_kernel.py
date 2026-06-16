@@ -63,7 +63,6 @@ else:
     @triton.autotune(
         configs=_SAE_FWD_CONFIGS,
         key=["d_in", "n_features"],
-        restore_value=["Out_ptr"],
     )
     @triton.jit
     def _fused_sae_fwd_kernel(
@@ -207,8 +206,6 @@ else:
 
             # Autotune on A10 will pick among the BLOCK_D/BLOCK_F configs above.
             # Set SAE_TRITON_AUTOTUNE=0 to skip autotune and use default 64/128.
-            BLOCK_D = 64
-            BLOCK_F = 128
             grid = lambda meta: (B, triton.cdiv(d_in, meta["BLOCK_D"]))
 
             _fused_sae_fwd_kernel[grid](
@@ -220,8 +217,6 @@ else:
                 stride_out_d=out.stride(0),
                 d_in=d_in,
                 n_features=n_features,
-                BLOCK_D=BLOCK_D,
-                BLOCK_F=BLOCK_F,
             )
 
             ctx.save_for_backward(x, W_enc, b_enc, W_dec, b_dec, log_threshold)
