@@ -149,6 +149,7 @@ def _hook_replay_correctness(model, input_ids, test_layers):
 def main(
     model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
     test_layers=(0, 1, 15, 29),
+    speed_targets=(0, 1, 15, 28),
     n_batches_for_speed: int = 50,
     batch_size: int = 16,
     seq_len: int = 2048,
@@ -207,31 +208,27 @@ def main(
     else:
         print("[WARN] manual rolling residuals differ from reference; see diffs above")
 
-    # speed run for layer 0 residuals
-    _stage(f"speed run: produce layer 0 residuals for {n_batches_for_speed} batches")
-    times = []
-    final_out = None
-    for b in range(n_batches_for_speed + 5):  # 5 warmup
-        ids_b = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-        torch.cuda.synchronize()
-        start_ev = torch.cuda.Event(enable_timing=True)
-        end_ev = torch.cuda.Event(enable_timing=True)
-        start_ev.record()
-        out_b = _capture_layer_residual_rolling(model, ids_b, 0)
-        end_ev.record()
-        torch.cuda.synchronize()
-        cuda = start_ev.elapsed_time(end_ev)
-        if b >= 5:
-            times.append(cuda)
-            final_out = out_b
-        if (b + 1) % 100 == 0:
-            print(f"  batch {b + 1}/{n_batches_for_speed + 5}: cuda={cuda:.1f} ms")
-
-    avg = sum(times) / len(times)
-    tok_s = (batch_size * seq_len) / (avg / 1000.0)
-    print(f"\n[SPEED] layer-0 rolling capture avg={avg:.1f} ms/batch  {tok_s/1000:.1f}k tok/s")
-    print(f"[SPEED] min={min(times):.1f} ms  max={max(times):.1f} ms")
-    print(f"[SANITY] final_out mean={final_out.float().mean().item():.4f} std={final_out.float().std().item():.4f}")
+    # chain speed run: time each target depth independently (triangular ok for probe)
+    _stage(f"chain speed run: timing targets {list(speed_targets)}")
+    for target in speed_targets:
+        times = []
+        for b in range(n_batches_for_speed + 5):  # 5 warmup
+            ids_b = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+            torch.cuda.synchronize()
+            start_ev = torch.cuda.Event(enable_timing=True)
+            end_ev = torch.cuda.Event(enable_timing=True)
+            start_ev.record()
+            _ = _capture_layer_residual_rolling(model, ids_b, target)
+            end_ev.record()
+            torch.cuda.synchronize()
+            cuda = start_ev.elapsed_time(end_ev)
+            if b >= 5:
+                times.append(cuda)
+            if (b + 1) % 100 == 0:
+                print(f"  target {target:2d} batch {b + 1}/{n_batches_for_speed + 5}: cuda={cuda:.1f} ms")
+        avg = sum(times) / len(times)
+        tok_s = (batch_size * seq_len) / (avg / 1000.0)
+        print(f"[SPEED] target layer {target:2d}: avg={avg:.1f} ms  {tok_s/1000:.1f}k tok/s  min={min(times):.1f} ms  max={max(times):.1f} ms")
     print(f"[MEM ] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
 
 
