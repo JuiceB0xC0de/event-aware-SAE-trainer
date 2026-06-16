@@ -2480,7 +2480,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     layers = list(range(start_layer, end_layer))
     print(f"  model={type(model).__name__}  blocks={len(decoder_layers)}  d_in={d_in}  "
           f"n_features={N_FEATURES} ({EXPANSION}x)  capture={capture}")
-    if capture in ("rolling", "rolling-hf") and d_in != D_IN:
+    if capture == "rolling" and d_in != D_IN:
         print(f"  [warn] rolling capture was tuned at d_in={D_IN}; model reports {d_in}")
 
     print(f"\n{'#'*60}\n  SAE ATLAS  model={_slug(MODEL_ID)}  layers={layers}  seed={seed}  "

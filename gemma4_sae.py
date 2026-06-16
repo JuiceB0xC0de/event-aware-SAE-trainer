@@ -190,7 +190,7 @@ class SAETainer:
         from sae_trainer_rolling import run_atlas_rolling
 
         print(f"\n{'='*60}")
-        print("Training SAE on Gemma-4 E4B")
+        print("Training SAE atlas")
         print(f"  Model: {self.model_path}")
         print(f"  Layers: {start}-{end} ({end-start} layers)")
         print(f"  Capture: {capture}")
