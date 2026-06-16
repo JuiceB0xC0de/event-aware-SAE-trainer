@@ -387,7 +387,8 @@ PRETOK_OUT = "/data/pretok/fineweb-edu"
     timeout=86400,
 )
 def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
-                      model_id: str, model_path: str, hf_token: str) -> int:
+                      model_id: str, model_path: str, hf_token: str,
+                      pretok_slug: str = None) -> int:
     """Stream a disjoint slice of FineWeb-Edu, tokenize it with the target model's
     tokenizer, and write one 1-D int32 token shard to
     /data/pretok/<model_slug>/shard_NN.npy.  Parallelized across containers via
@@ -406,8 +407,9 @@ def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
     _sync_repo()
     from sae_trainer_rolling import _slug
     # Match trainer's behavior: slug the full model path
-    model_slug = _slug(f"data_models_{model_id.replace('/', '_')}")
-    out_dir = f"/data/pretok/{model_slug}"
+    if pretok_slug is None:
+        pretok_slug = _slug(f"data_models_{model_id.replace('/', '_')}")
+    out_dir = f"/data/pretok/{pretok_slug}"
     os.makedirs(out_dir, exist_ok=True)
     shard_path = f"{out_dir}/shard_{shard_idx:02d}.npy"
     if os.path.exists(shard_path):
@@ -482,6 +484,11 @@ def pretokenize(
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     model_slug = model_id.replace("/", "_")
     volume_model_path = f"/data/models/{model_slug}"
+    # Import slug helper to match trainer's pretok path resolution
+    import sys
+    sys.path.insert(0, "/opt/sae-trainer")
+    from sae_trainer_rolling import _slug
+    pretok_slug = _slug(model_id)
 
     # Download model locally first (to ~/.cache/huggingface), then remote will cache on volume
     print(f"Downloading {model_id} to local cache...")
@@ -492,11 +499,11 @@ def pretokenize(
     vocab_size = tok.vocab_size
 
     # Remote function handles volume download + pretok
-    args = [(i, n_shards, tokens_per_shard, model_id, volume_model_path, hf_token) for i in range(n_shards)]
+    args = [(i, n_shards, tokens_per_shard, model_id, volume_model_path, hf_token, pretok_slug) for i in range(n_shards)]
     done = list(pretokenize_shard.starmap(args))
-    _write_pretok_manifest.remote(n_shards, model_slug, vocab_size)
+    _write_pretok_manifest.remote(n_shards, pretok_slug, vocab_size)
     print(f"\nPretokenize complete: {len(done)} shards x {tokens_per_shard/1e6:.0f}M tok "
-          f"-> /data/pretok/{model_slug}")
+          f"-> /data/pretok/{pretok_slug}")
 
 
 # =============================================================================
