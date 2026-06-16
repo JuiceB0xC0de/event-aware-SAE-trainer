@@ -163,8 +163,7 @@ class SAETainer:
               microbatch_tokens: int = 32768, resume_from: str | None = None,
               evict_model: bool = True, target_l0: int | None = None,
               timing: bool = False, compile: bool = False,
-              scratch_dir: str = "/root/rollcache",
-              model_id: str = "google/gemma-4-e4b-it") -> dict:
+              scratch_dir: str = "/root/rollcache") -> dict:
         """
         Train SAEs on a range of layers.
 
@@ -512,7 +511,6 @@ def main(
         timing=timing,
         compile=compile,
         scratch_dir=scratch_dir,
-        model_id=model_id,
     )
     print(f"\nTraining complete: {result['status']}")
     print(f"Layers trained: {result['layers']}")
