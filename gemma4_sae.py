@@ -37,7 +37,7 @@ image = (
     )
     .env({
         "TRITON_CACHE_DIR": "/tmp/triton-cache",  # Avoid permission issues
-        "SAE_USE_TRITON": "1",  # Enable Triton fused kernel experiment
+        "SAE_USE_TRITON": "0",  # Disabled: current fused kernel is ~100x slower and backward OOMs on A10
     })
     .env({})
     # Trainer modules are NOT baked into the image — they're cloned fresh from

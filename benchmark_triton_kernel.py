@@ -222,12 +222,12 @@ def main():
     pt_times = _time_forward_pytorch(sae, x)
     pt_avg = sum(pt_times) / len(pt_times)
     print(f"[PYTORCH FWD] min={min(pt_times):.1f} ms  max={max(pt_times):.1f} ms  "
-          f"avg={pt_avg:.1f} ms  {batch_tokens/pt_avg/1000:.1f}k tok/s")
+          f"avg={pt_avg:.1f} ms  {batch_tokens/pt_avg:.1f}k tok/s")
 
     tri_times = _time_forward_triton(sae, x)
     tri_avg = sum(tri_times) / len(tri_times)
     print(f"[TRITON FWD]  min={min(tri_times):.1f} ms  max={max(tri_times):.1f} ms  "
-          f"avg={tri_avg:.1f} ms  {batch_tokens/tri_avg/1000:.1f}k tok/s")
+          f"avg={tri_avg:.1f} ms  {batch_tokens/tri_avg:.1f}k tok/s")
 
     print(f"[SPEEDUP FWD] {pt_avg/tri_avg:.2f}x")
     print(f"[MEM ] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")

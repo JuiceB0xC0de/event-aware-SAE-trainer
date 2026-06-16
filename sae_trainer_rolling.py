@@ -119,8 +119,14 @@ DEFAULT_SEED   = 0
 # Numeric encoding of scheduler phase for W&B plotting (string is logged too).
 _PHASE_IDX = {"DESCENT": 0, "PIN": 1, "FINETUNE": 2}
 
-# Triton fused kernel flag - set via env var SAE_USE_TRITON=1
-USE_TRITON = os.environ.get("SAE_USE_TRITON", "0").lower() in ("1", "true", "yes", "on")
+# Triton fused kernel flag - DISABLED.
+# The current fused kernel is ~100x slower than PyTorch forward-only and its
+# backward kernel exceeds A10 shared-memory limits. Keep the env-var read for
+# future kernels, but force the path off until a new implementation exists.
+_USE_TRITON_ENV = os.environ.get("SAE_USE_TRITON", "0").lower() in ("1", "true", "yes", "on")
+USE_TRITON = False
+if _USE_TRITON_ENV:
+    print("[TRITON] SAE_USE_TRITON=1 ignored: current kernel is disabled (see sae_trainer_rolling.py)")
 
 
 def _aggressive_k_aux_k(target_l0: int) -> int:
