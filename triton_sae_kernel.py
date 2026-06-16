@@ -355,8 +355,11 @@ else:
             # under autocast), accumulating internally in fp32.
             dt = x.dtype
             x_c = (x - b_dec).to(dt)
-            W_enc_T = W_enc.to(dt).t()          # [d_in, n_features]
-            W_dec_T = W_dec.to(dt).t()          # [n_features, d_in]
+            # Transpose AND make contiguous so the Triton loads see the expected
+            # row-major strides (W_enc.weight is [n_features, d_in], so .t() is
+            # a strided view, not contiguous).
+            W_enc_T = W_enc.to(dt).t().contiguous()          # [d_in, n_features]
+            W_dec_T = W_dec.to(dt).t().contiguous()          # [n_features, d_in]
             b_enc_k = b_enc.to(dt)
             b_dec_k = b_dec.to(dt)
             log_thr_k = log_threshold.to(dt)
