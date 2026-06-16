@@ -53,7 +53,7 @@ image = (
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
         # Synchronous CUDA errors so assert/oom tracebacks point at the real line.
-        "CUDA_LAUNCH_BLOCKING": "1",
+        # "CUDA_LAUNCH_BLOCKING": "1",  # Debug-only; kills async overlap and pool capture throughput
     })
 )
 # =============================================================================
