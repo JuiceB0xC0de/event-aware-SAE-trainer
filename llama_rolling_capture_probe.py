@@ -148,10 +148,10 @@ def _hook_replay_correctness(model, input_ids, test_layers):
 
 def main(
     model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
-    test_layers=(0, 1, 15, 28),
+    test_layers=(0, 1, 15, 29),
     n_batches_for_speed: int = 50,
-    batch_size: int = 1,
-    seq_len: int = 128,
+    batch_size: int = 16,
+    seq_len: int = 2048,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
