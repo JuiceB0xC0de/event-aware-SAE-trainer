@@ -122,7 +122,8 @@ def main():
         max_thr = threshold.max().item()
         b_enc_off = sae.W_enc.bias - (max_thr + 10.0)
     sae_off = _make_sae(d_in=d_in, n_features=n_features, seed=0).to(device)
-    sae_off.W_enc.bias.data.copy_(b_enc_off)
+    with torch.no_grad():
+        sae_off.W_enc.bias.copy_(b_enc_off)
     xhat_off, l0_off = fused_sae_forward(x, sae_off)
     b_dec_off = sae_off.b_dec
     off_err = (xhat_off - b_dec_off).abs().max().item()
@@ -134,7 +135,8 @@ def main():
     # all-on-ish: drive every preactivation far above threshold
     b_enc_on = sae.W_enc.bias + (max_thr + 10.0)
     sae_on = _make_sae(d_in=d_in, n_features=n_features, seed=0).to(device)
-    sae_on.W_enc.bias.data.copy_(b_enc_on)
+    with torch.no_grad():
+        sae_on.W_enc.bias.copy_(b_enc_on)
     xhat_tri_on, l0_tri_on = fused_sae_forward(x, sae_on)
     with torch.no_grad():
         pre_on = (x - sae_on.b_dec) @ sae_on.W_enc.weight.t() + b_enc_on
@@ -172,9 +174,8 @@ def main():
     _report("Triton vs PyTorch fp32", xhat_fp32, l0_fp32, xhat_tri, l0_tri)
     _report("Triton vs kernel-math emulation", xhat_kmath, l0_kmath, xhat_tri, l0_tri)
 
-    # Gate agreement statistics (default threshold).
-    with torch.no_grad():
-        gate_tri = ((xhat_tri - sae.b_dec) @ sae.W_dec.weight.t().inverse() is None)  # can't invert; skip
+    # Gate agreement statistics would require materialising [B, n_features];
+    # skip in this fused-kernel diagnostic.
     _warn("gate agreement not computed (would require full pre materialisation)")
 
     # ---------------- backward correctness (against bf16 autocast, the real baseline) ----------------
