@@ -6,9 +6,7 @@ Run inside Modal or any CUDA box:
     python llama_rolling_capture_probe.py
 """
 import time
-import numpy as np
 import torch
-from pathlib import Path
 from transformers import AutoModelForCausalLM
 
 
@@ -26,7 +24,7 @@ def _mem():
 
 def _make_causal_mask(S, device, dtype):
     """Manual causal mask [1,1,S,S]; 0 where allowed, large negative where masked."""
-    mask = torch.triu(torch.full((S, S), float('-inf'), device=device, dtype=dtype), diagonal=1)
+    mask = torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
     return mask.unsqueeze(0).unsqueeze(0)
 
 
@@ -35,7 +33,7 @@ def _build_invariants(model, input_ids):
     with torch.no_grad():
         inputs_embeds = model.model.embed_tokens(input_ids)
         B, S, D = inputs_embeds.shape
-        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
         attention_mask = _make_causal_mask(S, input_ids.device, inputs_embeds.dtype)
         position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids)
     return {
@@ -46,7 +44,7 @@ def _build_invariants(model, input_ids):
     }
 
 
-def _run_block_rolling(layer, hidden, inv, layer_idx: int):
+def _run_block_rolling(layer, hidden, inv):
     """Execute one Llama decoder layer in rolling mode."""
     with torch.no_grad():
         hidden = layer(
@@ -64,7 +62,7 @@ def _capture_layer_residual_rolling(model, input_ids, target_layer: int):
     inv = _build_invariants(model, input_ids)
     hidden = inv["inputs_embeds"]
     for i in range(target_layer + 1):
-        hidden = _run_block_rolling(model.model.layers[i], hidden, inv, i)
+        hidden = _run_block_rolling(model.model.layers[i], hidden, inv)
     return hidden
 
 
@@ -78,8 +76,7 @@ def _reference_hidden(model, input_ids, target_layer: int):
 
 def main(
     model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
-    token_pool_dir: str = "/root/rollcache/tokens_huggingfacetb_smollm2-135m-instruct_s0",
-    test_layers=(0, 15, 29),
+    test_layers=(0, 1, 15, 29),
     n_batches_for_speed: int = 500,
     batch_size: int = 16,
     seq_len: int = 2048,
@@ -96,68 +93,44 @@ def main(
         device_map="cpu",
     )
     model.eval()
+    vocab_size = model.config.vocab_size
     torch.cuda.synchronize()
     print(f"[TIME] load to CPU: {(time.perf_counter() - t0) * 1000:.1f} ms")
 
-    # token pool
-    tok_dir = Path(token_pool_dir)
-    shards = sorted(tok_dir.glob("shard_*.npy"))
-    if not shards:
-        raise RuntimeError(f"No token shards in {tok_dir}")
-    ids_all = np.load(shards[0])
-    n_tokens_avail = (ids_all.shape[0] // (batch_size * seq_len)) * batch_size * seq_len
-    ids_all = torch.from_numpy(ids_all[:n_tokens_avail]).to(device)
+    _stage("move model to GPU for correctness reference")
+    model = model.to(device)
+    torch.cuda.synchronize()
+    print(f"[MEM after model to GPU] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
 
     _stage(f"correctness check on B={batch_size} x S={seq_len}")
-    sample_ids = ids_all[:batch_size * seq_len].view(batch_size, seq_len).long()
+    sample_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
 
+    ok = True
     for L in test_layers:
-        ref = _reference_hidden(model, sample_ids.to(device), L).to(device)
-        # move layer to GPU for rolling
-        layer = model.model.layers[L].to(device)
-        # need all prior layers too
-        prior_layers = [model.model.layers[i].to(device) for i in range(L)]
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
-        model.model.rotary_emb = model.model.rotary_emb.to(device)
-        rolling = _capture_layer_residual_rolling(model, sample_ids.to(device), L)
+        ref = _reference_hidden(model, sample_ids, L)
+        rolling = _capture_layer_residual_rolling(model, sample_ids, L)
         err = (ref - rolling).abs().max().item()
         print(f"  layer {L:2d}: max abs diff = {err:.4f}")
-        # move back to CPU to free GPU mem
-        layer.to("cpu")
-        for pl in prior_layers:
-            pl.to("cpu")
-        model.model.embed_tokens.to("cpu")
-        model.model.rotary_emb.to("cpu")
-        torch.cuda.empty_cache()
+        if err > 1e-2:
+            ok = False
+            print(f"    [FAIL] layer {L} diff exceeds 1e-2")
 
-    _ok("correctness checks passed" if all(True for _ in test_layers) else "see diffs")
+    if ok:
+        _ok("rolling residuals match reference within tolerance")
+    else:
+        print("[WARN] some rolling residuals differ from reference; see diffs above")
 
     # speed run for layer 0 residuals
     _stage(f"speed run: produce layer 0 residuals for {n_batches_for_speed} batches")
-    model.model.embed_tokens = model.model.embed_tokens.to(device)
-    model.model.rotary_emb = model.model.rotary_emb.to(device)
-    layer0 = model.model.layers[0].to(device)
-
-    # warm
-    ids0 = ids_all[:batch_size * seq_len].view(batch_size, seq_len).long()
-    for _ in range(3):
-        _ = _capture_layer_residual_rolling(model, ids0, 0)
-    torch.cuda.synchronize()
-
     times = []
-    n_tok_total = 0
     for b in range(n_batches_for_speed):
-        start = b * batch_size * seq_len
-        end = start + batch_size * seq_len
-        ids_b = ids_all[start:end].view(batch_size, seq_len).long()
-        n_tok_total += ids_b.numel()
-
+        ids_b = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         start_ev.record()
-        h = _capture_layer_residual_rolling(model, ids_b, 0)
+        _ = _capture_layer_residual_rolling(model, ids_b, 0)
         end_ev.record()
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
