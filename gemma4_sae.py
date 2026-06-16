@@ -255,6 +255,7 @@ class SAETainer:
         _sync_repo()
         sys.path.insert(0, "/opt/sae-trainer")
         env = os.environ.copy()
+        print("[SAETainer.benchmark_kernel] launching isolated benchmark subprocess...")
         proc = subprocess.run(
             [sys.executable, "/opt/sae-trainer/benchmark_triton_kernel.py"],
             cwd="/opt/sae-trainer",
@@ -262,9 +263,12 @@ class SAETainer:
             capture_output=True,
             text=True,
         )
+        print("[SAETainer.benchmark_kernel] ----- STDOUT -----")
         print(proc.stdout)
+        print("[SAETainer.benchmark_kernel] ----- STDERR -----")
+        print(proc.stderr)
+        print("[SAETainer.benchmark_kernel] ----- END -----")
         if proc.returncode != 0:
-            print(proc.stderr)
             raise RuntimeError(f"benchmark failed with code {proc.returncode}")
         return {"status": "ok", "stdout": proc.stdout}
 
