@@ -14,20 +14,21 @@ The scheduler and the training loop are MODEL-AGNOSTIC: they consume a stream of
 activation batches from a provider and never touch model internals. How activations
 are produced is pluggable (`--capture`):
 
-  auto     (default) -- forward-hook the residual stream of any AutoModelForCausalLM.
-                        Correct by construction (observes the real forward). Re-runs a
-                        (truncated) forward per layer: 1 pool of disk, N x compute.
-  rolling  (opt-in)  -- single-block walk: load the model once, run only block L over
-                        the residual cached from block L-1. 1 pool of disk AND ~1
-                        forward total -- a big VRAM/compute win, but its block-
-                        invocation machinery is Gemma-3n/4-family specific (per-layer
-                        embeddings, sliding/full attention types, KV sharing -> the
-                        layers-0..14 HARD_STOP). Guarded by validate_rolling_cache.py,
-                        which checks this single-block path bit-exact vs a full forward.
+  auto         (default) -- forward-hook the residual stream of any AutoModelForCausalLM.
+                            Correct by construction (observes the real forward). Re-runs a
+                            (truncated) forward per layer: 1 pool of disk, N x compute.
+  rolling      (opt-in)  -- Gemma-3n/4 single-block walk. Gemma-specific invariants
+                            (per-layer embeddings, sliding/full masks, KV sharing).
+                            Guarded by validate_rolling_cache.py.
+  rolling-hf   (opt-in)  -- generic Llama/SmolLM2/Qwen-style single-block walk using
+                            the model's own rotary_emb and position_embeddings. Same
+                            disk/compute win as rolling, but works for any HF decoder
+                            whose layers accept position_embeddings.
 
 Run (plain Python, expects a CUDA GPU; H100/A100 target):
     python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B --end-layer 16
     python sae_trainer_rolling.py --capture rolling --end-layer 15      # Gemma fast path
+    python sae_trainer_rolling.py --model-id HuggingFaceTB/SmolLM2-135M-Instruct --capture rolling-hf --end-layer 30  # Llama-style fast path
     python sae_trainer_rolling.py --hub-id me/my-saes --wandb-project my-run
 
 Config: $SAE_DATA_DIR (default ./data), $SAE_MODEL_ID, $SAE_HUB_ID, $WANDB_PROJECT,
@@ -769,6 +770,92 @@ def _run_block(decoder_layers, tcfg, layer, hidden, inv):
             past_key_values=None,
         )
     return out[0] if isinstance(out, tuple) else out
+
+
+def _is_hf_rolling_supported(text_model, decoder_layers):
+    """True for Llama/SmolLM2/Qwen-style decoders that expose shared rotary embeddings."""
+    import inspect
+    if not hasattr(text_model, "embed_tokens"):
+        return False
+    if not hasattr(text_model, "rotary_emb"):
+        return False
+    if len(decoder_layers) == 0:
+        return False
+    try:
+        sig = inspect.signature(decoder_layers[0].forward)
+        return "position_embeddings" in sig.parameters
+    except Exception:
+        return False
+
+
+def _make_llama_invariants(text_model, ids):
+    """Per-batch invariants for generic HF decoder rolling single-block capture.
+
+    Mirrors the head of LlamaModel.forward: shared position_ids and rotary cos/sin
+    passed to every decoder layer. The layer builds its own causal mask when
+    attention_mask=None.
+    """
+    import torch
+    with torch.no_grad():
+        inputs_embeds = text_model.embed_tokens(ids)
+        S = inputs_embeds.shape[1]
+        cache_position = torch.arange(S, device=ids.device)
+        position_ids = cache_position.unsqueeze(0)
+        position_embeddings = text_model.rotary_emb(inputs_embeds, position_ids=position_ids)
+    return {
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "position_embeddings": position_embeddings,
+    }
+
+
+def _run_hf_block(layer, hidden, inv):
+    """Run one Llama-like decoder layer in rolling mode."""
+    import torch
+    with torch.no_grad():
+        out = layer(
+            hidden,
+            attention_mask=inv["attention_mask"],
+            position_ids=inv["position_ids"],
+            position_embeddings=inv["position_embeddings"],
+            use_cache=False,
+        )
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _produce_pool_hf_rolling(model, text_model, decoder_layers, layer, tok_dir, src_dir,
+                             dst_dir, device):
+    """Generic HF single-block rolling capture (Llama/SmolLM2/Qwen).
+
+    layer 0: embed_tokens + block 0 over the token pool.
+    layer>=1: block L over src_dir (= pool[L-1]).
+    """
+    import time
+    import torch
+
+    tok_paths = _shard_paths(tok_dir)
+    n = len(tok_paths)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if len(_shard_paths(dst_dir)) >= n:
+        print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
+        return
+
+    print(f"  [produce L{layer}] HF rolling block {layer} over {n} batches ...")
+    t0 = time.time()
+    for i in range(n):
+        ids = _read_shard(tok_dir, i).to(device)
+        inv = _make_llama_invariants(text_model, ids)
+        if layer == 0:
+            hidden = inv["inputs_embeds"]
+        else:
+            hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds"].dtype)
+        out = _run_hf_block(decoder_layers[layer], hidden, inv)
+        _write_shard(dst_dir, i, out)
+        if (i + 1) % 500 == 0:
+            tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
+            print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
+    print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
 # ===========================================================================
@@ -2309,7 +2396,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     """Train one SAE per decoder layer in [start_layer, end_layer).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
-             "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized).
+             "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized);
+             "rolling-hf" = generic Llama/SmolLM2/Qwen single-block walk (no HARD_STOP).
     pool_batches: activation batches cached per layer (default 4000; use 500-1000 for limited disk)
     microbatch_tokens: tokens per microbatch for gradient accumulation (default = no accum)
     resume_from: path to checkpoint_full.pt to resume from
@@ -2337,7 +2425,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     if wandb_project is not None:
         WANDB_PROJECT = wandb_project
 
-    assert capture in ("auto", "rolling"), f"unknown --capture {capture!r}"
+    assert capture in ("auto", "rolling", "rolling-hf"), f"unknown --capture {capture!r}"
     if capture == "rolling" and end_layer > HARD_STOP_LAYER:
         print(f"  [scope] rolling clamps end_layer {end_layer} -> {HARD_STOP_LAYER} "
               f"(Gemma KV-share boundary)")
@@ -2380,6 +2468,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     d_in = int(getattr(tcfg, "hidden_size", D_IN))
     N_FEATURES = EXPANSION * d_in              # SAE dict scales with the detected width
     text_model, attr_name, decoder_layers = _find_text_model(model, n_layers)
+    if capture == "rolling-hf" and not _is_hf_rolling_supported(text_model, decoder_layers):
+        print(f"  [warn] --capture rolling-hf not supported for {type(text_model).__name__}; "
+              f"falling back to auto")
+        capture = "auto"
     model.to(device)
 
     end_layer = min(end_layer, n_layers)
@@ -2388,7 +2480,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     layers = list(range(start_layer, end_layer))
     print(f"  model={type(model).__name__}  blocks={len(decoder_layers)}  d_in={d_in}  "
           f"n_features={N_FEATURES} ({EXPANSION}x)  capture={capture}")
-    if capture == "rolling" and d_in != D_IN:
+    if capture in ("rolling", "rolling-hf") and d_in != D_IN:
         print(f"  [warn] rolling capture was tuned at d_in={D_IN}; model reports {d_in}")
 
     print(f"\n{'#'*60}\n  SAE ATLAS  model={_slug(MODEL_ID)}  layers={layers}  seed={seed}  "
@@ -2402,8 +2494,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # Auto/hook capture is independent per layer -- only one pool is on disk at a
     # time (plus resume-copy headroom), so the 2x pipeline term over-estimates peak
     # and would falsely block valid auto runs.
-    pool_multiplier = 2.2 if capture == "rolling" else 1.2
-    n_pools_desc = "2 pipelined pools" if capture == "rolling" else "1 pool"
+    pool_multiplier = 2.2 if capture in ("rolling", "rolling-hf") else 1.2
+    n_pools_desc = "2 pipelined pools" if capture in ("rolling", "rolling-hf") else "1 pool"
     peak_gb = pool_batches * shard_gb * pool_multiplier + 4
     free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
     sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
@@ -2433,7 +2525,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     t0 = time.time()
     # rolling must walk from 0 to build the residual chain; hook capture is independent
     # per layer, so it starts at start_layer.
-    walk_start = 0 if capture == "rolling" else start_layer
+    walk_start = 0 if capture in ("rolling", "rolling-hf") else start_layer
 
     # -- rolling resume: if a previous run persisted the last completed layer's pool,
     #    resume the chain from that layer instead of regenerating everything from 0.
@@ -2454,7 +2546,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         except Exception:
             pass
 
-    if capture == "rolling":
+    if capture in ("rolling", "rolling-hf"):
         if resume_from and explicit_resume_layer >= 0:
             # Explicit --resume-from under rolling: we must regenerate the full residual
             # chain from L0 up to the target layer because the persistent resume pool is
@@ -2473,7 +2565,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     for L in range(walk_start, end_layer):
         dst_dir = pool_dir_for(L)
-        if capture == "rolling":
+        if capture in ("rolling", "rolling-hf"):
             src_dir = pool_dir_for(L - 1) if L >= 1 else None
             consume_src = True
             if L == resume_layer + 1 and resume_layer >= 0:
@@ -2481,17 +2573,25 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # Do not consume it -- it stays on disk until the next layer finishes.
                 src_dir = _resume_pool_dir(seed)
                 consume_src = False
-            _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
-                          dst_dir, device)
+            if capture == "rolling":
+                _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
+                              dst_dir, device)
+            else:
+                _produce_pool_hf_rolling(model, text_model, decoder_layers, L, tok_dir, src_dir,
+                                         dst_dir, device)
             # Pipeline: while the LLM is still hot on GPU, pre-produce the next layer's pool.
             # When training L finishes, pool L+1 is already on disk and we start immediately.
             pre_produced_next = False
-            if L + 1 < end_layer and capture == "rolling":
+            if L + 1 < end_layer:
                 next_dir = pool_dir_for(L + 1)
                 if len(_shard_paths(next_dir)) < pool_batches:
                     print(f"  [pipeline] pre-producing pool L{L+1} while model hot ...")
-                    _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
-                                  dst_dir, next_dir, device)
+                    if capture == "rolling":
+                        _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
+                                      dst_dir, next_dir, device)
+                    else:
+                        _produce_pool_hf_rolling(model, text_model, decoder_layers, L + 1,
+                                                 tok_dir, dst_dir, next_dir, device)
                     pre_produced_next = True
                 else:
                     print(f"  [pipeline] pool L{L+1} already present")
@@ -2535,7 +2635,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         if evict_model:
             model.to(device)
 
-        if capture == "rolling":
+        if capture in ("rolling", "rolling-hf"):
             # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
@@ -2583,8 +2683,9 @@ def main():
                     "retuning. Default capture works on any AutoModelForCausalLM.")
     p.add_argument("--model-id", default=None,
                    help=f"HF model id to train SAEs on (default {MODEL_ID})")
-    p.add_argument("--capture", choices=["auto", "rolling"], default="auto",
-                   help="auto=model-agnostic forward-hook (default); rolling=Gemma single-block fast path")
+    p.add_argument("--capture", choices=["auto", "rolling", "rolling-hf"], default="auto",
+                   help="auto=model-agnostic forward-hook (default); rolling=Gemma single-block fast path; "
+                        "rolling-hf=generic Llama/SmolLM2/Qwen single-block fast path")
     p.add_argument("--start-layer", type=int, default=0)
     p.add_argument("--end-layer", type=int, default=9,
                    help="exclusive; clamped to model depth (and to 15 under --capture rolling)")
