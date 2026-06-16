@@ -118,7 +118,7 @@ def _sync_repo():
 
 
 @app.cls(
-    gpu="A10G",  # 24GB VRAM - enough for SmolLM2-360M with room to profile
+    gpu="A100-40GB",  # 24GB VRAM - enough for SmolLM2-360M with room to profile
     volumes={"/data": data_volume},
     ephemeral_disk=524_288,  # 512 GiB container-local NVMe
     secrets=[modal.Secret.from_name("huggingface")],
