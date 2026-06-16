@@ -122,7 +122,7 @@ def main():
         max_thr = threshold.max().item()
         b_enc_off = sae.W_enc.bias - (max_thr + 10.0)
     sae_off = _make_sae(d_in=d_in, n_features=n_features, seed=0).to(device)
-    sae_off.W_enc.bias.copy_(b_enc_off)
+    sae_off.W_enc.bias.data.copy_(b_enc_off)
     xhat_off, l0_off = fused_sae_forward(x, sae_off)
     b_dec_off = sae_off.b_dec
     off_err = (xhat_off - b_dec_off).abs().max().item()
@@ -134,7 +134,7 @@ def main():
     # all-on-ish: drive every preactivation far above threshold
     b_enc_on = sae.W_enc.bias + (max_thr + 10.0)
     sae_on = _make_sae(d_in=d_in, n_features=n_features, seed=0).to(device)
-    sae_on.W_enc.bias.copy_(b_enc_on)
+    sae_on.W_enc.bias.data.copy_(b_enc_on)
     xhat_tri_on, l0_tri_on = fused_sae_forward(x, sae_on)
     with torch.no_grad():
         pre_on = (x - sae_on.b_dec) @ sae_on.W_enc.weight.t() + b_enc_on
