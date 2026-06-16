@@ -169,7 +169,7 @@ class SAETainer:
 
         Args:
             layer_range: "start,end" e.g. "0,15" or "15,42"
-            capture: "rolling" (layers 0-14) or "auto" (any layer)
+            capture: "rolling" (Gemma 0-14), "rolling-hf" (Llama/SmolLM2/Qwen), or "auto" (any layer)
             expansion: SAE expansion factor (default 32)
             pool_batches: activation batches to cache (default 2000)
             max_steps: max training steps per layer
