@@ -127,7 +127,7 @@ def _sync_repo():
 class SAETainer:
     """Train SAEs on any HuggingFace causal LM."""
 
-    model_id: str = modal.parameter(default="HuggingFaceTB/SmolLM2-360M")
+    model_id: str = modal.parameter(default="HuggingFaceTB/SmolLM2-135M-Instruct")
 
     @modal.enter()
     def setup(self):

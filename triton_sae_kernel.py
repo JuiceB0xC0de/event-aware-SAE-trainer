@@ -205,6 +205,7 @@ else:
         # --- dims ---
         n_tokens: tl.constexpr,
         d_in: tl.constexpr,
+        d_in_padded: tl.constexpr,
         n_features: tl.constexpr,
         eps: tl.constexpr,
         # --- tile sizes ---
@@ -246,15 +247,15 @@ else:
             mask_b = b_range < n_tokens
 
             # Load the full-d token tile for pre-activation recomputation.
-            # x_c and grad_out are [BLOCK_B, d_in].
+            # x_c and grad_out are [BLOCK_B, d_in_padded] with padding masked out.
             x_c = tl.load(
-                X_c_ptr + b_range[:, None] * stride_x_d + tl.arange(0, d_in)[None, :],
-                mask=mask_b[:, None],
+                X_c_ptr + b_range[:, None] * stride_x_d + tl.arange(0, d_in_padded)[None, :],
+                mask=mask_b[:, None] & (tl.arange(0, d_in_padded)[None, :] < d_in),
                 other=0.0,
             ).to(tl.float32)
             grad_out = tl.load(
-                GradOut_ptr + b_range[:, None] * stride_gradout_d + tl.arange(0, d_in)[None, :],
-                mask=mask_b[:, None],
+                GradOut_ptr + b_range[:, None] * stride_gradout_d + tl.arange(0, d_in_padded)[None, :],
+                mask=mask_b[:, None] & (tl.arange(0, d_in_padded)[None, :] < d_in),
                 other=0.0,
             ).to(tl.float32)
             grad_l0_b = tl.load(GradL0_ptr + b_range, mask=mask_b, other=0.0).to(tl.float32)
@@ -262,8 +263,8 @@ else:
             # ---- ENCODE: pre[f_range] = x_c @ W_enc[:, f_range] + b_enc[f_range]
             # W_enc is passed transposed: [d_in, n_features].
             w_enc_f = tl.load(
-                W_enc_ptr + tl.arange(0, d_in)[:, None] * stride_wenc_f + f_range[None, :],
-                mask=mask_f[None, :],
+                W_enc_ptr + tl.arange(0, d_in_padded)[:, None] * stride_wenc_f + f_range[None, :],
+                mask=(tl.arange(0, d_in_padded)[:, None] < d_in) & mask_f[None, :],
                 other=0.0,
             ).to(tl.float32)
             pre_f = tl.dot(x_c, w_enc_f, allow_tf32=False) + b_enc_f  # [BLOCK_B, BLOCK_F]
@@ -274,8 +275,8 @@ else:
 
             # ---- grad through decoder: grad_feat = grad_out @ W_dec[:, f_range]
             w_dec_f = tl.load(
-                W_dec_ptr + tl.arange(0, d_in)[:, None] * stride_wdec_f + f_range[None, :],
-                mask=mask_f[None, :],
+                W_dec_ptr + tl.arange(0, d_in_padded)[:, None] * stride_wdec_f + f_range[None, :],
+                mask=(tl.arange(0, d_in_padded)[:, None] < d_in) & mask_f[None, :],
                 other=0.0,
             ).to(tl.float32)
             grad_feat_f = tl.dot(grad_out, w_dec_f, allow_tf32=False)  # [BLOCK_B, BLOCK_F]
@@ -318,16 +319,11 @@ else:
             acc_gwdec,
             mask=mask_d[:, None] & mask_f[None, :],
         )
-        tl.store(
-            Grad_b_enc_ptr + f_range,
-            acc_gbenc,
-            mask=mask_f,
-        )
-        tl.store(
-            Grad_log_thr_ptr + f_range,
-            acc_gthr,
-            mask=mask_f,
-        )
+        # grad_b_enc and grad_log_threshold are summed over all d_tiles for a
+        # fixed f_tile.  Multiple programs write to the same f_range, so use
+        # atomic_add to avoid the last-writer-wins race.
+        tl.atomic_add(Grad_b_enc_ptr + f_range, acc_gbenc, mask=mask_f)
+        tl.atomic_add(Grad_log_thr_ptr + f_range, acc_gthr, mask=mask_f)
 
 
     class FusedSAEForward(torch.autograd.Function):
@@ -406,8 +402,17 @@ else:
             # Output gradient buffers.
             grad_W_enc = torch.empty_like(W_enc)
             grad_W_dec = torch.empty_like(W_dec)
-            grad_b_enc = torch.empty_like(b_enc)
-            grad_log_threshold = torch.empty_like(log_threshold)
+            grad_b_enc = torch.zeros_like(b_enc)
+            grad_log_threshold = torch.zeros_like(log_threshold)
+
+            # Triton tl.arange wants power-of-2 lengths; pad d_in up.
+            d_in_padded = 1
+            while d_in_padded < d_in:
+                d_in_padded *= 2
+
+            # Make transposed weights contiguous for coalesced loads.
+            W_enc_bwd = W_enc.t().contiguous()   # [d_in, n_features]
+            W_dec_bwd = W_dec.t().contiguous()   # [d_in, n_features]
 
             grid = lambda meta: (
                 triton.cdiv(n_features, meta["BLOCK_F"]),
@@ -418,8 +423,8 @@ else:
                 x_c,
                 grad_out_t,
                 grad_l0,
-                W_enc.t(),
-                W_dec.t(),
+                W_enc_bwd,
+                W_dec_bwd,
                 b_enc,
                 log_threshold,
                 grad_W_enc,
@@ -428,14 +433,15 @@ else:
                 grad_log_threshold,
                 stride_x_d=x_c.stride(0),
                 stride_gradout_d=grad_out_t.stride(0),
-                stride_wenc_f=W_enc.t().stride(0),
-                stride_wdec_f=W_dec.t().stride(0),
+                stride_wenc_f=W_enc_bwd.stride(0),
+                stride_wdec_f=W_dec_bwd.stride(0),
                 stride_gwenc_f=grad_W_enc.stride(0),
                 stride_gwenc_d=grad_W_enc.stride(1),
                 stride_gwdec_d=grad_W_dec.stride(0),
                 stride_gwdec_f=grad_W_dec.stride(1),
                 n_tokens=B,
                 d_in=d_in,
+                d_in_padded=d_in_padded,
                 n_features=n_features,
                 eps=float(bandwidth),
             )
