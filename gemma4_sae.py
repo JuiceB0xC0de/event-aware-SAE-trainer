@@ -321,6 +321,33 @@ class SAETainer:
         return {"status": "ok", "stdout": proc.stdout}
 
     @modal.method()
+    def probe_llama_rolling_capture(self) -> dict:
+        """Run standalone Llama/SmolLM2 rolling-capture probe on A10."""
+        import os
+        import subprocess
+        import sys
+
+        _sync_repo()
+        sys.path.insert(0, "/opt/sae-trainer")
+        env = os.environ.copy()
+        env["SAE_USE_TRITON"] = "0"
+        proc = subprocess.run(
+            [sys.executable, "/opt/sae-trainer/llama_rolling_capture_probe.py"],
+            cwd="/opt/sae-trainer",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        print("[SAETainer.probe_llama_rolling_capture] ----- STDOUT -----")
+        print(proc.stdout)
+        print("[SAETainer.probe_llama_rolling_capture] ----- STDERR -----")
+        print(proc.stderr)
+        print("[SAETainer.probe_llama_rolling_capture] ----- END -----")
+        if proc.returncode != 0:
+            raise RuntimeError(f"probe failed with code {proc.returncode}")
+        return {"status": "ok", "stdout": proc.stdout}
+
+    @modal.method()
     def debug_kernel(self) -> dict:
         """Run the tiny debug script that prints Triton vs PyTorch intermediates."""
         import os
