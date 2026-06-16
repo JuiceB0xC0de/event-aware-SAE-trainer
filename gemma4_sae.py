@@ -268,6 +268,29 @@ class SAETainer:
             raise RuntimeError(f"benchmark failed with code {proc.returncode}")
         return {"status": "ok", "stdout": proc.stdout}
 
+    @modal.method()
+    def debug_kernel(self) -> dict:
+        """Run the tiny debug script that prints Triton vs PyTorch intermediates."""
+        import os
+        import subprocess
+        import sys
+
+        _sync_repo()
+        sys.path.insert(0, "/opt/sae-trainer")
+        env = os.environ.copy()
+        proc = subprocess.run(
+            [sys.executable, "/opt/sae-trainer/debug_triton_kernel.py"],
+            cwd="/opt/sae-trainer",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        print(proc.stdout)
+        if proc.returncode != 0:
+            print(proc.stderr)
+            raise RuntimeError(f"debug failed with code {proc.returncode}")
+        return {"status": "ok", "stdout": proc.stdout}
+
 
 # =============================================================================
 # Pre-tokenization (build /data/pretok/fineweb-edu shards -- the fast data path)
