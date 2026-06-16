@@ -66,16 +66,16 @@ def _kernel_math_emulation(sae, x, dtype=torch.bfloat16):
 
 
 def _report(ref_label, xhat_ref, l0_ref, xhat_tri, l0_tri):
-    diff = (xhat_tri - xhat_ref).abs()
-    l0_diff = (l0_tri - l0_ref).abs()
+    diff = (xhat_tri - xhat_ref).abs().float()
+    l0_diff = (l0_tri - l0_ref).abs().float()
     print(f"\n[REPORT] {ref_label}")
-    print(f"  recon p50={diff.float().quantile(0.50).item():.2e}  "
-          f"p95={diff.float().quantile(0.95).item():.2e}  "
-          f"p99={diff.float().quantile(0.99).item():.2e}  "
+    print(f"  recon p50={diff.quantile(0.50).item():.2e}  "
+          f"p95={diff.quantile(0.95).item():.2e}  "
+          f"p99={diff.quantile(0.99).item():.2e}  "
           f"max={diff.max().item():.2e}  mean={diff.mean().item():.2e}")
-    print(f"  L0    p50={l0_diff.float().quantile(0.50).item():.2e}  "
-          f"p95={l0_diff.float().quantile(0.95).item():.2e}  "
-          f"p99={l0_diff.float().quantile(0.99).item():.2e}  "
+    print(f"  L0    p50={l0_diff.quantile(0.50).item():.2e}  "
+          f"p95={l0_diff.quantile(0.95).item():.2e}  "
+          f"p99={l0_diff.quantile(0.99).item():.2e}  "
           f"max={l0_diff.max().item():.2e}  mean={l0_diff.mean().item():.2e}")
     return diff, l0_diff
 
@@ -143,12 +143,12 @@ def main():
         feat_on, gate_on = sae_on.jumprelu_with_gate(pre_on)
         xhat_ref_on = sae_on.decode(feat_on)
         l0_ref_on = gate_on.sum(dim=-1, dtype=torch.float32)
-    diff_on = (xhat_tri_on - xhat_ref_on).abs()
+    diff_on = (xhat_tri_on - xhat_ref_on).abs().float()
     on_recon_err = diff_on.max().item()
     on_l0_err = (l0_tri_on - l0_ref_on).abs().max().item()
-    print(f"[ALL-ON ] recon p50={diff_on.float().quantile(0.50).item():.2e}  "
-          f"p95={diff_on.float().quantile(0.95).item():.2e}  "
-          f"p99={diff_on.float().quantile(0.99).item():.2e}  "
+    print(f"[ALL-ON ] recon p50={diff_on.quantile(0.50).item():.2e}  "
+          f"p95={diff_on.quantile(0.95).item():.2e}  "
+          f"p99={diff_on.quantile(0.99).item():.2e}  "
           f"max={on_recon_err:.2e}  mean={diff_on.mean().item():.2e}")
     print(f"[ALL-ON ] max L0 err = {on_l0_err:.2e}")
     assert torch.isfinite(xhat_tri_on).all(), "all-on output contains inf/nan"
