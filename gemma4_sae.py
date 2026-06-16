@@ -40,28 +40,9 @@ image = (
         "SAE_USE_TRITON": "1",  # Enable Triton fused kernel experiment
     })
     .env({})
-    # Bake the local trainer modules into the image so the container
-    # always sees the working tree (Modal 1.4 dropped cls-level mounts).
-    .add_local_file(
-        "/Users/chiggy/event-aware-SAE-trainer/sae_trainer_rolling.py",
-        "/opt/sae-trainer/sae_trainer_rolling.py",
-        copy=True,
-    )
-    .add_local_file(
-        "/Users/chiggy/event-aware-SAE-trainer/sae_scheduler.py",
-        "/opt/sae-trainer/sae_scheduler.py",
-        copy=True,
-    )
-    .add_local_file(
-        "/Users/chiggy/event-aware-SAE-trainer/triton_sae_kernel.py",
-        "/opt/sae-trainer/triton_sae_kernel.py",
-        copy=True,
-    )
-    .add_local_file(
-        "/Users/chiggy/event-aware-SAE-trainer/benchmark_triton_kernel.py",
-        "/opt/sae-trainer/benchmark_triton_kernel.py",
-        copy=True,
-    )
+    # Trainer modules are NOT baked into the image — they're cloned fresh from
+    # GitHub at container start (see _sync_repo). Keeps this cached pip layer
+    # untouched so new commits don't trigger a full reinstall.
     .env({
         "SAE_DATA_DIR": "/data",
         # Container-local NVMe, NOT a Modal Volume. The activation pool is read
@@ -98,6 +79,43 @@ scratch_volume = Volume.from_name("sae-training-scratch", create_if_missing=True
 
 app = modal.App("gemma4-sae-train", image=image)
 
+# =============================================================================
+# Runtime code sync
+# =============================================================================
+
+REPO_URL = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer.git"
+REPO_BRANCH = "main"
+REPO_DIR = "/opt/sae-trainer"
+
+
+def _sync_repo():
+    """Clone the latest trainer code from GitHub on container start.
+
+    Runtime clone (not baked into the image) so new commits land without an
+    image rebuild — the cached pip layer above is never invalidated. Re-clones
+    fresh on every cold start; idempotent within a warm container. Public repo,
+    so no Secret/token needed.
+    """
+    import os
+    import sys
+    import subprocess
+
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        subprocess.run(["rm", "-rf", REPO_DIR], check=True)
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", REPO_BRANCH,
+             REPO_URL, REPO_DIR],
+            check=True,
+        )
+        sha = subprocess.run(
+            ["git", "-C", REPO_DIR, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        print(f"[_sync_repo] cloned {REPO_BRANCH} @ {sha} -> {REPO_DIR}")
+
+    if REPO_DIR not in sys.path:
+        sys.path.insert(0, REPO_DIR)
+
 
 @app.cls(
     gpu="A10G",  # 24GB VRAM - enough for SmolLM2-360M with room to profile
@@ -115,6 +133,9 @@ class SAETainer:
     def setup(self):
         import os
         from huggingface_hub import snapshot_download
+
+        # Pull fresh trainer code from GitHub (cached pip layer untouched).
+        _sync_repo()
 
         hf_token = os.environ.get("HF_TOKEN")
         model_id = self.model_id
@@ -159,12 +180,11 @@ class SAETainer:
             compile: enable torch.compile on the SAE (default False)
         """
         import os
-        import sys
         import subprocess
 
-        # The trainer modules are baked into the image at /opt/sae-trainer
-        # (see Image.add_local_file above). No need to clone or patch.
-        sys.path.insert(0, "/opt/sae-trainer")
+        # Trainer modules are cloned fresh from GitHub at container start;
+        # setup() already ran _sync_repo(), this is a no-op safety net.
+        _sync_repo()
         start, end = map(int, layer_range.split(","))
 
         # Import trainer module
@@ -221,33 +241,6 @@ class SAETainer:
 
         return {"status": "complete", "layers": list(range(start, end)), "results": results}
 
-    @modal.method()
-    def benchmark_kernel(self) -> dict:
-        """Run the Triton kernel micro-benchmark on an A10G.
-
-        Returns timing/correctness numbers for PyTorch vs Triton forward+backward
-        on a SmolLM2-135M-instruct sized SAE (d_in=576, n_features=18431).
-        """
-        import os
-        import subprocess
-        import sys
-
-        sys.path.insert(0, "/opt/sae-trainer")
-        env = os.environ.copy()
-        # The trainer modules are already baked into /opt/sae-trainer.
-        proc = subprocess.run(
-            [sys.executable, "/opt/sae-trainer/benchmark_triton_kernel.py"],
-            cwd="/opt/sae-trainer",
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        print(proc.stdout)
-        if proc.returncode != 0:
-            print(proc.stderr)
-            raise RuntimeError(f"benchmark failed with code {proc.returncode}")
-        return {"status": "ok", "stdout": proc.stdout}
-
 
 # =============================================================================
 # Pre-tokenization (build /data/pretok/fineweb-edu shards -- the fast data path)
@@ -277,9 +270,9 @@ def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
     from huggingface_hub import snapshot_download
 
     # Import _slug from trainer to ensure path matches exactly
-    # The trainer slugs the full MODEL_ID path, not just the model name
-    import sys
-    sys.path.insert(0, "/opt/sae-trainer")
+    # The trainer slugs the full MODEL_ID path, not just the model name.
+    # _sync_repo clones the code (no @modal.enter here — this is a plain fn).
+    _sync_repo()
     from sae_trainer_rolling import _slug
     # Match trainer's behavior: slug the full model path
     model_slug = _slug(f"data_models_{model_id.replace('/', '_')}")
