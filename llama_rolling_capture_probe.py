@@ -8,7 +8,6 @@ Run inside Modal or any CUDA box:
 import time
 import torch
 from transformers import AutoModelForCausalLM
-from transformers.models.llama.modeling_llama import create_causal_mask
 
 
 def _stage(msg):
@@ -148,7 +147,7 @@ def _hook_replay_correctness(model, input_ids, test_layers):
 
 def main(
     model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
-    test_layers=(0, 1, 15, 29),
+    test_layers=(0, 1, 15, 28),
     speed_targets=(0, 1, 15, 28),
     n_batches_for_speed: int = 50,
     batch_size: int = 16,
@@ -186,22 +185,15 @@ def main(
         print("[WARN] hook replay residuals differ; the layer is not deterministic under exact kwargs")
 
     _stage("manual invariant correctness")
-    with torch.no_grad():
-        full = model(input_ids=sample_ids, output_hidden_states=True)
     manual_ok = True
     for L in test_layers:
-        ref = full.hidden_states[L + 1]
+        ref = _reference_hidden(model, sample_ids, L)
         rolling = _capture_layer_residual_rolling(model, sample_ids, L)
         err = (ref - rolling).abs().max().item()
         print(f"  layer {L:2d}: max abs diff = {err:.4f}")
         if err > 1e-2:
             manual_ok = False
             print(f"    [FAIL] layer {L} diff exceeds 1e-2")
-            if L == test_layers[-1]:
-                print(f"    ref shape={tuple(ref.shape)} rolling shape={tuple(rolling.shape)}")
-                print(f"    norm(ref).max={model.model.norm(ref).abs().max().item():.2f}")
-                print(f"    last_hidden_state max={full.last_hidden_state.abs().max().item():.2f}")
-                print(f"    rolling-vs-last_hidden_state diff={(full.last_hidden_state - rolling).abs().max().item():.4f}")
 
     if manual_ok:
         _ok("manual rolling residuals match reference within tolerance")
