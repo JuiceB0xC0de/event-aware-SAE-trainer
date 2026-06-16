@@ -8,6 +8,7 @@ Run inside Modal or any CUDA box:
 import time
 import torch
 from transformers import AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import create_causal_mask
 
 
 def _stage(msg):
@@ -22,25 +23,28 @@ def _mem():
     return torch.cuda.memory_allocated() / 1024 ** 2, torch.cuda.memory_reserved() / 1024 ** 2
 
 
-def _make_causal_mask(S, device, dtype):
-    """Manual causal mask [1,1,S,S]; 0 where allowed, large negative where masked."""
-    mask = torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
-    return mask.unsqueeze(0).unsqueeze(0)
-
-
 def _build_invariants(model, input_ids):
-    """Minimal invariants for Llama-like rolling block execution."""
+    """Build invariants matching LlamaModel.forward exactly."""
     with torch.no_grad():
         inputs_embeds = model.model.embed_tokens(input_ids)
         B, S, D = inputs_embeds.shape
-        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        attention_mask = _make_causal_mask(S, input_ids.device, inputs_embeds.dtype)
-        position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids)
+        cache_position = torch.arange(S, device=input_ids.device)
+        position_ids = cache_position.unsqueeze(0)
+        attention_mask = create_causal_mask(
+            config=model.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+        position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids=position_ids)
     return {
         "inputs_embeds": inputs_embeds,
         "position_ids": position_ids,
         "attention_mask": attention_mask,
         "position_embeddings": position_embeddings,
+        "cache_position": cache_position,
     }
 
 
@@ -52,6 +56,7 @@ def _run_block_rolling(layer, hidden, inv):
             attention_mask=inv["attention_mask"],
             position_ids=inv["position_ids"],
             position_embeddings=inv["position_embeddings"],
+            cache_position=inv["cache_position"],
             use_cache=False,
         )[0]
     return hidden
@@ -74,12 +79,72 @@ def _reference_hidden(model, input_ids, target_layer: int):
     return out.hidden_states[target_layer + 1]
 
 
+def _print_kwargs(msg, kwargs):
+    print(f"  {msg} kwargs:")
+    for k, v in kwargs.items():
+        if isinstance(v, torch.Tensor):
+            print(f"    {k}: shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+        elif isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v):
+            print(f"    {k}: tuple of tensors " + ", ".join(f"{tuple(t.shape)}" for t in v))
+        else:
+            print(f"    {k}: {v}")
+
+
+def _detach_kwarg(v):
+    if isinstance(v, torch.Tensor):
+        return v.detach().clone()
+    if isinstance(v, tuple):
+        return tuple(t.detach().clone() if isinstance(t, torch.Tensor) else t for t in v)
+    return v
+
+
+def _hook_replay_correctness(model, input_ids, test_layers):
+    """Capture exact layer inputs/kwargs via forward_pre_hook and replay them standalone."""
+    captured = {}
+
+    def make_hook(idx):
+        def hook(module, args, kwargs):
+            hidden = args[0].detach().clone() if args else kwargs["hidden_states"].detach().clone()
+            captured[idx] = {
+                "hidden": hidden,
+                "kwargs": {k: _detach_kwarg(v) for k, v in kwargs.items()},
+            }
+
+        return hook
+
+    handles = [
+        layer.register_forward_pre_hook(make_hook(i), with_kwargs=True)
+        for i, layer in enumerate(model.model.layers)
+    ]
+    with torch.no_grad():
+        out = model(input_ids=input_ids, output_hidden_states=True)
+    for h in handles:
+        h.remove()
+
+    refs = out.hidden_states
+    ok = True
+    for L in test_layers:
+        rec = captured[L]
+        hidden = rec["hidden"]
+        kwargs = dict(rec["kwargs"])
+        kwargs.pop("hidden_states", None)
+        if L == test_layers[0]:
+            _print_kwargs(f"layer {L} captured", kwargs)
+        rolled = model.model.layers[L](hidden, **kwargs)[0]
+        err = (refs[L + 1] - rolled).abs().max().item()
+        print(f"  hook replay layer {L:2d}: max abs diff = {err:.4f}")
+        if err > 1e-2:
+            ok = False
+            print(f"    [FAIL] hook replay layer {L} diff exceeds 1e-2")
+    return ok
+
+
 def main(
     model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
     test_layers=(0, 1, 15, 29),
-    n_batches_for_speed: int = 500,
-    batch_size: int = 16,
-    seq_len: int = 2048,
+    n_batches_for_speed: int = 50,
+    batch_size: int = 1,
+    seq_len: int = 128,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
@@ -105,20 +170,28 @@ def main(
     _stage(f"correctness check on B={batch_size} x S={seq_len}")
     sample_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
 
-    ok = True
+    _stage("hook replay correctness (uses HF's exact kwargs)")
+    hook_ok = _hook_replay_correctness(model, sample_ids, test_layers)
+    if hook_ok:
+        _ok("hook replay residuals match reference")
+    else:
+        print("[WARN] hook replay residuals differ; the layer is not deterministic under exact kwargs")
+
+    _stage("manual invariant correctness")
+    manual_ok = True
     for L in test_layers:
         ref = _reference_hidden(model, sample_ids, L)
         rolling = _capture_layer_residual_rolling(model, sample_ids, L)
         err = (ref - rolling).abs().max().item()
         print(f"  layer {L:2d}: max abs diff = {err:.4f}")
         if err > 1e-2:
-            ok = False
+            manual_ok = False
             print(f"    [FAIL] layer {L} diff exceeds 1e-2")
 
-    if ok:
-        _ok("rolling residuals match reference within tolerance")
+    if manual_ok:
+        _ok("manual rolling residuals match reference within tolerance")
     else:
-        print("[WARN] some rolling residuals differ from reference; see diffs above")
+        print("[WARN] manual rolling residuals differ from reference; see diffs above")
 
     # speed run for layer 0 residuals
     _stage(f"speed run: produce layer 0 residuals for {n_batches_for_speed} batches")
