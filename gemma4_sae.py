@@ -241,6 +241,33 @@ class SAETainer:
 
         return {"status": "complete", "layers": list(range(start, end)), "results": results}
 
+    @modal.method()
+    def benchmark_kernel(self) -> dict:
+        """Run the Triton kernel micro-benchmark on an A10G.
+
+        Pulls the latest trainer code via _sync_repo, then runs the isolated
+        forward+backward correctness + timing benchmark.
+        """
+        import os
+        import subprocess
+        import sys
+
+        _sync_repo()
+        sys.path.insert(0, "/opt/sae-trainer")
+        env = os.environ.copy()
+        proc = subprocess.run(
+            [sys.executable, "/opt/sae-trainer/benchmark_triton_kernel.py"],
+            cwd="/opt/sae-trainer",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        print(proc.stdout)
+        if proc.returncode != 0:
+            print(proc.stderr)
+            raise RuntimeError(f"benchmark failed with code {proc.returncode}")
+        return {"status": "ok", "stdout": proc.stdout}
+
 
 # =============================================================================
 # Pre-tokenization (build /data/pretok/fineweb-edu shards -- the fast data path)
