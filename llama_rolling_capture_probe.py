@@ -45,18 +45,21 @@ def _build_invariants(model, input_ids):
 
 
 def _run_block_rolling(layer, hidden, inv, layer_idx: int = -1):
-    """Execute one Llama decoder layer in rolling mode."""
-    cos, sin = inv["position_embeddings"]
-    print(f"  [rolling layer {layer_idx}] cos shape={tuple(cos.shape)} sin shape={tuple(sin.shape)} hidden shape={tuple(hidden.shape)}")
+    """Execute one Llama decoder layer in rolling mode.
+
+    Some models return a tuple (hidden_states, ...), others return the tensor
+    directly. Do not use [0] blindly: for a batch-1 tensor it squeezes the
+    batch dimension.
+    """
     with torch.no_grad():
-        hidden = layer(
+        out = layer(
             hidden,
             attention_mask=inv["attention_mask"],
             position_ids=inv["position_ids"],
             position_embeddings=inv["position_embeddings"],
             use_cache=False,
-        )[0]
-    return hidden
+        )
+    return out[0] if isinstance(out, tuple) else out
 
 
 def _capture_layer_residual_rolling(model, input_ids, target_layer: int):
@@ -133,7 +136,8 @@ def _hook_replay_correctness(model, input_ids, test_layers):
         kwargs.pop("output_hidden_states", None)
         kwargs.pop("use_cache", None)
         _print_kwargs(f"layer {L} captured", kwargs)
-        rolled = model.model.layers[L](hidden, use_cache=False, **kwargs)[0]
+        out = model.model.layers[L](hidden, use_cache=False, **kwargs)
+        rolled = out[0] if isinstance(out, tuple) else out
         err = (refs[L + 1] - rolled).abs().max().item()
         print(f"  hook replay layer {L:2d}: max abs diff = {err:.4f}")
         if err > 1e-2:
