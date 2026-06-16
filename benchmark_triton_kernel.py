@@ -34,8 +34,8 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(device)}")
     print("=" * 60)
 
-    # ---------------- correctness ----------------
-    with torch.no_grad():
+    # ---------------- forward correctness (under bf16 autocast, matching trainer) ----------------
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         pre = sae.encode_pre(x)
         feat, gate = sae.jumprelu_with_gate(pre)
         xhat_ref = sae.decode(feat)
@@ -50,15 +50,43 @@ def main():
     assert recon_err < 1e-3, f"reconstruction mismatch too large: {recon_err}"
     assert l0_err < 1e-3, f"L0 mismatch too large: {l0_err}"
 
+    # ---------------- backward correctness ----------------
+    def _run_ref_backward():
+        sae.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pre = sae.encode_pre(x)
+            feat, gate = sae.jumprelu_with_gate(pre)
+            xhat_ref = sae.decode(feat)
+            l0_ref = gate.sum(dim=-1, dtype=torch.float32)
+            loss = (x - xhat_ref).pow(2).mean() + 1e-3 * l0_ref.mean()
+        loss.backward()
+        return {n: p.grad.clone() for n, p in sae.named_parameters() if p.grad is not None}
+
+    def _run_tri_backward():
+        sae.zero_grad(set_to_none=True)
+        xhat_tri, l0_tri = fused_sae_forward(x, sae)
+        loss = (x - xhat_tri).pow(2).mean() + 1e-3 * l0_tri.mean()
+        loss.backward()
+        return {n: p.grad.clone() for n, p in sae.named_parameters() if p.grad is not None}
+
+    ref_grads = _run_ref_backward()
+    tri_grads = _run_tri_backward()
+    for name in ref_grads:
+        err = (tri_grads[name] - ref_grads[name]).abs().max().item()
+        print(f"[BWD-CORRECTNESS] {name:20s} max grad err = {err:.2e}")
+        assert err < 5e-2, f"{name} gradient mismatch too large: {err}"
+    print("[BWD-CORRECTNESS] all gradients match")
+
     # ---------------- PyTorch baseline ----------------
     sae.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    pre = sae.encode_pre(x)
-    feat, gate = sae.jumprelu_with_gate(pre)
-    xhat_pt = sae.decode(feat)
-    l0_pt = gate.sum(dim=-1, dtype=torch.float32)
-    loss = (x - xhat_pt).pow(2).mean() + 1e-3 * l0_pt.mean()
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        pre = sae.encode_pre(x)
+        feat, gate = sae.jumprelu_with_gate(pre)
+        xhat_pt = sae.decode(feat)
+        l0_pt = gate.sum(dim=-1, dtype=torch.float32)
+        loss = (x - xhat_pt).pow(2).mean() + 1e-3 * l0_pt.mean()
     loss.backward()
     torch.cuda.synchronize()
     t_py = time.perf_counter() - t0

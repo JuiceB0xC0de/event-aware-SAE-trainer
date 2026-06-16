@@ -127,11 +127,8 @@ else:
                     other=0.0,
                 )
 
-                # [1, BLOCK_D] @ [BLOCK_D, BLOCK_F] -> [1, BLOCK_F], accumulate in fp32.
-                pre += tl.sum(
-                    tl.dot(xb[None, :], w_enc, allow_tf32=False),
-                    axis=0,
-                )
+                # [1, BLOCK_D] @ [BLOCK_D, BLOCK_F] -> [1, BLOCK_F]; squeeze to [BLOCK_F].
+                pre += tl.dot(xb[None, :], w_enc, allow_tf32=False).reshape([BLOCK_F])
 
             # ---- JumpReLU gate ----
             log_thr = tl.load(LogThr_ptr + f_range, mask=mask_f, other=1.0).to(tl.float32)
@@ -146,13 +143,11 @@ else:
                 W_dec_ptr + f_range[:, None] * stride_wdec_d + d_range[None, :],
                 mask=mask_f[:, None] & mask_d[None, :],
                 other=0.0,
-            ).to(tl.float32)
-
-            # [1, BLOCK_F] @ [BLOCK_F, BLOCK_D] -> [1, BLOCK_D], accumulate in fp32.
-            out += tl.sum(
-                tl.dot(gate[None, :], w_dec, allow_tf32=False),
-                axis=0,
             )
+
+            # [1, BLOCK_F] @ [BLOCK_F, BLOCK_D] -> [1, BLOCK_D]; squeeze to [BLOCK_D].
+            # Cast gate to the weight dtype so the matmul stays on bf16 Tensor Cores.
+            out += tl.dot(gate[None, :].to(w_dec.dtype), w_dec, allow_tf32=False).reshape([BLOCK_D])
 
         # Add b_dec slice and store this d-tile.
         b_dec_slice = tl.load(B_dec_ptr + d_range, mask=mask_d, other=0.0).to(tl.float32)
@@ -202,7 +197,9 @@ else:
         stride_gradout_d: tl.constexpr,
         stride_wenc_f: tl.constexpr,
         stride_wdec_f: tl.constexpr,
+        stride_gwenc_f: tl.constexpr,
         stride_gwenc_d: tl.constexpr,
+        stride_gwdec_d: tl.constexpr,
         stride_gwdec_f: tl.constexpr,
         # --- dims ---
         n_tokens: tl.constexpr,
@@ -311,12 +308,12 @@ else:
 
         # Store accumulated gradients for this (f_tile, d_tile) region.
         tl.store(
-            Grad_W_enc_ptr + f_range[:, None] * stride_gwenc_d + d_range[None, :],
+            Grad_W_enc_ptr + f_range[:, None] * stride_gwenc_f + d_range[None, :] * stride_gwenc_d,
             acc_gwenc,
             mask=mask_f[:, None] & mask_d[None, :],
         )
         tl.store(
-            Grad_W_dec_ptr + d_range[:, None] * stride_gwdec_f + f_range[None, :],
+            Grad_W_dec_ptr + d_range[:, None] * stride_gwdec_d + f_range[None, :] * stride_gwdec_f,
             acc_gwdec,
             mask=mask_d[:, None] & mask_f[None, :],
         )
@@ -429,7 +426,9 @@ else:
                 stride_gradout_d=grad_out_t.stride(0),
                 stride_wenc_f=W_enc.t().stride(0),
                 stride_wdec_f=W_dec.t().stride(0),
+                stride_gwenc_f=grad_W_enc.stride(0),
                 stride_gwenc_d=grad_W_enc.stride(1),
+                stride_gwdec_d=grad_W_dec.stride(0),
                 stride_gwdec_f=grad_W_dec.stride(1),
                 n_tokens=B,
                 d_in=d_in,
