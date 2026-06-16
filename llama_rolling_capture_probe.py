@@ -185,15 +185,22 @@ def main(
         print("[WARN] hook replay residuals differ; the layer is not deterministic under exact kwargs")
 
     _stage("manual invariant correctness")
+    with torch.no_grad():
+        full = model(input_ids=sample_ids, output_hidden_states=True)
     manual_ok = True
     for L in test_layers:
-        ref = _reference_hidden(model, sample_ids, L)
+        ref = full.hidden_states[L + 1]
         rolling = _capture_layer_residual_rolling(model, sample_ids, L)
         err = (ref - rolling).abs().max().item()
         print(f"  layer {L:2d}: max abs diff = {err:.4f}")
         if err > 1e-2:
             manual_ok = False
             print(f"    [FAIL] layer {L} diff exceeds 1e-2")
+            if L == test_layers[-1]:
+                print(f"    ref shape={tuple(ref.shape)} rolling shape={tuple(rolling.shape)}")
+                print(f"    norm(ref).max={model.model.norm(ref).abs().max().item():.2f}")
+                print(f"    last_hidden_state max={full.last_hidden_state.abs().max().item():.2f}")
+                print(f"    rolling-vs-last_hidden_state diff={(full.last_hidden_state - rolling).abs().max().item():.4f}")
 
     if manual_ok:
         _ok("manual rolling residuals match reference within tolerance")
@@ -203,26 +210,28 @@ def main(
     # speed run for layer 0 residuals
     _stage(f"speed run: produce layer 0 residuals for {n_batches_for_speed} batches")
     times = []
-    for b in range(n_batches_for_speed):
+    final_out = None
+    for b in range(n_batches_for_speed + 5):  # 5 warmup
         ids_b = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         start_ev.record()
-        _ = _capture_layer_residual_rolling(model, ids_b, 0)
+        out_b = _capture_layer_residual_rolling(model, ids_b, 0)
         end_ev.record()
         torch.cuda.synchronize()
-        wall = time.perf_counter() - t0
         cuda = start_ev.elapsed_time(end_ev)
-        times.append(cuda)
+        if b >= 5:
+            times.append(cuda)
+            final_out = out_b
         if (b + 1) % 100 == 0:
-            print(f"  batch {b + 1}/{n_batches_for_speed}: cuda={cuda:.1f} ms  wall={wall*1000:.1f} ms")
+            print(f"  batch {b + 1}/{n_batches_for_speed + 5}: cuda={cuda:.1f} ms")
 
     avg = sum(times) / len(times)
     tok_s = (batch_size * seq_len) / (avg / 1000.0)
     print(f"\n[SPEED] layer-0 rolling capture avg={avg:.1f} ms/batch  {tok_s/1000:.1f}k tok/s")
     print(f"[SPEED] min={min(times):.1f} ms  max={max(times):.1f} ms")
+    print(f"[SANITY] final_out mean={final_out.float().mean().item():.4f} std={final_out.float().std().item():.4f}")
     print(f"[MEM ] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
 
 
