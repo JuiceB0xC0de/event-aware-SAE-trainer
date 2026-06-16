@@ -1,12 +1,14 @@
-"""Micro-benchmark / diagnostic for the Triton fused SAE kernel on CUDA.
+"""Forward-only diagnostic for the Triton fused SAE kernel on CUDA.
+
+The current fused backward kernel requires more shared memory than an A10
+has (672 KB requested vs 101 KB limit) because it materialises the full
+padded d_in dimension per block. It is disabled here. This benchmark answers
+the narrower question: is the current fused forward worth keeping while we
+rewrite the backward?
 
 Run inside the Modal container (or any CUDA box) with:
 
     python benchmark_triton_kernel.py
-
-This is *iteration/diagnostic* mode, not final perf tuning. Autotune is
-intentionally collapsed to a single known-good config so compile times stay
-short while we nail down correctness.
 """
 import time
 import torch
@@ -83,6 +85,48 @@ def _threshold_margin_stats(pre, log_thr, margin=0.1):
     print(f"[THRESH-MARGIN] features within {margin*100:.0f}% of threshold: "
           f"{count} / {total} ({100*count/total:.3f}%)")
     return count, total
+
+
+def _time_forward_pytorch(sae, x, n_warm=3, n_rep=10):
+    torch.cuda.synchronize()
+    for _ in range(n_warm):
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pre = sae.encode_pre(x)
+            feat, gate = sae.jumprelu_with_gate(pre)
+            _ = sae.decode(feat)
+            _ = gate.sum(dim=-1, dtype=torch.float32)
+    times = []
+    for _ in range(n_rep):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pre = sae.encode_pre(x)
+            feat, gate = sae.jumprelu_with_gate(pre)
+            xhat = sae.decode(feat)
+            l0 = gate.sum(dim=-1, dtype=torch.float32)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return times, xhat, l0
+
+
+def _time_forward_triton(sae, x, n_warm=3, n_rep=10):
+    torch.cuda.synchronize()
+    for _ in range(n_warm):
+        with torch.no_grad():
+            _ = fused_sae_forward(x, sae)
+    times = []
+    for _ in range(n_rep):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        with torch.no_grad():
+            xhat, l0 = fused_sae_forward(x, sae)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return times, xhat, l0
 
 
 def main():
@@ -162,105 +206,43 @@ def main():
     _threshold_margin_stats(pre_fp32, sae.log_threshold, margin=0.10)
     _threshold_margin_stats(pre_fp32, sae.log_threshold, margin=0.20)
 
-    # gradient correctness on x_diag
-    _stage("backward correctness against bf16 autocast baseline")
-
-    def _run_ref_backward(xb):
-        sae.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pre = sae.encode_pre(xb)
-            feat, gate = sae.jumprelu_with_gate(pre)
-            xhat_ref = sae.decode(feat)
-            l0_ref = gate.sum(dim=-1, dtype=torch.float32)
-            loss = (xb - xhat_ref).pow(2).mean() + 1e-3 * l0_ref.mean()
-        loss.backward()
-        return {n: p.grad.clone() for n, p in sae.named_parameters() if p.grad is not None}
-
-    def _run_tri_backward(xb):
-        sae.zero_grad(set_to_none=True)
-        xhat_tri, l0_tri = fused_sae_forward(xb, sae)
-        loss = (xb - xhat_tri).pow(2).mean() + 1e-3 * l0_tri.mean()
-        loss.backward()
-        return {n: p.grad.clone() for n, p in sae.named_parameters() if p.grad is not None}
-
-    ref_grads = _run_ref_backward(x_diag)
-    tri_grads = _run_tri_backward(x_diag)
-
-    grad_ok = True
-    for name in ref_grads:
-        err = (tri_grads[name] - ref_grads[name]).abs().max().item()
-        rel = err / (ref_grads[name].abs().mean().item() + 1e-8)
-        print(f"[BWD] {name:20s} max err={err:.2e}  rel={rel:.2e}")
-        if rel > 0.05:
-            grad_ok = False
-            _warn(f"{name} relative gradient error > 5%")
-    if grad_ok:
-        _ok("backward gradients within 5% relative error")
+    _warn("fused Triton backward is disabled: A10 shared-memory footprint exceeds hardware limit")
 
     # clear diagnostic tensors before full-B timing
     del xhat_off, l0_off, sae_off
     del xhat_tri_on, l0_tri_on, sae_on, xhat_ref_on, l0_ref_on
     del xhat_bf16, l0_bf16, pre_bf16, xhat_fp32, l0_fp32, pre_fp32
     del xhat_kmath, l0_kmath, pre_kmath, xhat_tri_diag, l0_tri_diag
-    del ref_grads, tri_grads
     torch.cuda.empty_cache()
     print(f"\n[MEM after cache clear] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
 
-    # ---------------- full-B timing only ----------------
-    _stage("full-B forward+backward timing only")
+    # ---------------- full-B forward-only timing ----------------
+    _stage("full-B forward-only timing")
 
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    pt_times, _, _ = _time_forward_pytorch(sae, x)
+    print(f"[PYTORCH FWD] min={min(pt_times):.1f} ms  max={max(pt_times):.1f} ms  "
+          f"avg={sum(pt_times)/len(pt_times):.1f} ms  "
+          f"{batch_tokens/(sum(pt_times)/len(pt_times))/1000:.1f}k tok/s")
 
-    start.record()
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        pre = sae.encode_pre(x)
-        feat, gate = sae.jumprelu_with_gate(pre)
-        xhat_pt = sae.decode(feat)
-        l0_pt = gate.sum(dim=-1, dtype=torch.float32)
-        loss = (x - xhat_pt).pow(2).mean() + 1e-3 * l0_pt.mean()
-    loss.backward()
-    end.record()
-    torch.cuda.synchronize()
-    t_py_cuda = start.elapsed_time(end)
-    print(f"[PYTORCH  ] cuda={t_py_cuda:.1f} ms  {batch_tokens/t_py_cuda/1000:.1f}k tok/s")
+    tri_times, xhat_tri_full, l0_tri_full = _time_forward_triton(sae, x)
+    print(f"[TRITON FWD]  min={min(tri_times):.1f} ms  max={max(tri_times):.1f} ms  "
+          f"avg={sum(tri_times)/len(tri_times):.1f} ms  "
+          f"{batch_tokens/(sum(tri_times)/len(tri_times))/1000:.1f}k tok/s")
 
-    sae.zero_grad(set_to_none=True)
-    start.record()
-    xhat_tri, l0_tri = fused_sae_forward(x, sae)
-    loss = (x - xhat_tri).pow(2).mean() + 1e-3 * l0_tri.mean()
-    loss.backward()
-    end.record()
-    torch.cuda.synchronize()
-    t_tri_cuda = start.elapsed_time(end)
-    print(f"[TRITON   ] cuda={t_tri_cuda:.1f} ms  {batch_tokens/t_tri_cuda/1000:.1f}k tok/s")
-    print(f"[SPEEDUP  ] {t_py_cuda/t_tri_cuda:.2f}x")
+    speedup = (sum(pt_times)/len(pt_times)) / (sum(tri_times)/len(tri_times))
+    print(f"[SPEEDUP FWD] {speedup:.2f}x")
 
-    n_rep = 10
-    _stage(f"warm Triton path: {n_rep} repeated forward+backward runs")
-    times = []
-    for i in range(n_rep):
-        sae.zero_grad(set_to_none=True)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        xhat_tri, l0_tri = fused_sae_forward(x, sae)
-        loss = (x - xhat_tri).pow(2).mean() + 1e-3 * l0_tri.mean()
-        loss.backward()
-        end.record()
-        torch.cuda.synchronize()
-        dt = start.elapsed_time(end)
-        times.append(dt)
-        if (i + 1) % 2 == 0:
-            print(f"  warm {i + 1}/{n_rep}: cuda={dt:.1f} ms  avg={sum(times)/len(times):.1f} ms")
+    # quick sanity on full-B output
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        xhat_pt_full, l0_pt_full, _, _ = _sae_forward_pytorch(sae, x, torch.bfloat16)
+    diff_full = (xhat_tri_full - xhat_pt_full).abs().float()
+    l0_diff_full = (l0_tri_full - l0_pt_full).abs().float()
+    print(f"\n[FULL-B FWD CHECK]")
+    print(f"  recon mean={diff_full.mean().item():.2e} rms={diff_full.pow(2).mean().sqrt().item():.2e} max={diff_full.max().item():.2e}")
+    print(f"  L0    mean={l0_diff_full.mean().item():.2e} rms={l0_diff_full.pow(2).mean().sqrt().item():.2e} max={l0_diff_full.max().item():.2e}")
 
-    t_rep = sum(times) / n_rep
-    print(f"[TRITONx{n_rep}] avg cuda={t_rep:.1f} ms  {batch_tokens/t_rep/1000:.1f}k tok/s")
-    print(f"[TRITONx{n_rep}] min={min(times):.1f} ms  max={max(times):.1f} ms")
     print(f"[MEM ] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
-
-    _ok("diagnostic benchmark complete")
+    _ok("forward-only diagnostic benchmark complete")
 
 
 if __name__ == "__main__":
