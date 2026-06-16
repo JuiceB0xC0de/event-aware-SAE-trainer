@@ -177,7 +177,7 @@ class SAETainer:
             microbatch_tokens: for gradient accumulation (default 32k = no accum)
             resume_from: optional /data/.../checkpoint_full.pt for the first trained layer
             evict_model: move the LLM to CPU during SAE training to free VRAM (default True)
-            compile: enable torch.compile on the SAE (default False)
+            compile: enable torch.compile on the SAE (default False; SAE-only benchmark showed no speedup on A10)
         """
         import os
         import subprocess
@@ -274,11 +274,7 @@ class SAETainer:
 
     @modal.method()
     def benchmark_pytorch_sae(self, compile_sae: bool = False) -> dict:
-        """Run the SAE-only PyTorch fwd+bwd benchmark (no data pipeline).
-
-        This is the clean number for the standard SAE math path under bf16
-        autocast, optionally with torch.compile.
-        """
+        """Run the SAE-only PyTorch fwd+bwd benchmark (no data pipeline)."""
         import os
         import subprocess
         import sys
@@ -299,6 +295,30 @@ class SAETainer:
         print("[SAETainer.benchmark_pytorch_sae] ----- END -----")
         if proc.returncode != 0:
             raise RuntimeError(f"benchmark failed with code {proc.returncode}")
+        return {"status": "ok", "stdout": proc.stdout}
+
+    @modal.method()
+    def benchmark_pytorch_sae_batch(self) -> dict:
+        """Run SAE-only fwd+bwd across several batch sizes."""
+        import os
+        import subprocess
+        import sys
+
+        _sync_repo()
+        sys.path.insert(0, "/opt/sae-trainer")
+        env = os.environ.copy()
+        env["SAE_USE_TRITON"] = "0"
+        proc = subprocess.run(
+            [sys.executable, "/opt/sae-trainer/benchmark_pytorch_sae_batch.py"],
+            cwd="/opt/sae-trainer", env=env, capture_output=True, text=True,
+        )
+        print("[SAETainer.benchmark_pytorch_sae_batch] ----- STDOUT -----")
+        print(proc.stdout)
+        print("[SAETainer.benchmark_pytorch_sae_batch] ----- STDERR -----")
+        print(proc.stderr)
+        print("[SAETainer.benchmark_pytorch_sae_batch] ----- END -----")
+        if proc.returncode != 0:
+            raise RuntimeError(f"batch benchmark failed with code {proc.returncode}")
         return {"status": "ok", "stdout": proc.stdout}
 
     @modal.method()
@@ -478,7 +498,6 @@ def main(
         modal run gemma4_sae.py --layer-range 0,15 --capture rolling
         modal run gemma4_sae.py --model-id meta-llama/Llama-3.2-1B --layer-range 0,16 --capture auto
         modal run gemma4_sae.py --layer-range 5,10 --capture rolling --resume-from /data/saes/data_models_gemma-4-e4b/layer_05_s0/checkpoint_full.pt
-        modal run gemma4_sae.py --model-id meta-llama/Llama-3.2-1B --layer-range 0,16 --capture auto --compile
     """
     tainer = SAETainer(model_id=model_id)
     result = tainer.train.remote(
