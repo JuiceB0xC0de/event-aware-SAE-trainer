@@ -2,160 +2,150 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![pip installable](https://img.shields.io/badge/pip-installable-green)](https://pypi.org/)
 
-Train a sparse autoencoder (SAE) on **every decoder layer of any Hugging Face language
-model — in a single, unattended run.** No per-layer hyperparameter retuning, no
-restart-and-retune loop. The scheduler watches the training signal and adjusts itself.
+Train a sparse autoencoder on **every decoder layer of any Hugging Face causal LM — unattended, without retuning per layer.**
 
-## The point: a self-tuning scheduler
+The scheduler watches the run, chases the L0 target you give it, and converges. You set `target_l0`, hit go, and come back to a full atlas. No babysitting. No "this layer needs a different LR" loop.
 
-DeepMind's Gemma Scope reported the usual SAE-training pain: sparsity/LR had to be retuned
-per layer and runs repeated until they landed. This trainer removes that loop.
+## What is this
 
-`sae_scheduler.py` is an **event-aware controller** — an AECS mode machine plus an
-**Augmented-Lagrangian L0 integrator**. You set an L0 target and walk away:
+A one-command SAE atlas trainer with an **event-aware Augmented-Lagrangian scheduler**. It trains a JumpReLU SAE on each layer, auto-tunes the sparsity penalty (`λ`) in real time, and converges L0 to whatever target you pick. Dead features stay near zero via aux-loss revival + resampling + emergency dead-feature recovery.
 
-1. λ starts at 0; the SAE overshoots the target (L0 too high).
-2. The dual integrator raises λ in proportion to the constraint violation.
-3. L0 falls, oscillates around the target, and **converges** as close as the model allows — λ plateaus when it gets there, relaxes if it overshoots into being too sparse.
-4. Throughout, dead features are held **≈0** (aux-loss revival + threshold reset + resampling + a dead-feature emergency mode).
+It is model-agnostic for capture, fast-path for Llama/SmolLM2/Qwen-family models, and runs locally or on Modal.
 
-So one process sweeps all layers, each converging on its own. That self-tuning convergence
-is the product — everything else is plumbing around it.
+## Why does this exist
 
-## Model-agnostic by construction
+SAE training usually means: pick a layer, guess LR/sparsity, run, check L0, tweak, rerun, repeat for every layer. Gemma Scope even called that out as their main pain. This removes the loop — the scheduler handles it. One process, all layers, each landing on its own L0 target.
 
-The scheduler and training loop never touch model internals — they consume a stream of
-activation batches. **How activations are captured is pluggable (`--capture`):**
+The rough idea:
+1. Start λ at 0, the SAE overshoots (L0 too high).
+2. λ climbs based on how far off L0 is.
+3. L0 oscillates around target, then λ plateaus when it locks in.
+4. If it overshoots into too-sparse territory, λ relaxes.
 
-| Mode | Works on | Cost | Notes |
-|------|----------|------|-------|
-| `auto` *(default)* | **any `AutoModelForCausalLM`** (+ multimodal text path) | 1 pool of disk, N× forward | Forward-hooks the residual stream. **Correct by construction** — observes the real forward, no reconstruction. |
-| `rolling` | Gemma-3n/4 family | 1 pool of disk, ~1 forward total | Single-block walk: run only block L over the residual cached from block L−1. VRAM/compute-optimized; uses Gemma-specific internals (PLE, attention types, KV sharing → layers 0–14 only). Persists a resume pool so restarts resume from the last completed layer. |
+You still get all the knobs if you want them, but you don't need them.
 
-`d_in` and layer count are auto-detected from the model config; the SAE dictionary is
-`expansion × d_in` (default 32×).
+## Results
 
-## Files
+We trained a **full 29-layer atlas on `HuggingFaceTB/SmolLM2-135M-Instruct`** (layers 0–28 finished; L29 pending Modal credits) with `--capture rolling-hf`:
 
-| File | Role |
-|------|------|
-| `sae_trainer_rolling.py` | The trainer — scheduler-driven training loop, SAE arch, datasets, both capture backends, CLI. |
-| `sae_scheduler.py`       | The event-aware scheduler (AECS modes + Augmented-Lagrangian λ control). |
-| `examples/configs.py`    | Example expansion / sparsity configs. |
-| `examples/use_trained_sae.py` | Load a trained SAE and inspect feature activations. |
+- **~410k tok/s sustained** SAE forward+backward on an A100-40GB.
+- **Activation capture is no longer the bottleneck** — the rolling-hf fast path runs 350k–700k tok/s depending on depth.
+- **0% dead features** across every completed layer.
+- **EV ~0.93–0.95** on most mid-to-deep layers at `target_l0=50`.
+- **No per-layer retuning.** Same command, 30 layers.
 
-## Install
+If you've trained SAEs before, you know those numbers are kind of ridiculous. The rolling window is the cheat code.
 
-```bash
-# Development install (editable)
-pip install -e .
+## How it works
 
-# Or from requirements
-pip install -r requirements.txt
-```
+Three pieces:
 
-Requires a CUDA GPU (H100/A100 target). Configuration is via flags or environment:
+- `sae_scheduler.py` — the event-aware controller (AECS state machine + Augmented-Lagrangian λ integrator + dead-feature handling).
+- `sae_trainer_rolling.py` — the full trainer: SAE arch, loop, datasets, checkpointing, capture backends, CLI.
+- `gemma4_sae.py` — the Modal cloud runner if you want to train on A10/A100/H100 without managing machines.
 
-```bash
-export HF_TOKEN=hf_...            # model + corpus access (and upload, if used)
-export SAE_DATA_DIR=./data        # where SAEs/pools are written (default ./data)
-export SAE_SCRATCH_DIR=/mnt/nvme  # optional: fast disk for ephemeral activation pools
-# SAE_MODEL_ID / SAE_HUB_ID / WANDB_PROJECT also settable via env
-```
+The trainer doesn't touch model internals directly. It eats activation batches. How they get captured is pluggable:
 
-No HF org, wandb project, or upload target is baked in: a clone-and-run **trains locally and
-pushes nowhere** unless you pass `--hub-id` (and `--wandb-project` for logging).
+| `--capture` | Works on | Speed | Notes |
+|-------------|----------|-------|-------|
+| `auto` | any `AutoModelForCausalLM` | medium | Forward-hooks the residual stream. Correct by construction, observes the real forward. |
+| `rolling` | Gemma-3n/4 family | fast | Single-block walk with Gemma-specific internals. Scoped to layers 0–14 due to KV-share boundary. |
+| `rolling-hf` | Llama / SmolLM2 / Qwen / etc. | fast | Generic single-block walk. No layer cap. This is the one that changed the game for us. |
 
-## Run
+`d_in`, layer count, and vocab are auto-detected. Dictionary size is `expansion × d_in` (default 32×).
+
+## Quick start
+
+### Local
 
 ```bash
-# any causal LM, model-agnostic capture, layers 0–16
-python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B --end-layer 16
+pip install -e .      # or pip install -r requirements.txt
+export HF_TOKEN=hf_...
 
-# Gemma fast path (single-block, layers 0–14)
-python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it --capture rolling --end-layer 15
+# SmolLM2 0-28 (29 layers), 500 pool batches, 5000 steps, L0=50
+python sae_trainer_rolling.py \
+  --model-id HuggingFaceTB/SmolLM2-135M-Instruct \
+  --capture rolling-hf \
+  --layer-range 0,28 \
+  --pool-batches 500 \
+  --max-steps 5000 \
+  --target-l0 50
 
-# publish + log
-python sae_trainer_rolling.py --model-id Qwen/Qwen2.5-1.5B --hub-id me/qwen-saes --wandb-project run1
+# any causal LM, 8 layers, model-agnostic capture
+python sae_trainer_rolling.py \
+  --model-id meta-llama/Llama-3.2-1B \
+  --end-layer 7
 
-# fast smoke test: 2 layers, few steps, live tokenization, no upload
-python sae_trainer_rolling.py --start-layer 0 --end-layer 2 --max-steps 500 --no-pretok
+# smoke test: 2 layers, 500 steps, no upload
+python sae_trainer_rolling.py \
+  --start-layer 0 --end-layer 1 \
+  --max-steps 500 --no-pretok
 ```
 
-### Hobbyist presets (limited VRAM / disk)
+`--layer-range` is **inclusive** now: `0,28` means layers 0 through 28. (Not half-open. We fixed that foot-gun.)
+
+### Modal
 
 ```bash
-# 24GB VRAM, 100GB disk: 4x gradient accumulation, smaller pool
-python sae_trainer_rolling.py --model-id meta-llama/Llama-3.2-1B \
-    --microbatch-tokens 8192 --pool-batches 1000 --end-layer 8
-
-# Resume from checkpoint after preemption/interruption
-python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it \
-    --resume-from ./data/saes/google_gemma-4-e2b-it/layer_03_s0/checkpoint_full.pt
-
-# Ultra-low disk (50GB): train with 500 batches, more epoching
-python sae_trainer_rolling.py --pool-batches 500 --end-layer 4
+modal run gemma4_sae.py::SAETainer.train \
+  --model-id HuggingFaceTB/SmolLM2-135M-Instruct \
+  --layer-range 0,28 \
+  --capture rolling-hf \
+  --pool-batches 500 \
+  --max-steps 5000 \
+  --target-l0 50 \
+  --microbatch-tokens 32768 \
+  --timing
 ```
 
-`python sae_trainer_rolling.py --help` lists every flag.
+Default scratch is `/data/scratch` (persistent Modal volume), so rolling resume pools survive container death. If you want faster ephemeral NVMe and don't need resume, pass `--scratch-dir /root/rollcache`.
 
-## Key hyperparameters
+### Pretokenize once, train forever
 
-| Param | Default | Notes |
-|-------|---------|-------|
-| `--expansion` | `32` | SAE dict size = `expansion × d_in` |
-| `K` (target L0) | `500` | the constraint the scheduler converges to |
-| `--target-l0` | `None` | runtime override of `K` without editing source |
-| `BATCH_TOKENS` | `32_768` | tokens per SAE step (accumulated across microbatches) |
-| `--microbatch-tokens` | `32_768` | tokens per microbatch; use 8192 for 4x VRAM savings |
-| `SEQ_LEN` | `2_048` | sequence length into the model |
-| `AUX_K` | `128` | dead features revived per token via the aux loss |
-| `--pool-batches` | `4000` | activation batches cached per layer (~400GB); use 500-1000 for ~50-100GB |
-
-`d_in` is **not** a hyperparameter — it's read from the model config.
-
-## Checkpoint resume
-
-During training and at the end of each layer, training saves `checkpoint_full.pt` with:
-- Model weights (`sae_state`)
-- Optimizer state (`optimizer_state`)
-- Scheduler state (lambda, mode, event history)
-- RNG states (CUDA + CPU)
-- Dead-feature stats (`steps_since_fired`, `feature_fire_counts`)
-
-The async activation reader is deliberately optimized for throughput; after resume it restarts
-from the cached activation pool rather than serializing the in-flight prefetch queue.
-
-To resume after interruption:
-```bash
-python sae_trainer_rolling.py --resume-from ./data/saes/google_gemma-4-e2b-it/layer_03_s0/checkpoint_full.pt
-```
-
-### Rolling resume pool
-
-With `--capture rolling`, the trainer automatically persists the last completed layer's
-activation pool to disk. If the run is interrupted, restarting the same command resumes
-the residual chain from that layer instead of regenerating pools from layer 0. Only one
-resume pool is kept on disk at a time.
+FineWeb-Edu is streamed and tokenized on the fly by default. For repeated runs, pretokenize first:
 
 ```bash
-python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it --capture rolling --end-layer 15
-# interrupted, then restart:
-python sae_trainer_rolling.py --model-id google/gemma-4-E2B-it --capture rolling --end-layer 15
+modal run gemma4_sae.py::pretokenize \
+  --model-id HuggingFaceTB/SmolLM2-135M-Instruct \
+  --n-shards 16
 ```
 
-### Speed / VRAM optimizations
+Then training auto-detects the shards and skips live tokenization.
 
-- The base LLM is moved to CPU during SAE training by default (it is idle), freeing GPU
-  memory for larger microbatches. Disable with `--no-model-evict`.
-- Activation H2D transfers run on a dedicated CUDA stream and overlap with training.
-- Auto capture truncates the decoder stack to `[:layer+1]` per layer instead of relying
-  on hooks + exceptions.
+## Key flags
 
-The biggest remaining lever for tok/s is usually `--microbatch-tokens`: use the largest
-value that fits in the freed VRAM.
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--layer-range` | `0,15` | Inclusive `start,end`. Use `29,29` for a single layer. |
+| `--capture` | `auto` | `auto`, `rolling`, or `rolling-hf`. |
+| `--expansion` | `32` | SAE dictionary = `expansion × d_in`. |
+| `--target-l0` | model default | Runtime override of the L0 target. We used `50` for the SmolLM2 atlas. |
+| `--pool-batches` | `4000` | Cached activation batches per layer (~400GB). Use `500–1000` for limited disk. |
+| `--microbatch-tokens` | `32768` | Per-microbatch tokens; `8192` for 4× VRAM savings. |
+| `--max-steps` | `15000` | Cap per layer. Convergence usually happens earlier. |
+
+## Hobbyist presets
+
+24GB GPU, 100GB disk:
+
+```bash
+python sae_trainer_rolling.py \
+  --model-id meta-llama/Llama-3.2-1B \
+  --capture rolling-hf \
+  --layer-range 0,7 \
+  --microbatch-tokens 8192 \
+  --pool-batches 1000
+```
+
+## Resume
+
+Per-layer `checkpoint_full.pt` saves weights, optimizer, scheduler state, RNG, and dead-feature stats. For rolling capture, the trainer also persists one resume pool — restart the same command and it resumes the residual chain from the last completed layer instead of regenerating from 0.
+
+```bash
+python sae_trainer_rolling.py \
+  --resume-from ./data/saes/huggingfacetb_smollm2-135m-instruct/layer_12_s0/checkpoint_full.pt
+```
 
 ## Tests
 
@@ -164,23 +154,22 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-CPU-only, no GPU/network/token needed. Covers the SAE arch, pool I/O, dataset dispatch, the
-scheduler's λ integrator (climb/clamp/floor), the CLI, and the model-agnostic hook capture —
-including an exact match against a manual forward. Two further guards run when their deps are
-present and skip otherwise: a CUDA smoke test (`-m gpu`), and a **bit-exactness check** that
-hooked capture equals a real model's own `output_hidden_states` (needs network). That second
-test is the one that keeps the atlas trustworthy — it proves capture returns the *actual*
-residual stream, not a subtly wrong copy.
+CPU-only, covers SAE arch, scheduler integrator, dataset dispatch, CLI, and exact capture-vs-forward checks. A GPU smoke test runs with `-m gpu` if CUDA is around.
 
-For the `rolling` backend specifically, `validate_rolling_cache.py` is a standalone gate:
-it imports the shipped `_make_invariants`/`_run_block` and checks, per layer, that the
-single-block reconstruction matches a true full forward to tolerance — and demonstrates the
-expected divergence at/above `HARD_STOP_LAYER` that scopes rolling to layers 0–14.
+## Known issues / rough edges
 
-```bash
-python validate_rolling_cache.py --model-id google/gemma-4-E2B-it
-```
+- `rolling` is scoped to Gemma layers 0–14 by the KV-share boundary. Use `rolling-hf` for deeper Llama-family layers.
+- L29 of SmolLM2 is the final pre-head residual — training it works, but we ran out of Modal credits mid-capture. The 0–28 atlas is complete and solid.
+- No baked-in wandb or HF upload target. Add `--wandb-project` / `--hub-id` if you want them.
+
+## What's next
+
+- Finish and publish the SmolLM2-135M-Instruct SAE atlas.
+- Make `rolling-hf` the default for supported architectures.
+- Persisted pool workflow so single-layer resumes don't walk from layer 0.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Built by [Rick / juiceb0xc0de](https://huggingface.co/juiceb0xc0de). If this helps you train SAEs without losing your mind, that's the whole point.
