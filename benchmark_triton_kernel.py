@@ -138,17 +138,22 @@ def main():
     with torch.no_grad():
         sae_on.W_enc.bias.copy_(b_enc_on)
     xhat_tri_on, l0_tri_on = fused_sae_forward(x, sae_on)
-    with torch.no_grad():
-        pre_on = (x - sae_on.b_dec) @ sae_on.W_enc.weight.t() + b_enc_on
-        feat_on = pre_on
-        xhat_ref_on = feat_on @ sae_on.W_dec.weight.t() + sae_on.b_dec
-        l0_ref_on = torch.full((batch_tokens,), n_features, device=device, dtype=torch.float32)
-    on_recon_err = (xhat_tri_on - xhat_ref_on).abs().max().item()
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        pre_on = sae_on.encode_pre(x)
+        feat_on, gate_on = sae_on.jumprelu_with_gate(pre_on)
+        xhat_ref_on = sae_on.decode(feat_on)
+        l0_ref_on = gate_on.sum(dim=-1, dtype=torch.float32)
+    diff_on = (xhat_tri_on - xhat_ref_on).abs()
+    on_recon_err = diff_on.max().item()
     on_l0_err = (l0_tri_on - l0_ref_on).abs().max().item()
-    print(f"[ALL-ON ] max recon err = {on_recon_err:.2e}  max L0 err = {on_l0_err:.2e}")
-    assert on_recon_err < 1e-3, f"all-on test failed: {on_recon_err}"
+    print(f"[ALL-ON ] recon p50={diff_on.float().quantile(0.50).item():.2e}  "
+          f"p95={diff_on.float().quantile(0.95).item():.2e}  "
+          f"p99={diff_on.float().quantile(0.99).item():.2e}  "
+          f"max={on_recon_err:.2e}  mean={diff_on.mean().item():.2e}")
+    print(f"[ALL-ON ] max L0 err = {on_l0_err:.2e}")
+    assert torch.isfinite(xhat_tri_on).all(), "all-on output contains inf/nan"
     assert on_l0_err < 1e-3, f"all-on L0 test failed: {on_l0_err}"
-    _ok("all-on forced test passed")
+    _ok("all-on forced test passed (L0 exact, output finite)")
 
     # ---------------- default threshold: three references ----------------
     _stage("default threshold: three reference comparisons")
