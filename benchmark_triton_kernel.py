@@ -73,15 +73,17 @@ def _err_stats(label, xhat_ref, l0_ref, xhat_tri, l0_tri):
     return diff, l0_diff
 
 
-def _threshold_margin_stats(pre, log_thr, margin=0.1):
+def _threshold_margin_stats(pre, log_thr, margin=0.1, max_tokens=2048):
     """Count features whose |pre - threshold| / threshold is within margin."""
+    if pre.shape[0] > max_tokens:
+        pre = pre[:max_tokens]
     threshold = torch.exp(log_thr)
     rel = (pre.abs() - threshold[None, :]).abs() / (threshold[None, :] + 1e-8)
     near = rel < margin
     total = near.numel()
     count = near.sum().item()
     print(f"[THRESH-MARGIN] features within {margin*100:.0f}% of threshold: "
-          f"{count} / {total} ({100*count/total:.3f}%)")
+          f"{count} / {total} ({100*count/total:.3f}%)  (sampled {pre.shape[0]} tokens)")
     return count, total
 
 
@@ -142,6 +144,15 @@ def main():
     assert torch.isfinite(xhat_tri_on).all(), "all-on output contains inf/nan"
     assert on_l0_err < 1e-3, f"all-on L0 test failed: {on_l0_err}"
     _ok("all-on forced test passed (L0 exact, output finite)")
+
+    # ---------------- small-B default threshold diagnostic ----------------
+    _stage("small-B default threshold diagnostic (B=1024)")
+    x_small = x[:1024]
+    with torch.no_grad():
+        xhat_small_bf16, l0_small_bf16, pre_small_bf16, _ = _sae_forward_pytorch(sae, x_small, torch.bfloat16)
+    xhat_small_tri, l0_small_tri = fused_sae_forward(x_small, sae)
+    _err_stats("Small-B Triton vs bf16", xhat_small_bf16, l0_small_bf16, xhat_small_tri, l0_small_tri)
+    _threshold_margin_stats(pre_small_bf16, sae.log_threshold, margin=0.10)
 
     # ---------------- default threshold: three references ----------------
     _stage("default threshold: three reference comparisons")
