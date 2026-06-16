@@ -24,39 +24,36 @@ def _mem():
 
 
 def _build_invariants(model, input_ids):
-    """Build invariants matching LlamaModel.forward exactly."""
+    """Build invariants matching LlamaModel.forward exactly.
+
+    Avoids version-sensitive create_causal_mask kwargs by relying on the
+    decoder layer's internal mask creation (attention_mask=None is accepted).
+    """
     with torch.no_grad():
         inputs_embeds = model.model.embed_tokens(input_ids)
         B, S, D = inputs_embeds.shape
         cache_position = torch.arange(S, device=input_ids.device)
         position_ids = cache_position.unsqueeze(0)
-        attention_mask = create_causal_mask(
-            config=model.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=None,
-            cache_position=cache_position,
-            past_key_values=None,
-            position_ids=position_ids,
-        )
         position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids=position_ids)
     return {
         "inputs_embeds": inputs_embeds,
         "position_ids": position_ids,
-        "attention_mask": attention_mask,
+        "attention_mask": None,
         "position_embeddings": position_embeddings,
         "cache_position": cache_position,
     }
 
 
-def _run_block_rolling(layer, hidden, inv):
+def _run_block_rolling(layer, hidden, inv, layer_idx: int = -1):
     """Execute one Llama decoder layer in rolling mode."""
+    cos, sin = inv["position_embeddings"]
+    print(f"  [rolling layer {layer_idx}] cos shape={tuple(cos.shape)} sin shape={tuple(sin.shape)} hidden shape={tuple(hidden.shape)}")
     with torch.no_grad():
         hidden = layer(
             hidden,
             attention_mask=inv["attention_mask"],
             position_ids=inv["position_ids"],
             position_embeddings=inv["position_embeddings"],
-            cache_position=inv["cache_position"],
             use_cache=False,
         )[0]
     return hidden
@@ -67,7 +64,7 @@ def _capture_layer_residual_rolling(model, input_ids, target_layer: int):
     inv = _build_invariants(model, input_ids)
     hidden = inv["inputs_embeds"]
     for i in range(target_layer + 1):
-        hidden = _run_block_rolling(model.model.layers[i], hidden, inv)
+        hidden = _run_block_rolling(model.model.layers[i], hidden, inv, layer_idx=i)
     return hidden
 
 
@@ -99,7 +96,11 @@ def _detach_kwarg(v):
 
 
 def _hook_replay_correctness(model, input_ids, test_layers):
-    """Capture exact layer inputs/kwargs via forward_pre_hook and replay them standalone."""
+    """Capture exact layer inputs/kwargs via forward_pre_hook and replay them standalone.
+
+    Reference forward uses use_cache=False so captured kwargs are stateless and
+    layer replay should be exactly bit-for-bit identical.
+    """
     captured = {}
 
     def make_hook(idx):
@@ -117,7 +118,7 @@ def _hook_replay_correctness(model, input_ids, test_layers):
         for i, layer in enumerate(model.model.layers)
     ]
     with torch.no_grad():
-        out = model(input_ids=input_ids, output_hidden_states=True)
+        out = model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
     for h in handles:
         h.remove()
 
@@ -128,9 +129,11 @@ def _hook_replay_correctness(model, input_ids, test_layers):
         hidden = rec["hidden"]
         kwargs = dict(rec["kwargs"])
         kwargs.pop("hidden_states", None)
-        if L == test_layers[0]:
-            _print_kwargs(f"layer {L} captured", kwargs)
-        rolled = model.model.layers[L](hidden, **kwargs)[0]
+        kwargs.pop("past_key_values", None)
+        kwargs.pop("output_hidden_states", None)
+        kwargs.pop("use_cache", None)
+        _print_kwargs(f"layer {L} captured", kwargs)
+        rolled = model.model.layers[L](hidden, use_cache=False, **kwargs)[0]
         err = (refs[L + 1] - rolled).abs().max().item()
         print(f"  hook replay layer {L:2d}: max abs diff = {err:.4f}")
         if err > 1e-2:
@@ -141,7 +144,7 @@ def _hook_replay_correctness(model, input_ids, test_layers):
 
 def main(
     model_id: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
-    test_layers=(0, 1, 15, 29),
+    test_layers=(0, 1, 15, 28),
     n_batches_for_speed: int = 50,
     batch_size: int = 1,
     seq_len: int = 128,

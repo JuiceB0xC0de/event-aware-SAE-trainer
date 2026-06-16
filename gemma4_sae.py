@@ -84,7 +84,7 @@ app = modal.App("gemma4-sae-train", image=image)
 # =============================================================================
 
 REPO_URL = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer.git"
-REPO_BRANCH = "main"
+REPO_BRANCH = "fix/llama-rolling-capture"
 REPO_DIR = "/opt/sae-trainer"
 
 
