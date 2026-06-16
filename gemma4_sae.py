@@ -45,11 +45,10 @@ image = (
     # untouched so new commits don't trigger a full reinstall.
     .env({
         "SAE_DATA_DIR": "/data",
-        # Container-local NVMe, NOT a Modal Volume. The activation pool is read
-        # once per step (168MB/shard at d_in=2560); on the network Volume this
-        # capped throughput at ~193MB/s and starved the H100 (37k tok/s) while
-        # blocking the Modal heartbeat -> container restarts. Local disk is GB/s.
-        "SAE_SCRATCH_DIR": "/root/rollcache",
+        # Default scratch is persistent /data/scratch so rolling resume pools survive
+        # container death. Override to /root/rollcache for faster container-local NVMe
+        # when you don't need resume (e.g. one-shot multi-layer atlas).
+        "SAE_SCRATCH_DIR": "/data/scratch",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
         # Synchronous CUDA errors so assert/oom tracebacks point at the real line.
@@ -163,12 +162,12 @@ class SAETainer:
               microbatch_tokens: int = 32768, resume_from: str | None = None,
               evict_model: bool = True, target_l0: int | None = None,
               timing: bool = False, compile: bool = False,
-              scratch_dir: str = "/root/rollcache") -> dict:
+              scratch_dir: str = "/data/scratch") -> dict:
         """
         Train SAEs on a range of layers.
 
         Args:
-            layer_range: "start,end" e.g. "0,15" or "15,42"
+            layer_range: "start,end" INCLUSIVE e.g. "0,15" trains layers 0 through 15
             capture: "rolling" (Gemma 0-14), "rolling-hf" (Llama/SmolLM2/Qwen), or "auto" (any layer)
             expansion: SAE expansion factor (default 32)
             pool_batches: activation batches to cache (default 2000)
@@ -177,6 +176,8 @@ class SAETainer:
             resume_from: optional /data/.../checkpoint_full.pt for the first trained layer
             evict_model: move the LLM to CPU during SAE training to free VRAM (default True)
             compile: enable torch.compile on the SAE (default False; SAE-only benchmark showed no speedup on A10)
+            scratch_dir: activation pool scratch path. /data/scratch persists across Modal jobs;
+                /root/rollcache is faster container-local NVMe but is lost when the job ends.
         """
         import os
         import subprocess
@@ -192,7 +193,7 @@ class SAETainer:
         print(f"\n{'='*60}")
         print("Training SAE atlas")
         print(f"  Model: {self.model_path}")
-        print(f"  Layers: {start}-{end} ({end-start} layers)")
+        print(f"  Layers: {start}-{end} ({end-start+1} layers)")
         print(f"  Capture: {capture}")
         print(f"  Expansion: {expansion}x")
         print(f"  Pool batches: {pool_batches}")
@@ -513,12 +514,14 @@ def main(
     evict_model: bool = True,
     target_l0: int | None = None,
     timing: bool = False,
-    scratch_dir: str = "/root/rollcache",
+    scratch_dir: str = "/data/scratch",
     model_id: str = "google/gemma-4-e4b-it",
     compile: bool = False,
 ):
     """
     Train SAEs on any HuggingFace causal LM.
+
+    Layer ranges are INCLUSIVE: "0,15" trains layers 0 through 15.
 
     Examples:
         modal run gemma4_sae.py --layer-range 0,15 --capture rolling

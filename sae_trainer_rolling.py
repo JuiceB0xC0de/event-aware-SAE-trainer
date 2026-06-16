@@ -2393,7 +2393,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       push: bool = True, capture: str = "auto", model_id: str = None,
                       hub_id: str = None, wandb_project: str = None, expansion: int = None,
                       evict_model: bool = True, target_l0: int = None):
-    """Train one SAE per decoder layer in [start_layer, end_layer).
+    """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
              "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized);
@@ -2474,10 +2474,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         capture = "auto"
     model.to(device)
 
-    end_layer = min(end_layer, n_layers)
-    assert 0 <= start_layer < end_layer <= n_layers, \
-        f"bad layer range [{start_layer},{end_layer}) for a {n_layers}-layer model"
-    layers = list(range(start_layer, end_layer))
+    end_layer = min(end_layer, n_layers - 1)
+    assert 0 <= start_layer <= end_layer < n_layers, \
+        f"bad layer range [{start_layer},{end_layer}] for a {n_layers}-layer model"
+    layers = list(range(start_layer, end_layer + 1))
     print(f"  model={type(model).__name__}  blocks={len(decoder_layers)}  d_in={d_in}  "
           f"n_features={N_FEATURES} ({EXPANSION}x)  capture={capture}")
     if capture == "rolling" and d_in != D_IN:
@@ -2563,7 +2563,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 print(f"  [resume] rolling checkpoint found for layer {resume_layer}; "
                       f"chain resumes at L{walk_start}")
 
-    for L in range(walk_start, end_layer):
+    for L in range(walk_start, end_layer + 1):
         dst_dir = pool_dir_for(L)
         if capture in ("rolling", "rolling-hf"):
             src_dir = pool_dir_for(L - 1) if L >= 1 else None
@@ -2582,7 +2582,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             # Pipeline: while the LLM is still hot on GPU, pre-produce the next layer's pool.
             # When training L finishes, pool L+1 is already on disk and we start immediately.
             pre_produced_next = False
-            if L + 1 < end_layer:
+            if L + 1 <= end_layer:
                 next_dir = pool_dir_for(L + 1)
                 if len(_shard_paths(next_dir)) < pool_batches:
                     print(f"  [pipeline] pre-producing pool L{L+1} while model hot ...")
@@ -2688,7 +2688,7 @@ def main():
                         "rolling-hf=generic Llama/SmolLM2/Qwen single-block fast path")
     p.add_argument("--start-layer", type=int, default=0)
     p.add_argument("--end-layer", type=int, default=9,
-                   help="exclusive; clamped to model depth (and to 15 under --capture rolling)")
+                   help="inclusive; clamped to model depth (and to 15 under --capture rolling)")
     p.add_argument("--expansion", type=int, default=None,
                    help=f"SAE dict = expansion * d_in (default {EXPANSION})")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
