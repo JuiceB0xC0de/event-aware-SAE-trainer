@@ -42,12 +42,7 @@ def _sae_forward_pytorch(sae, x, dtype):
 
 
 def _kernel_math_emulation(sae, x, dtype=torch.bfloat16):
-    """Emulate the kernel's math exactly: cast operands to bf16, reduce in fp32.
-
-    Uses smaller effective batch (same as x here; keep it cheap) and the same
-    tile-invariant reduction order as a plain matmul would. This is a bound, not
-    the ground truth.
-    """
+    """Emulate the kernel's math: cast operands to bf16, reduce in fp32."""
     xb = x.to(dtype)
     W_enc = sae.W_enc.weight.to(dtype)
     b_enc = sae.W_enc.bias.to(dtype)
@@ -56,7 +51,7 @@ def _kernel_math_emulation(sae, x, dtype=torch.bfloat16):
     log_thr = sae.log_threshold.to(dtype)
 
     with torch.no_grad():
-        pre = (xb - b_dec) @ W_enc.t() + b_enc  # still fp32 accumulation inside cuBLAS
+        pre = (xb - b_dec) @ W_enc.t() + b_enc
         threshold = torch.exp(log_thr)
         gate = (pre > threshold).to(dtype)
         feat = pre * gate
@@ -65,18 +60,16 @@ def _kernel_math_emulation(sae, x, dtype=torch.bfloat16):
     return xhat, l0, pre, gate
 
 
-def _report(ref_label, xhat_ref, l0_ref, xhat_tri, l0_tri):
+def _err_stats(label, xhat_ref, l0_ref, xhat_tri, l0_tri):
     diff = (xhat_tri - xhat_ref).abs().float()
     l0_diff = (l0_tri - l0_ref).abs().float()
-    print(f"\n[REPORT] {ref_label}")
-    print(f"  recon p50={diff.quantile(0.50).item():.2e}  "
-          f"p95={diff.quantile(0.95).item():.2e}  "
-          f"p99={diff.quantile(0.99).item():.2e}  "
-          f"max={diff.max().item():.2e}  mean={diff.mean().item():.2e}")
-    print(f"  L0    p50={l0_diff.quantile(0.50).item():.2e}  "
-          f"p95={l0_diff.quantile(0.95).item():.2e}  "
-          f"p99={l0_diff.quantile(0.99).item():.2e}  "
-          f"max={l0_diff.max().item():.2e}  mean={l0_diff.mean().item():.2e}")
+    print(f"\n[REPORT] {label}")
+    print(f"  recon mean={diff.mean().item():.2e} "
+          f"rms={diff.pow(2).mean().sqrt().item():.2e} "
+          f"max={diff.max().item():.2e}")
+    print(f"  L0    mean={l0_diff.mean().item():.2e} "
+          f"rms={l0_diff.pow(2).mean().sqrt().item():.2e} "
+          f"max={l0_diff.max().item():.2e}")
     return diff, l0_diff
 
 
@@ -115,7 +108,6 @@ def main():
     # ---------------- forced-gate tests ----------------
     _stage("forced-gate correctness tests")
 
-    # all-off: drive every preactivation far below threshold by subtracting a huge bias offset
     with torch.no_grad():
         log_thr = sae.log_threshold
         threshold = torch.exp(log_thr)
@@ -125,14 +117,12 @@ def main():
     with torch.no_grad():
         sae_off.W_enc.bias.copy_(b_enc_off)
     xhat_off, l0_off = fused_sae_forward(x, sae_off)
-    b_dec_off = sae_off.b_dec
-    off_err = (xhat_off - b_dec_off).abs().max().item()
+    off_err = (xhat_off - sae_off.b_dec).abs().max().item()
     print(f"[ALL-OFF] max |xhat - b_dec| = {off_err:.2e}  L0 max = {l0_off.max().item():.2e}")
     assert off_err < 1e-3, f"all-off test failed: {off_err}"
     assert l0_off.max().item() == 0.0, "all-off L0 must be zero"
     _ok("all-off forced test passed")
 
-    # all-on-ish: drive every preactivation far above threshold
     b_enc_on = sae.W_enc.bias + (max_thr + 10.0)
     sae_on = _make_sae(d_in=d_in, n_features=n_features, seed=0).to(device)
     with torch.no_grad():
@@ -144,12 +134,10 @@ def main():
         xhat_ref_on = sae_on.decode(feat_on)
         l0_ref_on = gate_on.sum(dim=-1, dtype=torch.float32)
     diff_on = (xhat_tri_on - xhat_ref_on).abs().float()
-    on_recon_err = diff_on.max().item()
     on_l0_err = (l0_tri_on - l0_ref_on).abs().max().item()
-    print(f"[ALL-ON ] recon p50={diff_on.quantile(0.50).item():.2e}  "
-          f"p95={diff_on.quantile(0.95).item():.2e}  "
-          f"p99={diff_on.quantile(0.99).item():.2e}  "
-          f"max={on_recon_err:.2e}  mean={diff_on.mean().item():.2e}")
+    print(f"[ALL-ON ] recon mean={diff_on.mean().item():.2e} "
+          f"rms={diff_on.pow(2).mean().sqrt().item():.2e} "
+          f"max={diff_on.max().item():.2e}")
     print(f"[ALL-ON ] max L0 err = {on_l0_err:.2e}")
     assert torch.isfinite(xhat_tri_on).all(), "all-on output contains inf/nan"
     assert on_l0_err < 1e-3, f"all-on L0 test failed: {on_l0_err}"
@@ -167,7 +155,7 @@ def main():
     _threshold_margin_stats(pre_fp32, sae.log_threshold, margin=0.10)
     _threshold_margin_stats(pre_fp32, sae.log_threshold, margin=0.20)
 
-    _stage("compute Triton fused forward (compile + single-config autotune)")
+    _stage("compute Triton fused forward (compile + single-config)")
     t0 = time.perf_counter()
     xhat_tri, l0_tri = fused_sae_forward(x, sae)
     torch.cuda.synchronize()
@@ -175,15 +163,11 @@ def main():
     print(f"[MEM ] allocated={_mem()[0]:.1f} MB  reserved={_mem()[1]:.1f} MB")
     _ok("Triton forward compile complete")
 
-    _report("Triton vs PyTorch bf16 autocast", xhat_bf16, l0_bf16, xhat_tri, l0_tri)
-    _report("Triton vs PyTorch fp32", xhat_fp32, l0_fp32, xhat_tri, l0_tri)
-    _report("Triton vs kernel-math emulation", xhat_kmath, l0_kmath, xhat_tri, l0_tri)
+    _err_stats("Triton vs PyTorch bf16 autocast", xhat_bf16, l0_bf16, xhat_tri, l0_tri)
+    _err_stats("Triton vs PyTorch fp32", xhat_fp32, l0_fp32, xhat_tri, l0_tri)
+    _err_stats("Triton vs kernel-math emulation", xhat_kmath, l0_kmath, xhat_tri, l0_tri)
 
-    # Gate agreement statistics would require materialising [B, n_features];
-    # skip in this fused-kernel diagnostic.
-    _warn("gate agreement not computed (would require full pre materialisation)")
-
-    # ---------------- backward correctness (against bf16 autocast, the real baseline) ----------------
+    # ---------------- backward correctness ----------------
     _stage("backward correctness against bf16 autocast baseline")
 
     def _run_ref_backward():
