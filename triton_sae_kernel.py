@@ -127,9 +127,9 @@ else:
                     other=0.0,
                 )
 
-                # [BLOCK_D] * [BLOCK_D, BLOCK_F] -> [BLOCK_F] via elementwise sum.
-                # (tl.dot+reshape was producing incorrect values in this Triton build.)
-                pre += tl.sum(xb[:, None] * w_enc, axis=0)
+                # [BLOCK_D] * [BLOCK_D, BLOCK_F] -> [BLOCK_F]. Cast product to fp32
+                # before summing so accumulation matches PyTorch's bf16 matmul.
+                pre += tl.sum((xb[:, None] * w_enc).to(tl.float32), axis=0)
 
             # ---- JumpReLU gate ----
             log_thr = tl.load(LogThr_ptr + f_range, mask=mask_f, other=1.0).to(tl.float32)
@@ -146,9 +146,9 @@ else:
                 other=0.0,
             )
 
-            # [BLOCK_F] * [BLOCK_F, BLOCK_D] -> [BLOCK_D] via elementwise sum.
-            # (tl.dot+reshape was producing incorrect values in this Triton build.)
-            out += tl.sum(gate[:, None] * w_dec, axis=0)
+            # [BLOCK_F] * [BLOCK_F, BLOCK_D] -> [BLOCK_D]. Cast product to fp32
+            # before summing so accumulation matches PyTorch's bf16 matmul.
+            out += tl.sum((gate[:, None] * w_dec).to(tl.float32), axis=0)
 
         # Add b_dec slice and store this d-tile.
         b_dec_slice = tl.load(B_dec_ptr + d_range, mask=mask_d, other=0.0).to(tl.float32)
