@@ -39,7 +39,7 @@ image = (
         "TRITON_CACHE_DIR": "/tmp/triton-cache",  # Avoid permission issues
         "SAE_USE_TRITON": "1",  # Enable Triton fused kernel experiment
     })
-    .env({
+    .env({})
     # Bake the local trainer modules into the image so the container
     # always sees the working tree (Modal 1.4 dropped cls-level mounts).
     .add_local_file(
@@ -50,6 +50,16 @@ image = (
     .add_local_file(
         "/Users/chiggy/event-aware-SAE-trainer/sae_scheduler.py",
         "/opt/sae-trainer/sae_scheduler.py",
+        copy=True,
+    )
+    .add_local_file(
+        "/Users/chiggy/event-aware-SAE-trainer/triton_sae_kernel.py",
+        "/opt/sae-trainer/triton_sae_kernel.py",
+        copy=True,
+    )
+    .add_local_file(
+        "/Users/chiggy/event-aware-SAE-trainer/benchmark_triton_kernel.py",
+        "/opt/sae-trainer/benchmark_triton_kernel.py",
         copy=True,
     )
     .env({
@@ -210,6 +220,33 @@ class SAETainer:
         subprocess.run(["sync"])
 
         return {"status": "complete", "layers": list(range(start, end)), "results": results}
+
+    @modal.method()
+    def benchmark_kernel(self) -> dict:
+        """Run the Triton kernel micro-benchmark on an A10G.
+
+        Returns timing/correctness numbers for PyTorch vs Triton forward+backward
+        on a SmolLM2-135M-instruct sized SAE (d_in=576, n_features=18431).
+        """
+        import os
+        import subprocess
+        import sys
+
+        sys.path.insert(0, "/opt/sae-trainer")
+        env = os.environ.copy()
+        # The trainer modules are already baked into /opt/sae-trainer.
+        proc = subprocess.run(
+            [sys.executable, "/opt/sae-trainer/benchmark_triton_kernel.py"],
+            cwd="/opt/sae-trainer",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        print(proc.stdout)
+        if proc.returncode != 0:
+            print(proc.stderr)
+            raise RuntimeError(f"benchmark failed with code {proc.returncode}")
+        return {"status": "ok", "stdout": proc.stdout}
 
 
 # =============================================================================

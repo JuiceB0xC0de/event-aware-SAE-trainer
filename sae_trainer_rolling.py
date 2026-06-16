@@ -1777,28 +1777,36 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # from THIS forward -- the two extra full-batch encode passes that used to
             # bracket this loop (one for L0, one for the fired mask) are gone.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                if use_triton_fwd:
-                    # Triton fused forward - returns x_hat and per-token L0
-                    x_hat, l0_per_token = fused_sae_forward(acts_mb, sae)
+                triton_ok_this_step = use_triton_fwd
+                if triton_ok_this_step:
+                    # The fused kernel's backward does not yet implement the dead-feature
+                    # aux loss.  Use the standard PyTorch path whenever dead features need
+                    # revival so training behaviour is preserved.
+                    if n_dead > 0:
+                        triton_ok_this_step = False
+
+                if triton_ok_this_step:
+                    # Triton fused forward with autograd.  If the kernel fails to compile
+                    # for this shape/device, fall back cleanly to the PyTorch path.
+                    try:
+                        x_hat, l0_per_token = fused_sae_forward(acts_mb, sae)
+                    except Exception as e:
+                        print(f"  [TRITON] Fused forward failed ({e}); falling back to PyTorch for this step")
+                        triton_ok_this_step = False
+
+                if triton_ok_this_step:
                     l0_mb = l0_per_token.mean()
-                    # Compute recon loss
                     residual_float = acts_mb.float() - x_hat.float()
                     recon_loss = residual_float.pow(2).mean() / accum_steps
-                    # Sparsity penalty
                     slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
                     sparsity_loss = (
                         scheduler.lambda_l0 * slack
                         + 0.5 * sae_cfg.al_mu * slack * slack
                     ) / accum_steps
-                    # No aux loss in Triton path yet (simplified)
                     aux_loss = torch.zeros((), device=acts_mb.device, dtype=torch.float32)
                     loss = recon_loss + sparsity_loss + aux_loss
-                    # For fired_accum, we need to recompute gate (Triton doesn't return it)
-                    with torch.no_grad():
-                        pre = sae.encode_pre(acts_mb)
-                        fired_accum |= (sae.l0_indicator(pre) > 0).any(dim=0)
                 else:
-                    # Standard PyTorch forward
+                    # Standard PyTorch forward (also used as Triton fallback).
                     pre = sae.encode_pre(acts_mb)
                     feat_acts, gate = sae.jumprelu_with_gate(pre)
                     x_hat = sae.decode(feat_acts)
@@ -1838,7 +1846,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             accum_sparsity_loss += sparsity_loss.detach().item() * accum_steps
             accum_aux_loss += aux_loss.detach().item() * accum_steps
             with torch.no_grad():
-                fired_accum |= (feat_acts.detach() > 0).any(dim=0)
+                if triton_ok_this_step:
+                    # The fused kernel does not return gate, so recompute it cheaply
+                    # for the fire-state tracker (no backward needed).
+                    pre = sae.encode_pre(acts_mb)
+                    fired_accum |= (sae.l0_indicator(pre) > 0).any(dim=0)
+                else:
+                    fired_accum |= (feat_acts.detach() > 0).any(dim=0)
 
             # Collect high-error activation candidates for the upcoming resample.
             # Reuses the main forward's residual (computed above) instead of running a
