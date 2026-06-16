@@ -273,6 +273,35 @@ class SAETainer:
         return {"status": "ok", "stdout": proc.stdout}
 
     @modal.method()
+    def benchmark_pytorch_sae(self, compile_sae: bool = False) -> dict:
+        """Run the SAE-only PyTorch fwd+bwd benchmark (no data pipeline).
+
+        This is the clean number for the standard SAE math path under bf16
+        autocast, optionally with torch.compile.
+        """
+        import os
+        import subprocess
+        import sys
+
+        _sync_repo()
+        sys.path.insert(0, "/opt/sae-trainer")
+        env = os.environ.copy()
+        env["SAE_USE_TRITON"] = "0"
+        cmd = [sys.executable, "/opt/sae-trainer/benchmark_pytorch_sae.py"]
+        if compile_sae:
+            cmd.append("--compile")
+        print(f"[SAETainer.benchmark_pytorch_sae] compile={compile_sae} launching...")
+        proc = subprocess.run(cmd, cwd="/opt/sae-trainer", env=env, capture_output=True, text=True)
+        print("[SAETainer.benchmark_pytorch_sae] ----- STDOUT -----")
+        print(proc.stdout)
+        print("[SAETainer.benchmark_pytorch_sae] ----- STDERR -----")
+        print(proc.stderr)
+        print("[SAETainer.benchmark_pytorch_sae] ----- END -----")
+        if proc.returncode != 0:
+            raise RuntimeError(f"benchmark failed with code {proc.returncode}")
+        return {"status": "ok", "stdout": proc.stdout}
+
+    @modal.method()
     def debug_kernel(self) -> dict:
         """Run the tiny debug script that prints Triton vs PyTorch intermediates."""
         import os
@@ -282,6 +311,7 @@ class SAETainer:
         _sync_repo()
         sys.path.insert(0, "/opt/sae-trainer")
         env = os.environ.copy()
+        env["SAE_USE_TRITON"] = "0"
         proc = subprocess.run(
             [sys.executable, "/opt/sae-trainer/debug_triton_kernel.py"],
             cwd="/opt/sae-trainer",
