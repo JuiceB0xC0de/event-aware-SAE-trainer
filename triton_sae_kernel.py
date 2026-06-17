@@ -21,8 +21,10 @@ import torch.nn as nn
 try:
     import triton
     import triton.language as tl
+    import torch
 
-    _HAS_TRITON = True
+    # We must have both the Triton module and an available CUDA device.
+    _HAS_TRITON = torch.cuda.is_available()
 except Exception:  # pragma: no cover
     triton = None  # type: ignore
     tl = None  # type: ignore
