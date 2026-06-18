@@ -359,7 +359,8 @@ else:
             out = torch.empty_like(x)
             l0 = torch.empty(B, device=x.device, dtype=torch.float32)
 
-            grid = lambda meta: (B, triton.cdiv(d_in, meta["BLOCK_D"]))
+            def grid(meta):
+                return (B, triton.cdiv(d_in, meta["BLOCK_D"]))
 
             _fused_sae_fwd_kernel[grid](
                 x_c, W_enc_T, b_enc_k, W_dec_T, b_dec_k, log_thr_k,
@@ -410,10 +411,11 @@ else:
             W_enc_bwd = W_enc.t().contiguous()   # [d_in, n_features]
             W_dec_bwd = W_dec.t().contiguous()   # [d_in, n_features]
 
-            grid = lambda meta: (
-                triton.cdiv(n_features, meta["BLOCK_F"]),
-                triton.cdiv(d_in, meta["BLOCK_D"]),
-            )
+            def grid(meta):
+                return (
+                            triton.cdiv(n_features, meta["BLOCK_F"]),
+                            triton.cdiv(d_in, meta["BLOCK_D"]),
+                        )
 
             _fused_sae_bwd_kernel[grid](
                 x_c,

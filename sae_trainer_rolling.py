@@ -270,7 +270,9 @@ class RevivalController:
 
     def dead_pct(self, window: int) -> float:
         """Percent of features silent for at least `window` steps."""
-        return (self.steps_since_fired >= window).float().mean().item() * 100
+        # ⚡ Bolt Optimization: Use .sum(dtype=torch.float32) instead of casting the entire boolean mask to .float()
+        # This avoids allocating a full-sized float tensor, significantly reducing memory bandwidth and execution time.
+        return ((self.steps_since_fired >= window).sum(dtype=torch.float32) / max(self.steps_since_fired.numel(), 1)).item() * 100
 
     def fire_rate(self, window: int):
         """Per-feature fire rate over the accumulation window."""
@@ -832,7 +834,6 @@ def _produce_pool_hf_rolling(model, text_model, decoder_layers, layer, tok_dir, 
     layer>=1: block L over src_dir (= pool[L-1]).
     """
     import time
-    import torch
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -1538,7 +1539,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # default mode: balanced compile time vs runtime speed
             # fullgraph=False allows graph breaks at the custom autograd Function.
             sae = torch.compile(sae, mode="default", fullgraph=False, dynamic=False)
-            print(f"  torch.compile enabled on SAE (default, fullgraph=False)")
+            print("  torch.compile enabled on SAE (default, fullgraph=False)")
         except Exception as e:
             print(f"  WARNING: torch.compile failed ({e}), falling back to eager SAE")
     else:
@@ -1607,7 +1608,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             probe = probe_batch[:probe_tokens]
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 probe_pre = sae.encode_pre(probe)
-                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1).float().mean().item()
+                # ⚡ Bolt Optimization: Pass dtype=torch.float32 to .sum() instead of .float().mean()
+                # Accumulating the sum in fp32 directly prevents intermediate type conversion overhead
+                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1, dtype=torch.float32).mean().item()
             activation_norm = probe.float().pow(2).mean().sqrt().item()
             ref_norm = activation_norm_ref if activation_norm_ref and activation_norm_ref > 0 else activation_norm
             norm_ratio = activation_norm / max(ref_norm, 1e-8)
@@ -1654,7 +1657,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                       f"warmup_thr={warmup_threshold:.4f} old_thr_mean={current_thr_mean:.4f}")
                 # Re-measure L0 after warmup to update the scheduler's initial state
                 with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1).float().mean().item()
+                    # ⚡ Bolt Optimization: Pass dtype=torch.float32 to .sum() instead of .float().mean()
+                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1, dtype=torch.float32).mean().item()
                 print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f}, "
                       f"target_warmup_L0={warmup_l0_target:.0f})")
                 initial_l0 = warmup_l0  # use updated L0 for the rest of preflight
@@ -1855,10 +1859,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if use_triton_fwd:
             try:
                 from triton_sae_kernel import fused_sae_forward
-                print(f"  [TRITON] Using fused SAE kernel")
+                print("  [TRITON] Using fused SAE kernel")
             except ImportError:
                 use_triton_fwd = False
-                print(f"  [TRITON] Kernel not available, falling back to PyTorch")
+                print("  [TRITON] Kernel not available, falling back to PyTorch")
 
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
@@ -1970,7 +1974,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             timing["evt_opt_start"] = _new_cuda_event()
             if timing["evt_opt_start"] is not None:
                 timing["evt_opt_start"].record()
-            t_opt_start = time.perf_counter()
+            time.perf_counter()
 
         # Single optimizer step after accumulation.
         # grad_norm is only needed for logging/W&B, so defer the .item() sync
@@ -2153,7 +2157,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
                 fire_rate = revival.fire_rate(LOG_EVERY)
-                ultra_active = (fire_rate > 0.10).float().sum().item()
+                # ⚡ Bolt Optimization: Use .sum(dtype=torch.float32) instead of .float().sum() to avoid float tensor allocation
+                ultra_active = (fire_rate > 0.10).sum(dtype=torch.float32).item()
             now = time.time()
             tokens_per_sec = log_window_tokens / max(now - log_window_start, 1e-6)
             log_window_start = now; log_window_tokens = 0
@@ -2286,7 +2291,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            "scheduler/phase_idx": _PHASE_IDX.get(scheduler.phase, -1),
                            "scheduler/effective_slingshot_gain": scheduler._effective_slingshot_gain(),
                            "scheduler/activation_norm_preflight": scheduler._activation_norm_preflight,
-                           "timing/tokens_per_sec": tokens_per_sec,
                            **({f"timing/{k}": v for k, v in {
                                "provider_ms": t_provider_avg * 1000,
                                "fwd_bwd_cuda_ms": cuda_ms["fwd_bwd"],
@@ -2567,12 +2571,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         dst_dir = pool_dir_for(L)
         if capture in ("rolling", "rolling-hf"):
             src_dir = pool_dir_for(L - 1) if L >= 1 else None
-            consume_src = True
             if L == resume_layer + 1 and resume_layer >= 0:
                 # The persistent resume pool is the source for the first produced layer.
                 # Do not consume it -- it stays on disk until the next layer finishes.
                 src_dir = _resume_pool_dir(seed)
-                consume_src = False
             if capture == "rolling":
                 _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
                               dst_dir, device)

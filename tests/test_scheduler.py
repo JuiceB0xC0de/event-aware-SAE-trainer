@@ -330,7 +330,7 @@ def test_old_checkpoint_without_phase_fields_restores_safely(tiny_sae, tmp_path)
     sched.phase_step = 7
     sched.pin_ev_count = 2
 
-    n = sum(1 for _ in sae.parameters())  # any size; roundtrip only needs a tensor
+    sum(1 for _ in sae.parameters())  # any size; roundtrip only needs a tensor
     ffc = torch.zeros(8, dtype=torch.long)
     ssf = torch.zeros(8, dtype=torch.long)
     rng = {"cuda": None, "cpu": torch.get_rng_state()}
