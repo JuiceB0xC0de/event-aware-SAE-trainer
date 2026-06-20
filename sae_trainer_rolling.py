@@ -94,8 +94,8 @@ N_FEATURES    = EXPANSION * D_IN   # 49152 at d_in=1536; recomputed for the dete
 K             = 500         # FINAL target L0. Natural L0 settles ~550 at 32x; target<natural keeps lambda slightly positive.
 K_INIT        = 500         # Curriculum disabled (== K)
 K_CURRICULUM_STEPS = 1      # effectively disabled (target_l0 = K from step 1)
-BATCH_TOKENS  = 32_768      # total tokens per SAE step (accumulated across microbatches if --accum-steps > 1)
-MICROBATCH_TOKENS = 32_768  # tokens per microbatch for gradient accumulation; default = no accumulation
+BATCH_TOKENS  = int(os.environ.get("SAE_BATCH_TOKENS", "32768"))  # total tokens per SAE step (must be divisible by SEQ_LEN)
+MICROBATCH_TOKENS = int(os.environ.get("SAE_MICROBATCH_TOKENS", str(BATCH_TOKENS)))  # tokens per microbatch for gradient accumulation
 SEQ_LEN       = 2_048       # length passed to the model (attention is O(seq^2))
 N_STEPS       = 15_000      # peak-EV early-stop usually fires well before this
 LR            = 2e-4
@@ -1404,7 +1404,8 @@ def _load_full_checkpoint(ckpt_path, sae, optimizer, scheduler, device):
 def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=False,
                              max_steps=N_STEPS, bdec_batches=BDEC_INIT_BATCHES,
                              microbatch_tokens=MICROBATCH_TOKENS,
-                             resume_from=None, push=True, activation_norm_ref=None):
+                             resume_from=None, push=True, activation_norm_ref=None,
+                             cpu=False):
     """Train one JumpReLU SAE on activations supplied by `provider`.
 
     Gradient accumulation: if `microbatch_tokens < BATCH_TOKENS`, accumulate gradients
@@ -1415,6 +1416,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     bf16 path: activations are kept in bf16 through the forward; loss/reductions in fp32.
     """
+    import contextlib
     import json
     import math
     import time
@@ -1423,16 +1425,22 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     import torch.nn as nn
     from sae_scheduler import SAEAECSConfig, SAEEventControlScheduler
 
+    def _autocast():
+        if device.type == "cuda":
+            return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
     n_steps = int(min(max_steps, N_STEPS))
     accum_steps = BATCH_TOKENS // microbatch_tokens
     assert BATCH_TOKENS % microbatch_tokens == 0, \
         f"BATCH_TOKENS ({BATCH_TOKENS}) must be divisible by microbatch_tokens ({microbatch_tokens})"
 
-    device = torch.device("cuda")
+    device = torch.device("cuda" if not cpu else "cpu")
     torch.manual_seed(seed)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True  # Critical for H100
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True  # Critical for H100
     torch.set_float32_matmul_precision("high")
 
     # -- LAMBDA tier (layers 0-14 only -> hot/trough/mid) ---------------------
@@ -1551,7 +1559,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
          {"params": sae.W_dec.parameters(), "weight_decay": 1e-4},
          {"params": [sae.b_dec], "weight_decay": 0},
          {"params": [sae.log_threshold], "weight_decay": 0}],
-        lr=LR, betas=(0.9, 0.999), fused=True)
+        lr=LR, betas=(0.9, 0.999), fused=(device.type == "cuda"))
     scheduler = SAEEventControlScheduler(optimizer, sae_cfg, mode_label=f"L{layer:02d}",
                                          layer=layer)
 
@@ -1605,7 +1613,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if probe_batch is not None:
             probe_tokens = min(probe_batch.shape[0], max(1024, min(microbatch_tokens, 8192)))
             probe = probe_batch[:probe_tokens]
-            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with torch.no_grad(), _autocast():
                 probe_pre = sae.encode_pre(probe)
                 initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1).float().mean().item()
             activation_norm = probe.float().pow(2).mean().sqrt().item()
@@ -1653,7 +1661,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                       f"warmup_target_L0={warmup_l0_target:.0f} (pctile={pctile:.1f}%) "
                       f"warmup_thr={warmup_threshold:.4f} old_thr_mean={current_thr_mean:.4f}")
                 # Re-measure L0 after warmup to update the scheduler's initial state
-                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                with torch.no_grad(), _autocast():
                     warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1).float().mean().item()
                 print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f}, "
                       f"target_warmup_L0={warmup_l0_target:.0f})")
@@ -1725,6 +1733,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             "n_steps": 0,
             "_last_provider": 0.0,
             "_last_errbuf": 0.0,
+            "_last_fwd_bwd": 0.0,
+            "_last_opt_norm": 0.0,
             "evt_fwd_bwd_start": None,
             "evt_fwd_bwd_end": None,
             "evt_opt_start": None,
@@ -1779,6 +1789,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     # -- training loop --------------------------------------------------------
     last_step = start_step - 1
+    t_step_start_prev = None
     for step in range(start_step, n_steps + 1):
         last_step = step
         if do_timing:
@@ -1869,7 +1880,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # Everything the step needs (recon, L0, sparsity, aux, fired-mask) comes
             # from THIS forward -- the two extra full-batch encode passes that used to
             # bracket this loop (one for L0, one for the fired mask) are gone.
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast():
                 triton_ok_this_step = use_triton_fwd
                 if triton_ok_this_step:
                     # The fused kernel's backward does not yet implement the dead-feature
@@ -1963,7 +1974,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         ))
 
         if do_timing:
-            timing["t_fwd_bwd_wall"] += time.perf_counter() - t_fwd_bwd_wall_start
+            _fwd_bwd_elapsed = time.perf_counter() - t_fwd_bwd_wall_start
+            timing["t_fwd_bwd_wall"] += _fwd_bwd_elapsed
+            timing["_last_fwd_bwd"] = _fwd_bwd_elapsed
             timing["evt_fwd_bwd_end"] = _new_cuda_event()
             if timing["evt_fwd_bwd_end"] is not None:
                 timing["evt_fwd_bwd_end"].record()
@@ -2010,6 +2023,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             timing["evt_norm_end"] = _new_cuda_event()
             if timing["evt_norm_end"] is not None:
                 timing["evt_norm_end"].record()
+            timing["_last_opt_norm"] = time.perf_counter() - t_opt_start
 
         # accum_recon_loss / accum_l0 are already Python floats (summed from the
         # microbatch .item() calls); use them directly instead of bouncing through
@@ -2088,6 +2102,32 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 t_step_total - timing["_last_provider"] - timing["_last_errbuf"]
             )
             timing["n_steps"] += 1
+
+            # Live per-step timing: no CUDA sync, so usable every step on CPU/GPU.
+            _prev = t_step_start_prev if t_step_start_prev is not None else t_step_start
+            dt_step = t_step_start - _prev
+            t_step_start_prev = t_step_start
+            step_tok_s = BATCH_TOKENS / max(t_step_total, 1e-9)
+            wall_tok_s = BATCH_TOKENS / max(dt_step, 1e-9)
+            t_other = max(
+                0.0,
+                t_step_total
+                - timing["_last_provider"]
+                - timing["_last_errbuf"]
+                - timing["_last_fwd_bwd"]
+                - timing["_last_opt_norm"],
+            )
+            print(
+                f"  [STEP-TIME {step:>4}] "
+                f"total={t_step_total*1000:>6.1f}ms "
+                f"provider={timing['_last_provider']*1000:>6.1f}ms "
+                f"fwd_bwd={timing['_last_fwd_bwd']*1000:>6.1f}ms "
+                f"opt_norm={timing['_last_opt_norm']*1000:>6.1f}ms "
+                f"errbuf={timing['_last_errbuf']*1000:>6.1f}ms "
+                f"other={t_other*1000:>6.1f}ms "
+                f"step_tok/s={step_tok_s:>7.1f} "
+                f"wall_tok/s={wall_tok_s:>7.1f}"
+            )
 
         if is_log_step:
             dead = revival.dead_pct(LOG_EVERY)
@@ -2302,7 +2342,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                           step=step)
 
         if step % CHECKPOINT_EVERY == 0:
-            rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
+            rng_states = {"cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                          "cpu": torch.get_rng_state()}
             provider_state = provider.get_state() if hasattr(provider, "get_state") else None
             _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
                                   revival.feature_fire_counts.clone(),
@@ -2347,7 +2388,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         json.dump(meta, f, indent=2)
 
     # Save full checkpoint at layer completion (for resume if interrupted between layers)
-    rng_states = {"cuda": torch.cuda.get_rng_state(), "cpu": torch.get_rng_state()}
+    rng_states = {"cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                  "cpu": torch.get_rng_state()}
     provider_state = provider.get_state() if hasattr(provider, "get_state") else None
     _save_full_checkpoint(out_dir, step, sae, optimizer, scheduler, rng_states,
                           revival.feature_fire_counts.clone(),
@@ -2392,7 +2434,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
                       hub_id: str = None, wandb_project: str = None, expansion: int = None,
-                      evict_model: bool = True, target_l0: int = None):
+                      evict_model: bool = True, target_l0: int = None, cpu: bool = False):
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -2403,6 +2445,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     resume_from: path to checkpoint_full.pt to resume from
     evict_model: move the LLM to CPU during SAE training to free VRAM (default True).
     target_l0: override the global L0 target K (default 500). Use for aggressive sparsity tests.
+    cpu: force CPU training (no CUDA). Will be SLOW - for debugging only.
     model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
     max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
     import time
@@ -2432,7 +2475,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         end_layer = HARD_STOP_LAYER
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    device = torch.device("cuda")
+    device = torch.device("cpu" if cpu else "cuda")
     torch.manual_seed(seed)
 
     # -- load model ONCE (generic loader: CausalLM, multimodal fallback) -------
@@ -2608,7 +2651,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         # Reload before the next layer's pool production.
         if evict_model:
             model.to("cpu")
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         provider = RollingActivationProvider(dst_dir, device, seed=seed)
         try:
@@ -2622,7 +2666,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                                            max_steps=max_steps, bdec_batches=bdec_batches,
                                            microbatch_tokens=microbatch_tokens or MICROBATCH_TOKENS,
                                            resume_from=layer_resume, push=push,
-                                           activation_norm_ref=activation_norm_ref)
+                                           activation_norm_ref=activation_norm_ref,
+                                           cpu=cpu)
         finally:
             provider.close()
         results[f"layer_{L:02d}"] = res
@@ -2712,7 +2757,9 @@ def main():
                    help="keep the LLM on GPU during SAE training (disables VRAM freeing)")
     p.add_argument("--target-l0", type=int, default=None,
                    help=f"override the L0 target K (default {K})")
-    p.set_defaults(use_pretok=True, push=True, evict_model=True)
+    p.add_argument("--cpu", action="store_true",
+                   help="force CPU training (no CUDA). Will be SLOW - for debugging only.")
+    p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
 
     res = run_atlas_rolling(
@@ -2722,7 +2769,7 @@ def main():
         resume_from=args.resume_from, push=args.push, capture=args.capture,
         model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
         expansion=args.expansion, evict_model=args.evict_model,
-        target_l0=args.target_l0)
+        target_l0=args.target_l0, cpu=args.cpu)
     print(f"\nDone. {res}")
 
 
