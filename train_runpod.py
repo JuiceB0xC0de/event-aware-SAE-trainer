@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train SAE atlas on RunPod for Gemma-4-E4B layers 0-14 and push every layer to HF.
+"""Train SAE atlas on RunPod for Gemma-4-E2B layers 0-14 and push every layer to HF.
 
 Run on a RunPod H100 pod with /workspace mounted:
     export HF_TOKEN=hf_...
@@ -7,7 +7,7 @@ Run on a RunPod H100 pod with /workspace mounted:
     python train_runpod.py --layer-range 0,14 --capture rolling
 
 This wrapper just calls sae_trainer_rolling.py's run_atlas_rolling with the right env
-and then uploads each layer's outputs to juiceb0xc0de/gemma-4-e4b-SAE.
+and then uploads each layer's outputs to juiceb0xc0de/gemma-4-e2b-SAE.
 """
 import argparse
 import json
@@ -19,11 +19,11 @@ from pathlib import Path
 from huggingface_hub import HfApi, create_repo, upload_folder
 
 
-MODEL_ID = "google/gemma-4-E4B-it"
+MODEL_ID = "google/gemma-4-E2B-it"
 SLUG = MODEL_ID.replace("/", "_").lower()
 DATA_DIR = Path("/workspace/data")
 SAE_DIR = DATA_DIR / "saes" / SLUG
-HF_SAE_REPO = "juiceb0xc0de/gemma-4-e4b-SAE"
+HF_SAE_REPO = "juiceb0xc0de/gemma-4-e2b-SAE"
 
 
 def _env():
@@ -86,7 +86,7 @@ def main():
                         help="Use live tokenization instead of pre-tokenized shards")
     parser.add_argument("--timing", action="store_true", default=True)
     parser.add_argument("--no-timing", action="store_false", dest="timing")
-    parser.add_argument("--wandb-project", type=str, default="gemma-4-e4b-sae")
+    parser.add_argument("--wandb-project", type=str, default="gemma-4-e2b-sae")
     args = parser.parse_args()
 
     start, end = map(int, args.layer_range.split(","))

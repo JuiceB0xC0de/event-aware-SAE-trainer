@@ -37,7 +37,7 @@ pip install -e .
 python - <<'PY'
 import os
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained("google/gemma-4-E4B-it", token=os.environ.get("HF_TOKEN"))
+tok = AutoTokenizer.from_pretrained("google/gemma-4-E2B-it", token=os.environ.get("HF_TOKEN"))
 print("Tokenizer cached.")
 PY
 
@@ -48,7 +48,7 @@ echo "Next (drop in and go):"
 echo "  source /workspace/venv/bin/activate"
 echo "  export HF_TOKEN=hf_...        # gated E4B + push to your SAE repo"
 echo "  export WANDB_API_KEY=...      # optional"
-echo "  python pretokenize_runpod.py --model-id google/gemma-4-E4B-it"
+echo "  python pretokenize_runpod.py --model-id google/gemma-4-E2B-it"
 echo "  python train_runpod.py --layer-range 0,14 --capture rolling \\"
 echo "      --target-l0 50 --expansion 32 --microbatch-tokens 32768"
 echo "=================================================================="

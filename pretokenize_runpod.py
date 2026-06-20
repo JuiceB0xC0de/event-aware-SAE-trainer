@@ -2,16 +2,16 @@
 """Pre-tokenize FineWeb-Edu for any HF model on RunPod and push shards to HF.
 
 Parallelized across CPU workers. Run on the pod:
-    python pretokenize_runpod.py --model-id google/gemma-4-E4B-it \
+    python pretokenize_runpod.py --model-id google/gemma-4-E2B-it \
         --n-shards 32 --tokens-per-shard 12000000 --workers 12
 
 Writes:
-    /workspace/data/pretok/google_gemma-4-e4b-it/
+    /workspace/data/pretok/google_gemma-4-e2b-it/
         manifest.json
         shard_00.npy ... shard_31.npy
 
 Pushes to HF dataset:
-    juiceb0xc0de/gemma-4-e4b-pretok
+    juiceb0xc0de/gemma-4-e2b-pretok
 """
 import argparse
 import json
@@ -27,8 +27,8 @@ from huggingface_hub import HfApi, create_repo
 from transformers import AutoTokenizer
 
 
-DEFAULT_MODEL_ID = "google/gemma-4-E4B-it"
-DEFAULT_HF_DATASET_REPO = "juiceb0xc0de/gemma-4-e4b-pretok"
+DEFAULT_MODEL_ID = "google/gemma-4-E2B-it"
+DEFAULT_HF_DATASET_REPO = "juiceb0xc0de/gemma-4-e2b-pretok"
 
 
 def _slug(model_id: str) -> str:
