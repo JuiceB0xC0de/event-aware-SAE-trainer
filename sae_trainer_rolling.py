@@ -832,7 +832,6 @@ def _produce_pool_hf_rolling(model, text_model, decoder_layers, layer, tok_dir, 
     layer>=1: block L over src_dir (= pool[L-1]).
     """
     import time
-    import torch
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -1538,7 +1537,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # default mode: balanced compile time vs runtime speed
             # fullgraph=False allows graph breaks at the custom autograd Function.
             sae = torch.compile(sae, mode="default", fullgraph=False, dynamic=False)
-            print(f"  torch.compile enabled on SAE (default, fullgraph=False)")
+            print("  torch.compile enabled on SAE (default, fullgraph=False)")
         except Exception as e:
             print(f"  WARNING: torch.compile failed ({e}), falling back to eager SAE")
     else:
@@ -1855,10 +1854,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if use_triton_fwd:
             try:
                 from triton_sae_kernel import fused_sae_forward
-                print(f"  [TRITON] Using fused SAE kernel")
+                print("  [TRITON] Using fused SAE kernel")
             except ImportError:
                 use_triton_fwd = False
-                print(f"  [TRITON] Kernel not available, falling back to PyTorch")
+                print("  [TRITON] Kernel not available, falling back to PyTorch")
 
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
