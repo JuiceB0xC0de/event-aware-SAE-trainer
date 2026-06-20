@@ -21,7 +21,7 @@ pip install -e .
 python - <<'PY'
 import os
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained("google/gemma-4-e2b-it", token=os.environ.get("HF_TOKEN"))
+tok = AutoTokenizer.from_pretrained("google/gemma-4-E4B-it", token=os.environ.get("HF_TOKEN"))
 print("Tokenizer cached.")
 PY
 
