@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-06-20
+
+### Fixed
+- **Pinned coherent dependency stack** for Gemma-4, Qwen3, and Qwen3.5 model families:
+  `torch>=2.6.0,<2.8.0`, `transformers>=5.0.0`, `torchvision`, `torchaudio`,
+  `accelerate>=1.6.0`, `datasets>=3.0.0`, `numpy<3.0.0`.
+- **RunPod setup no longer inherits system-site packages**: `setup_runpod.sh` now
+  creates an isolated venv and installs an ABI-matched CUDA 12.4 torch stack from the
+  PyTorch index, preventing `undefined symbol` import crashes caused by the image's
+  pre-installed torchaudio/torchvision wheels.
+
+### Changed
+- `setup_runpod.sh` accepts `MODEL_ID` env var and pre-caches that tokenizer instead
+  of hardcoding `google/gemma-4-E2B-it`.
+
 ## [0.2.0] - 2026-06-13
 
 ### Added

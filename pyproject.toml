@@ -32,17 +32,25 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch>=2.5.0",
-    "transformers>=4.51.0",
-    "accelerate",
-    "datasets>=2.20.0",
-    "numpy",
-    "tqdm",
-    "sentencepiece",
-    "protobuf",
-    "huggingface_hub",
-    "hf_transfer",
-    "wandb",
+    # Coherent PyTorch stack. Install from https://download.pytorch.org/whl/cu124
+    # on CUDA pods, or from the default index on CPU/MPS Macs. These versions
+    # are ABI-matched and support Gemma-4 (multimodal) and Qwen3/Qwen3.5 models.
+    "torch>=2.6.0,<2.8.0",
+    "torchvision>=0.21.0,<0.23.0",
+    "torchaudio>=2.6.0,<2.8.0",
+    # Gemma-4 and Qwen3 require transformers 5.x. Pin lower bound to the first
+    # release that includes both model families.
+    "transformers>=5.0.0",
+    "accelerate>=1.6.0",
+    "datasets>=3.0.0",
+    # numpy 2.x is fine with recent torch; numpy 3.x is not.
+    "numpy>=1.26.0,<3.0.0",
+    "tqdm>=4.65.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=3.20.0",
+    "huggingface_hub>=0.30.0",
+    "hf_transfer>=0.1.9",
+    "wandb>=0.19.0",
 ]
 
 [project.optional-dependencies]
