@@ -7,7 +7,7 @@
 # mounted volume. After this finishes:
 #     source /workspace/venv/bin/activate
 #     export HF_TOKEN=hf_...
-#     python pretokenize_runpod.py            # builds E4B shards
+#     python pretokenize_runpod.py            # builds E2B shards
 #     python train_runpod.py --layer-range 0,14 --capture rolling \
 #         --target-l0 50 --expansion 32 --microbatch-tokens 32768
 set -e
@@ -33,7 +33,7 @@ source /workspace/venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e .
 
-# Pre-download the E4B tokenizer so nothing streams mid-run (needs HF_TOKEN if gated)
+# Pre-download the E2B tokenizer so nothing streams mid-run (needs HF_TOKEN if gated)
 python - <<'PY'
 import os
 from transformers import AutoTokenizer
@@ -46,7 +46,7 @@ echo "=================================================================="
 echo "Setup complete. Venv: /workspace/venv"
 echo "Next (drop in and go):"
 echo "  source /workspace/venv/bin/activate"
-echo "  export HF_TOKEN=hf_...        # gated E4B + push to your SAE repo"
+echo "  export HF_TOKEN=hf_...        # gated E2B + push to your SAE repo"
 echo "  export WANDB_API_KEY=...      # optional"
 echo "  python pretokenize_runpod.py --model-id google/gemma-4-E2B-it"
 echo "  python train_runpod.py --layer-range 0,14 --capture rolling \\"
