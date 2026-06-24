@@ -345,7 +345,7 @@ class SAEEventControlScheduler:
             feat_acts = sae.apply_jumprelu(pre)
             x_hat = sae.decode(feat_acts)
 
-            recon_loss = (acts - x_hat).pow(2).mean()
+            recon_loss = (acts.float() - x_hat.float()).pow(2).mean()
             gate = sae.l0_indicator(pre)
             l0 = gate.sum(dim=-1).mean().item()
             ev = compute_explained_variance(acts, x_hat)
