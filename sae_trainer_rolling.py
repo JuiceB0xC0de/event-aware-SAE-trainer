@@ -1615,7 +1615,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             probe = probe_batch[:probe_tokens]
             with torch.no_grad(), _autocast():
                 probe_pre = sae.encode_pre(probe)
-                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1).float().mean().item()
+                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1, dtype=torch.float32).mean().item()
             activation_norm = probe.float().pow(2).mean().sqrt().item()
             ref_norm = activation_norm_ref if activation_norm_ref and activation_norm_ref > 0 else activation_norm
             norm_ratio = activation_norm / max(ref_norm, 1e-8)
@@ -1662,7 +1662,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                       f"warmup_thr={warmup_threshold:.4f} old_thr_mean={current_thr_mean:.4f}")
                 # Re-measure L0 after warmup to update the scheduler's initial state
                 with torch.no_grad(), _autocast():
-                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1).float().mean().item()
+                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1, dtype=torch.float32).mean().item()
                 print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f}, "
                       f"target_warmup_L0={warmup_l0_target:.0f})")
                 initial_l0 = warmup_l0  # use updated L0 for the rest of preflight
