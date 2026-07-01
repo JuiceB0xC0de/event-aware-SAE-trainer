@@ -396,7 +396,6 @@ def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
     has >= tokens_per_shard tokens."""
     import os
     import numpy as np
-    from pathlib import Path
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from huggingface_hub import snapshot_download

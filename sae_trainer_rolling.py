@@ -270,11 +270,14 @@ class RevivalController:
 
     def dead_pct(self, window: int) -> float:
         """Percent of features silent for at least `window` steps."""
-        return (self.steps_since_fired >= window).float().mean().item() * 100
+        # ⚡ Bolt: avoid float intermediate, use sum / numel directly
+        mask = self.steps_since_fired >= window
+        return (mask.sum().item() / max(mask.numel(), 1)) * 100
 
     def fire_rate(self, window: int):
         """Per-feature fire rate over the accumulation window."""
-        return self.feature_fire_counts.float() / max(window, 1)
+        # ⚡ Bolt: remove .float() since int division natively returns float tensor
+        return self.feature_fire_counts / max(window, 1)
 
     def reset_fire_counts(self):
         self.feature_fire_counts.zero_()
@@ -832,7 +835,6 @@ def _produce_pool_hf_rolling(model, text_model, decoder_layers, layer, tok_dir, 
     layer>=1: block L over src_dir (= pool[L-1]).
     """
     import time
-    import torch
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -1546,7 +1548,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # default mode: balanced compile time vs runtime speed
             # fullgraph=False allows graph breaks at the custom autograd Function.
             sae = torch.compile(sae, mode="default", fullgraph=False, dynamic=False)
-            print(f"  torch.compile enabled on SAE (default, fullgraph=False)")
+            print("  torch.compile enabled on SAE (default, fullgraph=False)")
         except Exception as e:
             print(f"  WARNING: torch.compile failed ({e}), falling back to eager SAE")
     else:
@@ -1615,7 +1617,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             probe = probe_batch[:probe_tokens]
             with torch.no_grad(), _autocast():
                 probe_pre = sae.encode_pre(probe)
-                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1).float().mean().item()
+                # ⚡ Bolt: fuse float casting into reduction to avoid intermediate float tensor allocation
+                initial_l0 = sae.l0_indicator(probe_pre).sum(dim=-1, dtype=torch.float32).mean().item()
             activation_norm = probe.float().pow(2).mean().sqrt().item()
             ref_norm = activation_norm_ref if activation_norm_ref and activation_norm_ref > 0 else activation_norm
             norm_ratio = activation_norm / max(ref_norm, 1e-8)
@@ -1662,7 +1665,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                       f"warmup_thr={warmup_threshold:.4f} old_thr_mean={current_thr_mean:.4f}")
                 # Re-measure L0 after warmup to update the scheduler's initial state
                 with torch.no_grad(), _autocast():
-                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1).float().mean().item()
+                    # ⚡ Bolt: fuse float casting into reduction
+                    warmup_l0 = sae.l0_indicator(sae.encode_pre(probe)).sum(dim=-1, dtype=torch.float32).mean().item()
                 print(f"  [THRESH WARMUP] L0 after warmup: {warmup_l0:.1f} (was {initial_l0:.1f}, "
                       f"target_warmup_L0={warmup_l0_target:.0f})")
                 initial_l0 = warmup_l0  # use updated L0 for the rest of preflight
@@ -1866,10 +1870,10 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if use_triton_fwd:
             try:
                 from triton_sae_kernel import fused_sae_forward
-                print(f"  [TRITON] Using fused SAE kernel")
+                print("  [TRITON] Using fused SAE kernel")
             except ImportError:
                 use_triton_fwd = False
-                print(f"  [TRITON] Kernel not available, falling back to PyTorch")
+                print("  [TRITON] Kernel not available, falling back to PyTorch")
 
         for accum_idx in range(accum_steps):
             start_idx = accum_idx * microbatch_size
@@ -2193,7 +2197,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
                 fire_rate = revival.fire_rate(LOG_EVERY)
-                ultra_active = (fire_rate > 0.10).float().sum().item()
+                # ⚡ Bolt: avoid intermediate float cast for boolean mask
+                ultra_active = (fire_rate > 0.10).sum().item()
             now = time.time()
             tokens_per_sec = log_window_tokens / max(now - log_window_start, 1e-6)
             log_window_start = now; log_window_tokens = 0
