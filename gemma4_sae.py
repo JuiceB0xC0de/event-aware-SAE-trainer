@@ -168,7 +168,9 @@ class SAETainer:
 
         Args:
             layer_range: "start,end" INCLUSIVE e.g. "0,15" trains layers 0 through 15
-            capture: "rolling" (Gemma 0-14), "rolling-hf" (Llama/SmolLM2/Qwen), or "auto" (any layer)
+            capture: "rolling" (Gemma 0-14), "rolling-float" (Gemma 0-14, blocks hoisted
+                CPU<->GPU so only the active 1-2 blocks sit in VRAM), "rolling-hf"
+                (Llama/SmolLM2/Qwen), "rolling-hf-float", or "auto" (any layer)
             expansion: SAE expansion factor (default 32)
             pool_batches: activation batches to cache (default 2000)
             max_steps: max training steps per layer
@@ -186,6 +188,16 @@ class SAETainer:
         # setup() already ran _sync_repo(), this is a no-op safety net.
         _sync_repo()
         start, end = map(int, layer_range.split(","))
+
+        # Env must be set BEFORE importing the trainer: ROLLCACHE / SAE_TIMING /
+        # SAE_COMPILE are resolved at module import time, so setting them after
+        # the import silently keeps the image defaults (/data/scratch).
+        if timing:
+            os.environ["SAE_TIMING"] = "1"
+        if compile:
+            os.environ["SAE_COMPILE"] = "1"
+        if scratch_dir:
+            os.environ["SAE_SCRATCH_DIR"] = scratch_dir
 
         # Import trainer module
         from sae_trainer_rolling import run_atlas_rolling
@@ -205,14 +217,6 @@ class SAETainer:
         print(f"  Compile SAE: {compile}")
         print(f"  Scratch dir: {scratch_dir}")
         print(f"{'='*60}\n")
-
-        import os as _os
-        if timing:
-            _os.environ["SAE_TIMING"] = "1"
-        if compile:
-            _os.environ["SAE_COMPILE"] = "1"
-        if scratch_dir:
-            _os.environ["SAE_SCRATCH_DIR"] = scratch_dir
 
         # Run training
         results = run_atlas_rolling(
@@ -257,7 +261,7 @@ class SAETainer:
         env = os.environ.copy()
         print("[SAETainer.benchmark_kernel] launching isolated benchmark subprocess...")
         proc = subprocess.run(
-            [sys.executable, "/opt/sae-trainer/benchmark_triton_kernel.py"],
+            [sys.executable, "/opt/sae-trainer/archive/benchmark_triton_kernel.py"],
             cwd="/opt/sae-trainer",
             env=env,
             capture_output=True,
@@ -283,7 +287,7 @@ class SAETainer:
         sys.path.insert(0, "/opt/sae-trainer")
         env = os.environ.copy()
         env["SAE_USE_TRITON"] = "0"
-        cmd = [sys.executable, "/opt/sae-trainer/benchmark_pytorch_sae.py"]
+        cmd = [sys.executable, "/opt/sae-trainer/archive/benchmark_pytorch_sae.py"]
         if compile_sae:
             cmd.append("--compile")
         print(f"[SAETainer.benchmark_pytorch_sae] compile={compile_sae} launching...")
@@ -309,7 +313,7 @@ class SAETainer:
         env = os.environ.copy()
         env["SAE_USE_TRITON"] = "0"
         proc = subprocess.run(
-            [sys.executable, "/opt/sae-trainer/benchmark_pytorch_sae_batch.py"],
+            [sys.executable, "/opt/sae-trainer/archive/benchmark_pytorch_sae_batch.py"],
             cwd="/opt/sae-trainer", env=env, capture_output=True, text=True,
         )
         print("[SAETainer.benchmark_pytorch_sae_batch] ----- STDOUT -----")
@@ -333,7 +337,7 @@ class SAETainer:
         env = os.environ.copy()
         env["SAE_USE_TRITON"] = "0"
         proc = subprocess.run(
-            [sys.executable, "/opt/sae-trainer/llama_rolling_capture_probe.py"],
+            [sys.executable, "/opt/sae-trainer/archive/llama_rolling_capture_probe.py"],
             cwd="/opt/sae-trainer",
             env=env,
             capture_output=True,

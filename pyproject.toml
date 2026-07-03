@@ -51,6 +51,8 @@ dependencies = [
     "huggingface_hub>=0.30.0",
     "hf_transfer>=0.1.9",
     "wandb>=0.19.0",
+    # Fast JSON for census/metadata I/O (dropped during the zarr migration, needed again).
+    "orjson>=3.10",
 ]
 
 [project.optional-dependencies]

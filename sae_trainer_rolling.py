@@ -20,6 +20,10 @@ are produced is pluggable (`--capture`):
   rolling      (opt-in)  -- Gemma-3n/4 single-block walk. Gemma-specific invariants
                             (per-layer embeddings, sliding/full masks, KV sharing).
                             Guarded by validate_rolling_cache.py.
+  rolling-float (opt-in) -- same walk as rolling, but the full model stays on CPU
+                            and only the active block (+ pinned shared components)
+                            is hoisted to GPU. Same math as rolling: identical
+                            _produce_pool path, weights merely change device.
   rolling-hf   (opt-in)  -- generic Llama/SmolLM2/Qwen-style single-block walk using
                             the model's own rotary_emb and position_embeddings. Same
                             disk/compute win as rolling, but works for any HF decoder
@@ -859,6 +863,88 @@ def _produce_pool_hf_rolling(model, text_model, decoder_layers, layer, tok_dir, 
 
 
 # ===========================================================================
+#  Floating layer window (only active decoder blocks on GPU)
+# ===========================================================================
+
+class FloatingLayerWindow:
+    """Keep the full LLM on CPU and move only the decoder blocks currently
+    computing onto GPU. This is the "caterpillar" / sliding-window loader:
+    at any production step only ~2 layers touch VRAM, everything else stays
+    on host memory.
+
+    Shared small components (embed_tokens, rotary_emb, and for Gemma-3n/4 the
+    per-layer-embedding table + projection) are moved to GPU once and left there
+    because every layer's production needs them. Decoder blocks are activated
+    and deactivated around each production pass.
+    """
+
+    # Every module _make_invariants / _make_llama_invariants touches. Gemma-only
+    # attrs are skipped via hasattr on Llama-style models and vice versa.
+    SHARED_COMPONENTS = (
+        "embed_tokens",              # all models
+        "rotary_emb",                # all models
+        "embed_tokens_per_layer",    # Gemma-3n/4 PLE token-identity table
+        "per_layer_model_projection",  # Gemma-3n/4 PLE context projection
+        "per_layer_projection_norm",   # Gemma-3n/4 PLE norm
+    )
+
+    def __init__(self, text_model, decoder_layers, device):
+        import torch
+        self.text_model = text_model
+        self.decoder_layers = decoder_layers
+        self.device = device
+        self._active: set = set()
+        # Pin shared components to GPU once. They are tiny compared to the
+        # decoder stack and are needed by every layer's production.
+        for name in self.SHARED_COMPONENTS:
+            mod = getattr(text_model, name, None)
+            if mod is not None:
+                mod.to(device)
+
+    def activate(self, layer: int):
+        """Ensure decoder block `layer` is on GPU."""
+        import torch
+        if layer < 0 or layer >= len(self.decoder_layers):
+            return
+        if layer not in self._active:
+            self.decoder_layers[layer].to(self.device)
+            self._active.add(layer)
+
+    def deactivate(self, layer: int):
+        """Move decoder block `layer` back to CPU."""
+        import torch
+        if layer in self._active:
+            self.decoder_layers[layer].to("cpu")
+            self._active.discard(layer)
+
+    def deactivate_all(self):
+        """Move all active blocks back to CPU and clear the window."""
+        import torch
+        for layer in list(self._active):
+            self.decoder_layers[layer].to("cpu")
+        self._active.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def set_active(self, layers):
+        """Activate the given set of layers, deactivating any others."""
+        layers = set(int(l) for l in layers if 0 <= l < len(self.decoder_layers))
+        to_deactivate = self._active - layers
+        to_activate = layers - self._active
+        for layer in to_deactivate:
+            self.deactivate(layer)
+        for layer in to_activate:
+            self.activate(layer)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.deactivate_all()
+        return False
+
+
+# ===========================================================================
 #  Pool I/O  (activation shards on container-local NVMe at ROLLCACHE)
 # ===========================================================================
 
@@ -935,10 +1021,14 @@ def _find_resume_layer(seed: int, pool_batches: int, model_id: str, capture: str
     try:
         with open(mpath) as f:
             m = json.load(f)
+        # Float variants produce bit-identical pools to their base mode (same walk,
+        # weights merely hoisted between devices), so resume across the family.
+        def _capture_family(c):
+            return {"rolling-float": "rolling", "rolling-hf-float": "rolling-hf"}.get(c, c)
         if (m.get("seed") != seed or
             m.get("pool_batches") != pool_batches or
             m.get("model_id") != model_id or
-            m.get("capture") != capture):
+            _capture_family(m.get("capture")) != _capture_family(capture)):
             return -1
         rdir = _resume_pool_dir(seed)
         n_saved = len(_shard_paths(rdir)) if rdir.exists() else 0
@@ -2439,7 +2529,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
              "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized);
-             "rolling-hf" = generic Llama/SmolLM2/Qwen single-block walk (no HARD_STOP).
+             "rolling-hf" = generic Llama/SmolLM2/Qwen single-block walk (no HARD_STOP);
+             "rolling-hf-float" = same as rolling-hf but only 1-2 blocks in GPU memory at a time.
     pool_batches: activation batches cached per layer (default 4000; use 500-1000 for limited disk)
     microbatch_tokens: tokens per microbatch for gradient accumulation (default = no accum)
     resume_from: path to checkpoint_full.pt to resume from
@@ -2468,8 +2559,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     if wandb_project is not None:
         WANDB_PROJECT = wandb_project
 
-    assert capture in ("auto", "rolling", "rolling-hf"), f"unknown --capture {capture!r}"
-    if capture == "rolling" and end_layer > HARD_STOP_LAYER:
+    assert capture in ("auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float"), \
+        f"unknown --capture {capture!r}"
+    if capture in ("rolling", "rolling-float") and end_layer > HARD_STOP_LAYER:
         print(f"  [scope] rolling clamps end_layer {end_layer} -> {HARD_STOP_LAYER} "
               f"(Gemma KV-share boundary)")
         end_layer = HARD_STOP_LAYER
@@ -2511,11 +2603,21 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     d_in = int(getattr(tcfg, "hidden_size", D_IN))
     N_FEATURES = EXPANSION * d_in              # SAE dict scales with the detected width
     text_model, attr_name, decoder_layers = _find_text_model(model, n_layers)
-    if capture == "rolling-hf" and not _is_hf_rolling_supported(text_model, decoder_layers):
-        print(f"  [warn] --capture rolling-hf not supported for {type(text_model).__name__}; "
+    if capture in ("rolling-hf", "rolling-hf-float") and not _is_hf_rolling_supported(text_model, decoder_layers):
+        print(f"  [warn] --capture {capture} not supported for {type(text_model).__name__}; "
               f"falling back to auto")
         capture = "auto"
-    model.to(device)
+
+    # Floating window: keep the full model on CPU, pin tiny shared components to GPU,
+    # and let the production loop move only the active 1-2 decoder blocks to GPU.
+    use_floating_window = (capture in ("rolling-float", "rolling-hf-float") and device.type == "cuda")
+    if use_floating_window:
+        print(f"  [floating-window] keeping full model on CPU; only active blocks + "
+              f"embed_tokens/rotary_emb will touch GPU")
+        floating_window = FloatingLayerWindow(text_model, decoder_layers, device)
+    else:
+        floating_window = None
+        model.to(device)
 
     end_layer = min(end_layer, n_layers - 1)
     assert 0 <= start_layer <= end_layer < n_layers, \
@@ -2523,7 +2625,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     layers = list(range(start_layer, end_layer + 1))
     print(f"  model={type(model).__name__}  blocks={len(decoder_layers)}  d_in={d_in}  "
           f"n_features={N_FEATURES} ({EXPANSION}x)  capture={capture}")
-    if capture == "rolling" and d_in != D_IN:
+    if capture in ("rolling", "rolling-float") and d_in != D_IN:
         print(f"  [warn] rolling capture was tuned at d_in={D_IN}; model reports {d_in}")
 
     print(f"\n{'#'*60}\n  SAE ATLAS  model={_slug(MODEL_ID)}  layers={layers}  seed={seed}  "
@@ -2537,8 +2639,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # Auto/hook capture is independent per layer -- only one pool is on disk at a
     # time (plus resume-copy headroom), so the 2x pipeline term over-estimates peak
     # and would falsely block valid auto runs.
-    pool_multiplier = 2.2 if capture in ("rolling", "rolling-hf") else 1.2
-    n_pools_desc = "2 pipelined pools" if capture in ("rolling", "rolling-hf") else "1 pool"
+    pool_multiplier = 2.2 if capture in ("rolling", "rolling-float", "rolling-hf") else 1.2
+    n_pools_desc = "2 pipelined pools" if capture in ("rolling", "rolling-float", "rolling-hf") else "1 pool"
     peak_gb = pool_batches * shard_gb * pool_multiplier + 4
     free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
     sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
@@ -2568,7 +2670,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     t0 = time.time()
     # rolling must walk from 0 to build the residual chain; hook capture is independent
     # per layer, so it starts at start_layer.
-    walk_start = 0 if capture in ("rolling", "rolling-hf") else start_layer
+    walk_start = 0 if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float") else start_layer
 
     # -- rolling resume: if a previous run persisted the last completed layer's pool,
     #    resume the chain from that layer instead of regenerating everything from 0.
@@ -2589,7 +2691,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         except Exception:
             pass
 
-    if capture in ("rolling", "rolling-hf"):
+    if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float"):
         if resume_from and explicit_resume_layer >= 0:
             # Explicit --resume-from under rolling: we must regenerate the full residual
             # chain from L0 up to the target layer because the persistent resume pool is
@@ -2608,7 +2710,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     for L in range(walk_start, end_layer + 1):
         dst_dir = pool_dir_for(L)
-        if capture in ("rolling", "rolling-hf"):
+        if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float"):
             src_dir = pool_dir_for(L - 1) if L >= 1 else None
             consume_src = True
             if L == resume_layer + 1 and resume_layer >= 0:
@@ -2616,7 +2718,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # Do not consume it -- it stays on disk until the next layer finishes.
                 src_dir = _resume_pool_dir(seed)
                 consume_src = False
-            if capture == "rolling":
+            if use_floating_window:
+                floating_window.activate(L)
+            if capture in ("rolling", "rolling-float"):
                 _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
                               dst_dir, device)
             else:
@@ -2629,7 +2733,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 next_dir = pool_dir_for(L + 1)
                 if len(_shard_paths(next_dir)) < pool_batches:
                     print(f"  [pipeline] pre-producing pool L{L+1} while model hot ...")
-                    if capture == "rolling":
+                    if use_floating_window:
+                        floating_window.activate(L + 1)
+                    if capture in ("rolling", "rolling-float"):
                         _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
                                       dst_dir, next_dir, device)
                     else:
@@ -2638,6 +2744,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                     pre_produced_next = True
                 else:
                     print(f"  [pipeline] pool L{L+1} already present")
+            if use_floating_window:
+                # Drop all blocks before SAE training. The SAE phase should not pay
+                # for any decoder layers to sit in VRAM.
+                floating_window.deactivate_all()
             if L < start_layer:
                 # Skip-train layers below the explicit resume target: we produced their
                 # pool but won't train them. Keep their source pool for the next layer.
@@ -2649,7 +2759,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         # The LLM is idle during SAE training. Evict it from GPU memory so the SAE
         # can use the freed VRAM for a larger microbatch / less gradient accumulation.
         # Reload before the next layer's pool production.
-        if evict_model:
+        # In floating-window mode this is already done (blocks were dropped after production).
+        if evict_model and not use_floating_window:
             model.to("cpu")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2677,10 +2788,12 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 activation_norm_ref = probe_norm
 
         # Bring the LLM back to GPU for the next layer's pool production.
-        if evict_model:
+        # Floating-window mode never moved the full model; individual blocks are
+        # re-activated inside the production loop as needed.
+        if evict_model and not use_floating_window:
             model.to(device)
 
-        if capture in ("rolling", "rolling-hf"):
+        if capture in ("rolling", "rolling-hf", "rolling-hf-float"):
             # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
@@ -2728,9 +2841,10 @@ def main():
                     "retuning. Default capture works on any AutoModelForCausalLM.")
     p.add_argument("--model-id", default=None,
                    help=f"HF model id to train SAEs on (default {MODEL_ID})")
-    p.add_argument("--capture", choices=["auto", "rolling", "rolling-hf"], default="auto",
+    p.add_argument("--capture", choices=["auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float"], default="auto",
                    help="auto=model-agnostic forward-hook (default); rolling=Gemma single-block fast path; "
-                        "rolling-hf=generic Llama/SmolLM2/Qwen single-block fast path")
+                        "rolling-hf=generic Llama/SmolLM2/Qwen single-block fast path; "
+                        "rolling-hf-float=rolling-hf with only active blocks in GPU memory")
     p.add_argument("--start-layer", type=int, default=0)
     p.add_argument("--end-layer", type=int, default=9,
                    help="inclusive; clamped to model depth (and to 15 under --capture rolling)")
