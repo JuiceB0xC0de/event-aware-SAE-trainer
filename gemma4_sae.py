@@ -51,6 +51,8 @@ image = (
         "SAE_SCRATCH_DIR": "/data/scratch",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "WANDB_ENTITY": "ricks-holmberg-juiceb0xc0de",
+        "WANDB_PROJECT": "gemma-4-e2b-sae",
         # Synchronous CUDA errors so assert/oom tracebacks point at the real line.
         # "CUDA_LAUNCH_BLOCKING": "1",  # Debug-only; kills async overlap and pool capture throughput
     })
@@ -119,8 +121,10 @@ def _sync_repo():
 @app.cls(
     gpu="A100-40GB",  # 24GB VRAM - enough for SmolLM2-360M with room to profile
     volumes={"/data": data_volume},
-    ephemeral_disk=524_288,  # 512 GiB container-local NVMe
-    secrets=[modal.Secret.from_name("huggingface")],
+    ephemeral_disk=1_048_576,  # 1 TiB container-local NVMe: rolling keeps ~3 pools
+                               # + a resume copy resident (E2B: ~101GB per 1000-batch pool)
+    secrets=[modal.Secret.from_name("huggingface"),
+             modal.Secret.from_name("WANDB_API_KEY")],
     timeout=86400,  # 24 hours
 )
 class SAETainer:
@@ -387,7 +391,8 @@ PRETOK_OUT = "/data/pretok/fineweb-edu"
 @app.function(
     image=image,
     volumes={"/data": data_volume},
-    secrets=[modal.Secret.from_name("huggingface")],
+    secrets=[modal.Secret.from_name("huggingface"),
+             modal.Secret.from_name("WANDB_API_KEY")],
     timeout=86400,
 )
 def pretokenize_shard(shard_idx: int, n_shards: int, tokens_per_shard: int,
@@ -521,6 +526,7 @@ def main(
     expansion: int = 32,
     pool_batches: int = 2000,
     max_steps: int = 15000,
+    microbatch_tokens: int = 32768,
     resume_from: str | None = None,
     evict_model: bool = True,
     target_l0: int | None = None,
@@ -546,6 +552,7 @@ def main(
         expansion=expansion,
         pool_batches=pool_batches,
         max_steps=max_steps,
+        microbatch_tokens=microbatch_tokens,
         resume_from=resume_from,
         evict_model=evict_model,
         target_l0=target_l0,
