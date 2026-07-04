@@ -274,11 +274,14 @@ class RevivalController:
 
     def dead_pct(self, window: int) -> float:
         """Percent of features silent for at least `window` steps."""
-        return (self.steps_since_fired >= window).float().mean().item() * 100
+        mask = self.steps_since_fired >= window
+        # Optimization: use sum with float32 dtype rather than casting full mask to float
+        return (mask.sum(dtype=torch.float32) / mask.numel()).item() * 100
 
     def fire_rate(self, window: int):
         """Per-feature fire rate over the accumulation window."""
-        return self.feature_fire_counts.float() / max(window, 1)
+        # Optimization: true division automatically returns float, avoids explicit cast memory allocation
+        return self.feature_fire_counts / max(window, 1)
 
     def reset_fire_counts(self):
         self.feature_fire_counts.zero_()
@@ -2283,7 +2286,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
                 fire_rate = revival.fire_rate(LOG_EVERY)
-                ultra_active = (fire_rate > 0.10).float().sum().item()
+                # Optimization: sum over boolean mask directly returns int64 scalar instead of allocating full float mask
+                ultra_active = (fire_rate > 0.10).sum().item()
             now = time.time()
             tokens_per_sec = log_window_tokens / max(now - log_window_start, 1e-6)
             log_window_start = now; log_window_tokens = 0
