@@ -163,7 +163,7 @@ def main():
             repo_id=HF_SAE_REPO,
             repo_type="model",
         )
-        print(f"[HF] uploaded run_summary.json")
+        print("[HF] uploaded run_summary.json")
 
     print("\nTraining complete.")
     print(f"  Results: {results}")
