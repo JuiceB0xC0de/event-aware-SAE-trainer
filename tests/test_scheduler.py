@@ -278,6 +278,9 @@ def test_early_stop_requires_sparse_side_crossing():
         sched.step({**_sig(l0=l0), "ev": 0.99})
     assert sched.should_stop is False
 
+    # Sparse-side crossing alone no longer stops immediately: the PIN gate
+    # additionally requires phase==PIN (L0 within pin_l0_band_abs of target)
+    # plus EV-ready (pin_ev_patience good windows) or PIN timeout.
     crossed = _make_scheduler(
         l0_tolerance=0.20,
         al_slingshot_overshoot_rel=0.10,
@@ -286,9 +289,34 @@ def test_early_stop_requires_sparse_side_crossing():
     )
     crossed.lambda_l0 = 1e-3
     crossed._lambda_history = [1e-3, 1e-3, 1e-3]
-    for l0 in [475.0, 475.0, 475.0]:
+    for l0 in [499.8, 499.8, 499.8, 499.8]:
         crossed.step({**_sig(l0=l0), "ev": 0.99})
     assert crossed.should_stop is True
+
+
+def test_pin_gate_holds_al_stop_until_ev_ready_or_timeout():
+    """The Qwen L0/L1 regression: AL converges while EV is still climbing.
+    The EV-blind AL stop must hold until PIN is EV-ready or times out."""
+    sched = _make_scheduler(
+        l0_tolerance=0.20,
+        al_slingshot_overshoot_rel=0.10,
+        ev_stop_patience=1,
+        ev_check_every=1,
+    )
+    sched.lambda_l0 = 1e-3
+    sched._lambda_history = [1e-3, 1e-3, 1e-3]
+    # L0 locked in the PIN band, but EV well below pin_ev_thresh: no stop.
+    for _ in range(6):
+        sched.step({**_sig(l0=499.8), "ev": 0.70})
+    assert sched.phase == "PIN"
+    assert sched.should_stop is False
+
+    # Backdate PIN entry past pin_timeout_steps: the polish budget is spent,
+    # now the AL stop may fire even with low EV.
+    sched.pin_entry_step = sched.total_steps - sched.config.pin_timeout_steps
+    sched.step({**_sig(l0=499.8), "ev": 0.70})
+    assert sched.should_stop is True
+    assert "PIN timeout" in sched.stop_reason
 
 
 # -- Phase observability (Branch 1) -------------------------------------------

@@ -952,11 +952,27 @@ class SAEEventControlScheduler:
             self._ev_above_floor_count = 0
 
         if self._ev_above_floor_count >= self.config.ev_stop_patience:
+            # PIN stop gate (Branch 6 / Task 6B): AL convergence alone must not
+            # end the run the moment sparsity locks -- PIN exists to let EV catch
+            # up with lambda frozen. Hold the stop until PIN reports EV-ready
+            # (pin_ev_count windows at/above pin_ev_thresh) or PIN times out.
+            # A run that converges without ever entering PIN keeps training
+            # (bounded by max_steps) rather than stopping mid-DESCENT.
+            pin_ev_ready = self.pin_ev_count >= self.config.pin_ev_patience
+            pin_elapsed = (self.total_steps - self.pin_entry_step
+                           if self.pin_entry_step is not None else 0)
+            pin_timed_out = (self.pin_entry_step is not None
+                             and pin_elapsed >= self.config.pin_timeout_steps)
+            if self.phase != "PIN" or not (pin_ev_ready or pin_timed_out):
+                return
+            pin_note = ("PIN EV-ready" if pin_ev_ready
+                        else f"PIN timeout after {pin_elapsed} steps")
             self.should_stop = True
             self.stop_reason = (
                 f"AL converged: L0 {l0_mean:.1f} in target +/-{self.config.l0_tolerance*100:.0f}% of "
                 f"{self.config.target_l0}, lambda plateaued at {self.lambda_l0:.3e} "
-                f"({self.config.ev_stop_patience} windows of stability). Final EV={ev:.3f}."
+                f"({self.config.ev_stop_patience} windows of stability); {pin_note}. "
+                f"Final EV={ev:.3f}."
             )
 
     # -- Dead Feature Emergency --------------------------------------------------
@@ -1216,6 +1232,10 @@ class SAEEventControlScheduler:
         "ste_bandwidth_floor": float,  # min adaptive bandwidth
         "ste_bandwidth_max": float,    # max adaptive bandwidth
         "threshold_nudge_gain": float, # direct threshold stepping gain (0 = disabled)
+        "pin_ev_thresh": float,        # EV level PIN needs before early stop may fire
+        "pin_ev_patience": float,      # consecutive good EV windows for PIN EV-ready
+        "pin_timeout_steps": float,    # max PIN polish steps before stop is allowed
+        "pin_l0_band_abs": float,      # |L0-target| band for DESCENT -> PIN entry
     }
 
     def _apply_live_tune(self):

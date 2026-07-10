@@ -2242,8 +2242,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 total_var = full_batch.float().var().item()  # .item(): keep ev a python float
                 ev = 1.0 - (recon_val / total_var) if total_var > 0 else 0.0
+                # Per-dim normalized EV: equal weight per channel, so a few
+                # high-magnitude residual dims (Qwen-style outlier channels)
+                # can't dominate the score like they do in global-variance EV.
+                # Probed on the last microbatch; logging-only signal.
+                xh_p, _ = sae(acts_mb)
+                res_var_d = (acts_mb.float() - xh_p.float()).pow(2).mean(dim=0)
+                var_d = acts_mb.float().var(dim=0)
+                ev_perdim = 1.0 - (res_var_d / var_d.clamp_min(1e-6)).mean().item()
         else:
-            dead = None; ev = None
+            dead = None; ev = None; ev_perdim = None
 
         if do_timing:
             t_cpu_post_start = time.perf_counter()
@@ -2413,13 +2421,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             metrics["ev"].append(ev)
             print(f"  step={step:>5} mode={scheduler.mode:<9s} phase={scheduler.phase:<8s} "
                   f"recon={recon_val:.5f} "
-                  f"L0={l0_val:.1f} dead={dead:.1f}% ev={ev:.3f} thr={thr.mean().item():.3f} "
+                  f"L0={l0_val:.1f} dead={dead:.1f}% ev={ev:.3f} evd={ev_perdim:.3f} thr={thr.mean().item():.3f} "
                   f"ultra={int(ultra_active):>4d} lr={scheduler.optimizer.param_groups[0]['lr']:.2e} "
                   f"lam={scheduler.lambda_l0:.2e} tok/s={tokens_per_sec/1e3:.1f}k "
                   f"tokens={step*BATCH_TOKENS/1e6:.1f}M")
             if use_wandb:
                 wandb.log({"train/recon_loss": recon_val, "train/mean_l0": l0_val,
                            "train/dead_pct": dead, "train/explained_variance": ev,
+                           "train/ev_perdim": ev_perdim,
                            "train/lr": scheduler.optimizer.param_groups[0]["lr"],
                            "train/lambda_l0": scheduler.lambda_l0,
                            "train/activation_norm": activation_norm_step,
