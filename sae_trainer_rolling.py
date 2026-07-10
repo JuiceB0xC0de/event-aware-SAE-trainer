@@ -1085,21 +1085,27 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
         from pathlib import Path as _Path
         pretok_dir = str(_Path(PRETOK_DIR).parent / _slug(model_id or MODEL_ID))
 
-    # Pre-tokenized shards are model-specific.  If their vocab doesn't match, fall
-    # back to on-the-fly tokenization with the correct tokenizer.
-    if use_pretok and vocab_size is not None:
-        try:
-            import json
-            from pathlib import Path as _Path
-            with open(_Path(pretok_dir) / "manifest.json") as f:
-                manifest = json.load(f)
-            pretok_vocab = manifest.get("vocab_size")
-            if pretok_vocab is not None and pretok_vocab != vocab_size:
-                print(f"  [tokens] pretok vocab_size {pretok_vocab} != model {vocab_size}; "
-                      f"falling back to streaming")
-                use_pretok = False
-        except Exception:
-            pass
+    # Pre-tokenized shards are model-specific.  If they are absent or their vocab
+    # doesn't match, fall back to on-the-fly tokenization with the correct tokenizer.
+    if use_pretok:
+        import json
+        from pathlib import Path as _Path
+        manifest_path = _Path(pretok_dir) / "manifest.json"
+        if not manifest_path.exists():
+            print(f"  [tokens] no pretok shards at {pretok_dir}; "
+                  f"falling back to streaming tokenization")
+            use_pretok = False
+        elif vocab_size is not None:
+            try:
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
+                pretok_vocab = manifest.get("vocab_size")
+                if pretok_vocab is not None and pretok_vocab != vocab_size:
+                    print(f"  [tokens] pretok vocab_size {pretok_vocab} != model {vocab_size}; "
+                          f"falling back to streaming")
+                    use_pretok = False
+            except Exception:
+                pass
 
     dataset = _build_token_dataset(
         hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=use_pretok,

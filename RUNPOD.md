@@ -10,12 +10,13 @@ potholes we already paid for.
   secure; RTX A5000 24GB ≈ $0.16/hr community).
 - ~4× the GPU variety. Match the card to the job — a validation run does not need
   an H100.
-- `/workspace` network volume persists across pod stop/start: repo, caches, and
-  outputs survive. Only GPU time is billed while running.
+- Storage is tiered (see "Storage reality" below) — treat every pod as
+  disposable and let HF Hub + W&B be the system of record.
 
 ## Pod setup
 
-**Image:** `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+**Image:** `juiceboxdocks/ml-workflow-image:cu128` (our own, prebuilt ML stack)
+or `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (stock).
 **Ports:** `22/tcp` (direct SSH) — or use the `ssh.runpod.io` proxy (see below).
 **Disk:** 60GB container disk minimum; pools for a full 500-batch run at
 d_in=1024 peak ~74GB, so put `SAE_SCRATCH_DIR` on `/workspace` for big runs.
@@ -144,4 +145,26 @@ for anything whose weights you intend to keep.**
 | Smoke (3 layers × 500 steps) | RTX 6000 Ada | ~15 min | ~$0.20 |
 | Full 28-layer Qwen3-0.6B atlas | RTX 6000 Ada | ~6–8 h | ~$5–6 |
 
-Stop the pod when done — the volume keeps everything for the next session.
+## Storage reality — assume everything on the pod can vanish
+
+Do not trust pod storage with anything irreplaceable. The tiers:
+
+- **Container disk** (`/`, `/root`, `/tmp`): wiped on every stop/restart. Truly
+  ephemeral, always.
+- **Pod volume** (`/workspace` on a pod created without a network volume): tied
+  to that specific pod on that specific host. It survives a *stop → start* in
+  the happy path, but it is destroyed on **terminate**, and RunPod does not
+  guarantee it — host reallocation or a stopped pod getting reaped loses it.
+  Treat it as scratch that happens to sometimes survive.
+- **Network volume** (created separately, attached at pod creation): the only
+  storage that survives pod termination and can attach to a new pod. Costs
+  ~$0.07/GB/mo. Use one if you actually need state across pods.
+
+**The real durability strategy is in the trainer, not the storage:** every
+completed layer uploads to HF Hub immediately, all metrics stream to W&B, and
+the code lives on GitHub. If the pod evaporates mid-run, you lose only the
+in-progress layer and rebuildable caches — restart a fresh pod, clone, and
+resume. Nothing on the pod is ever the only copy of anything that matters.
+
+When the run is done: pull anything you want, then **terminate** the pod and
+assume the storage is gone.
