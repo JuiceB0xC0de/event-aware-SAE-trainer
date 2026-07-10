@@ -91,6 +91,9 @@ def main():
     parser.add_argument("--no-push", action="store_true")
     parser.add_argument("--no-model-evict", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="qwen3-0.6b-sae")
+    parser.add_argument("--norm-ref", type=float, default=None,
+                        help="pin activation_norm_ref (L0 probe norm) when retraining "
+                             "a mid-chain layer in a fresh process")
     args = parser.parse_args()
 
     if not os.environ.get("HF_TOKEN"):
@@ -136,6 +139,7 @@ def main():
         expansion=args.expansion,
         evict_model=not args.no_model_evict,
         target_l0=args.target_l0,
+        norm_ref=args.norm_ref,
     )
 
     if not args.no_push:
