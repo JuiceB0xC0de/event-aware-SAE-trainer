@@ -43,6 +43,7 @@ def _setup_token_pool(model_id: str, model, hf_token: str, pool_batches: int, se
                       tok_dir: Path):
     """Capture token shards once, shared by both production runs."""
     from transformers import AutoTokenizer
+    tok_dir.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
     bos_token_id = tokenizer.bos_token_id or 2
     tcfg = getattr(model.config, "text_config", model.config)
