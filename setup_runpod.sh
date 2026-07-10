@@ -11,12 +11,12 @@
 #     source /workspace/venv/bin/activate
 #     export HF_TOKEN=hf_...
 #     export WANDB_API_KEY=...      # optional
-#     python pretokenize_runpod.py --model-id google/gemma-4-E2B-it
+#     python pretokenize_runpod.py --model-id HuggingFaceTB/SmolLM2-135M-Instruct
 #     python train_runpod.py --layer-range 0,14 --capture rolling \
 #         --target-l0 50 --expansion 32 --microbatch-tokens 32768
 set -e
 
-MODEL_ID="${MODEL_ID:-google/gemma-4-E2B-it}"
+MODEL_ID="${MODEL_ID:-HuggingFaceTB/SmolLM2-135M-Instruct}"
 
 cd /workspace
 mkdir -p /workspace/data /workspace/code
@@ -48,7 +48,7 @@ pip install -e .
 python - <<'PY'
 import os
 from transformers import AutoTokenizer
-model_id = os.environ.get("MODEL_ID", "google/gemma-4-E2B-it")
+model_id = os.environ.get("MODEL_ID", "HuggingFaceTB/SmolLM2-135M-Instruct")
 tok = AutoTokenizer.from_pretrained(model_id, token=os.environ.get("HF_TOKEN"))
 print(f"Tokenizer cached for {model_id}.")
 PY

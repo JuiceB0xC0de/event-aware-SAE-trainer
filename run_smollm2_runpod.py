@@ -2,13 +2,11 @@
 """Train SmolLM2-135M SFT-Only SAE atlas on RunPod.
 
 Run:
-    export HF_TOKEN=hf_...
+    export HF_TOKEN=hf_...      # pull from gopass, never hardcode
     export WANDB_API_KEY=...
     python run_smollm2_runpod.py \
-        --model-id google/gemma-4-E4B-it \
-        --hf-sae-repo juiceb0xc0de/gemma-4-E4B-it-SAE \
         --layer-range 0,29 \
-        --capture rolling-hf \
+        --capture rolling-hf-float \
         --pool-batches 500 \
         --max-steps 5000 \
         --target-l0 50 \
@@ -23,8 +21,8 @@ import sys
 from pathlib import Path
 
 
-MODEL_ID = "google/gemma-4-E4B-it"
-HF_SAE_REPO = "juiceb0xc0de/gemma-4-E4B-it-SAE"
+MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
+HF_SAE_REPO = "juiceb0xc0de/smollm2-135m-SAE"
 
 
 def _env():
@@ -47,7 +45,8 @@ def main():
     parser.add_argument("--hf-sae-repo", type=str, default=HF_SAE_REPO)
     parser.add_argument("--layer-range", type=str, default="0,29")
     parser.add_argument("--capture", type=str, default="rolling-hf",
-                        choices=["auto", "rolling", "rolling-hf"])
+                        choices=["auto", "rolling", "rolling-float",
+                                 "rolling-hf", "rolling-hf-float"])
     parser.add_argument("--pool-batches", type=int, default=500)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--target-l0", type=int, default=50)
