@@ -691,15 +691,17 @@ class PreTokenizedDataset(IterableDataset):
 
 
 def _build_token_dataset(hf_token, batch_tokens, seed: int = 0,
-                         use_pretok: bool = False, pretok_dir=None):
+                         use_pretok: bool = False, pretok_dir=None, model_id=None):
     """Construct the streaming dataset. If `use_pretok=True`, reads pre-tokenized
-    memmap shards (faster); otherwise streams + tokenizes FineWeb-Edu on the fly."""
+    memmap shards (faster); otherwise streams + tokenizes FineWeb-Edu on the fly.
+    `model_id` picks the tokenizer for streaming; defaults to the module-level
+    MODEL_ID (set via $SAE_MODEL_ID) for backward compatibility."""
     if use_pretok:
         if pretok_dir is None:
             pretok_dir = PRETOK_DIR
         return PreTokenizedDataset(pretok_dir=pretok_dir, batch_tokens=batch_tokens, seed=seed)
     return StreamingBatchDataset(
-        hf_token=hf_token, model_id=MODEL_ID,
+        hf_token=hf_token, model_id=model_id or MODEL_ID,
         batch_tokens=batch_tokens, max_seq_len=4096, seed=seed,
     )
 
@@ -1101,7 +1103,7 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
 
     dataset = _build_token_dataset(
         hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=use_pretok,
-        pretok_dir=pretok_dir)
+        pretok_dir=pretok_dir, model_id=model_id)
     it = iter(dataset)                                     # main-process iteration
 
     # Pre-tokenized shards are tokenizer-specific.  Validate the first batch against
@@ -1114,8 +1116,18 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
             del it, dataset
             use_pretok = False
             dataset = _build_token_dataset(
-                hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=False)
+                hf_token=hf_token, batch_tokens=BATCH_TOKENS, seed=seed, use_pretok=False,
+                model_id=model_id)
             it = iter(dataset)
+            # Re-validate: if the rebuilt stream still emits out-of-range ids the
+            # tokenizer itself is wrong -- fail loudly instead of writing poison.
+            probe = next(it)
+            if probe.min() < 0 or probe.max() >= vocab_size:
+                raise RuntimeError(
+                    f"streaming tokenizer for {model_id} produced ids outside "
+                    f"[0,{vocab_size}) (max={int(probe.max())}); check model_id/tokenizer")
+            import itertools
+            it = itertools.chain([probe], it)
         else:
             import itertools
             it = itertools.chain([probe], it)
