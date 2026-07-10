@@ -987,7 +987,7 @@ def _resume_manifest_path(seed: int) -> Path:
 
 
 def _save_resume_pool(pool_dir: Path, layer: int, seed: int, pool_batches: int,
-                      model_id: str, capture: str):
+                      model_id: str, capture: str, activation_norm_ref: float = None):
     """Persist pool_dir as the rolling resume checkpoint for `layer`.
 
     Keeps exactly one resume pool on disk (overwrites the previous one). Copying is
@@ -1008,6 +1008,7 @@ def _save_resume_pool(pool_dir: Path, layer: int, seed: int, pool_batches: int,
         "pool_batches": pool_batches,
         "model_id": model_id,
         "capture": capture,
+        "activation_norm_ref": activation_norm_ref,
     }
     with open(_resume_manifest_path(seed), "w") as f:
         json.dump(manifest, f)
@@ -2551,7 +2552,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
                       hub_id: str = None, wandb_project: str = None, expansion: int = None,
-                      evict_model: bool = True, target_l0: int = None, cpu: bool = False):
+                      evict_model: bool = True, target_l0: int = None, cpu: bool = False,
+                      norm_ref: float = None):
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -2693,7 +2695,11 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         return _pool_dir(f"pool_L{L:02d}_s{seed}")
 
     results = {}
-    activation_norm_ref = None
+    # The slingshot gain and LR multipliers scale by probe/ref norm ratio. The ref
+    # must be the norm of the chain's FIRST layer (L0), not whichever layer this
+    # process happens to train first -- a resume that starts mid-chain with ref=None
+    # gives the first retrained layer ratio=1.0 and therefore maximum slingshot gain.
+    activation_norm_ref = norm_ref
     t0 = time.time()
     # rolling must walk from 0 to build the residual chain; hook capture is independent
     # per layer, so it starts at start_layer.
@@ -2734,6 +2740,27 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 walk_start = max(walk_start, resume_layer + 1)
                 print(f"  [resume] rolling checkpoint found for layer {resume_layer}; "
                       f"chain resumes at L{walk_start}")
+                if activation_norm_ref is None:
+                    try:
+                        import json as _json
+                        with open(_resume_manifest_path(seed)) as _f:
+                            _ref = _json.load(_f).get("activation_norm_ref")
+                        if _ref and _ref > 0:
+                            activation_norm_ref = float(_ref)
+                            print(f"  [resume] restored activation_norm_ref={activation_norm_ref:.5f}")
+                        else:
+                            print("  [resume] WARNING: manifest has no activation_norm_ref; "
+                                  "first trained layer will self-reference (max slingshot gain). "
+                                  "Pass --norm-ref to pin it.")
+                    except Exception:
+                        pass
+                # Pools below the resume point are pre-crash leftovers the retention
+                # loop can never reach (it only walks down to walk_start).
+                for _stale in range(0, walk_start):
+                    _sd = pool_dir_for(_stale)
+                    if _sd.exists():
+                        _rm_pool(_sd)
+                        print(f"  [cleanup] deleted stale pre-resume pool L{_stale}")
 
     for L in range(walk_start, end_layer + 1):
         dst_dir = pool_dir_for(L)
@@ -2824,7 +2851,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
-                _save_resume_pool(dst_dir, L, seed, pool_batches, MODEL_ID, capture)
+                _save_resume_pool(dst_dir, L, seed, pool_batches, MODEL_ID, capture,
+                                  activation_norm_ref=activation_norm_ref)
             # Pool retention policy with pipeline:
             #   - We just trained L. Pool L+1 was pre-produced from L.
             #   - We no longer need L-1 as a source (L+1 came from L).
@@ -2900,6 +2928,10 @@ def main():
                    help=f"override the L0 target K (default {K})")
     p.add_argument("--cpu", action="store_true",
                    help="force CPU training (no CUDA). Will be SLOW - for debugging only.")
+    p.add_argument("--norm-ref", type=float, default=None,
+                   help="pin activation_norm_ref (the chain's L0 probe norm). Required when "
+                        "retraining a mid-chain layer in a fresh process, otherwise the first "
+                        "trained layer self-references and gets maximum slingshot gain.")
     p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
 
@@ -2910,7 +2942,7 @@ def main():
         resume_from=args.resume_from, push=args.push, capture=args.capture,
         model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
         expansion=args.expansion, evict_model=args.evict_model,
-        target_l0=args.target_l0, cpu=args.cpu)
+        target_l0=args.target_l0, cpu=args.cpu, norm_ref=args.norm_ref)
     print(f"\nDone. {res}")
 
 
