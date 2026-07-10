@@ -154,40 +154,53 @@ def main():
     results = {}
     all_ok = True
 
-    for layer in layers:
-        print(f"\n{'-'*60}\nLayer {layer}\n{'-'*60}")
-
+    # Pools chain: producing layer L reads layer L-1's pool. Walk contiguously
+    # from 0 to the deepest requested layer; compare hf vs float only at the
+    # requested layers, and drop stale pools as the chain advances.
+    check = set(layers)
+    for layer in range(max(layers) + 1):
         src_dir = Path(base.ROLLCACHE) / f"pool_L{layer-1:02d}_s{args.seed}_hf" \
             if layer > 0 else None
         # For layer 0 we use the token dir as source for embeddings, not a pool dir.
         # _produce_pool_hf_rolling handles layer==0 internally via inputs_embeds.
 
-        # Produce with full model on GPU
+        # Produce with full model on GPU (this pool is also the chain source
+        # for layer+1, so it is produced for every layer, requested or not).
         dst_hf = Path(base.ROLLCACHE) / f"pool_L{layer:02d}_s{args.seed}_hf"
         dst_hf.mkdir(parents=True, exist_ok=True)
         t_hf = _produce_with_full_model(model, text_model, decoder_layers, layer,
                                           tok_dir, src_dir, dst_hf, device)
-        print(f"  rolling-hf:       {t_hf:6.1f}s")
 
-        # Move model back to CPU before floating run
-        model.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if layer in check:
+            print(f"\n{'-'*60}\nLayer {layer}\n{'-'*60}")
+            print(f"  rolling-hf:       {t_hf:6.1f}s")
 
-        # Produce with floating window
-        dst_float = Path(base.ROLLCACHE) / f"pool_L{layer:02d}_s{args.seed}_float"
-        dst_float.mkdir(parents=True, exist_ok=True)
-        t_float = _produce_with_floating_window(text_model, decoder_layers, layer,
-                                                  tok_dir, src_dir, dst_float, device)
-        print(f"  rolling-hf-float: {t_float:6.1f}s")
+            # Move model back to CPU before floating run
+            model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        match, max_diff = _compare_dirs(dst_hf, dst_float)
-        results[layer] = {"t_hf": t_hf, "t_float": t_float,
-                          "match": match, "max_diff": max_diff}
-        print(f"  bit-exact: {match}  max_diff={max_diff:.3e}  "
-              f"speedup={t_hf/max(t_float, 1e-9):.2f}x")
-        if not match:
-            all_ok = False
+            # Produce with floating window
+            dst_float = Path(base.ROLLCACHE) / f"pool_L{layer:02d}_s{args.seed}_float"
+            dst_float.mkdir(parents=True, exist_ok=True)
+            t_float = _produce_with_floating_window(text_model, decoder_layers, layer,
+                                                      tok_dir, src_dir, dst_float, device)
+            print(f"  rolling-hf-float: {t_float:6.1f}s")
+
+            match, max_diff = _compare_dirs(dst_hf, dst_float)
+            results[layer] = {"t_hf": t_hf, "t_float": t_float,
+                              "match": match, "max_diff": max_diff}
+            print(f"  bit-exact: {match}  max_diff={max_diff:.3e}  "
+                  f"speedup={t_hf/max(t_float, 1e-9):.2f}x")
+            if not match:
+                all_ok = False
+            base._rm_pool(dst_float)
+        else:
+            print(f"  [chain] pool L{layer:02d} produced ({t_hf:.1f}s), comparison not requested")
+
+        # Only the previous pool is needed as source for the next layer.
+        if src_dir is not None:
+            base._rm_pool(src_dir)
 
     print(f"\n{'='*60}")
     print("SUMMARY")
