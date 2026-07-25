@@ -1909,6 +1909,17 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # -- training loop --------------------------------------------------------
     last_step = start_step - 1
     t_step_start_prev = None
+    # AuxK dead-set cache. These MUST live outside the step loop: the refresh only
+    # runs every AUX_DEAD_THRESHOLD steps and every other step reuses the cached set.
+    # They used to be initialised inside the loop, which silently reset them to
+    # empty on 249 of every 250 steps -- so the aux revival loss only ever applied
+    # on refresh steps (0.4% of training), and `last_dead_count` logged 0 forever
+    # because logging lands on step % 250 == 0 while the refresh is step % 250 == 1.
+    # That left the emergency mass reset as the only path that ever revived a
+    # feature, which is how a layer gets to 34% dead before anything intervenes.
+    aux_n_dead = 0
+    aux_dead_indices = None
+    aux_eff_k = 0
     for step in range(start_step, n_steps + 1):
         last_step = step
         if do_timing:
@@ -1963,16 +1974,20 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # refresh it only every AUX_DEAD_THRESHOLD steps (or on the first step).
         # Between refreshes we reuse the cached dead_indices/eff_k/n_dead.
         aux_k_eff = revival.effective_k_aux(K)
-        n_dead = 0
-        dead_indices = None
-        eff_k = 0
         if step % AUX_DEAD_THRESHOLD == 1 or step == start_step:
             dead_mask_aux = revival.aux_dead_mask()
-            n_dead = int(dead_mask_aux.sum().item())
-            if n_dead > 0:
-                dead_indices = torch.where(dead_mask_aux)[0]
-                eff_k = min(aux_k_eff, n_dead)
-        # else: reuse dead_indices, eff_k, n_dead from previous refresh
+            aux_n_dead = int(dead_mask_aux.sum().item())
+            if aux_n_dead > 0:
+                aux_dead_indices = torch.where(dead_mask_aux)[0]
+                aux_eff_k = min(aux_k_eff, aux_n_dead)
+            else:
+                aux_dead_indices = None
+                aux_eff_k = 0
+        # else: reuse aux_dead_indices / aux_eff_k / aux_n_dead from the last refresh
+        # (they persist across steps now -- see the note above the loop).
+        n_dead = aux_n_dead
+        dead_indices = aux_dead_indices
+        eff_k = aux_eff_k
         revival.last_dead_count = n_dead
 
         buffer_err_this_step = revival.should_buffer_err(step, K)
