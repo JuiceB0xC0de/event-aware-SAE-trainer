@@ -233,6 +233,7 @@ class SAEAECSConfig:
     # later branches; the legacy ev_stop_thresh/ev_stop_patience above stay
     # authoritative for stopping until FINETUNE is implemented.
     pin_l0_band_abs: float = 0.5        # |L0 - target| <= this -> DESCENT enters PIN
+    pin_l0_release_frac: float = 0.25   # |L0 - target| > this*target while PINned -> back to DESCENT
     pin_timeout_steps: int = 2000       # max steps in PIN before bailing back to DESCENT
     pin_ev_thresh: float = 0.95         # EV window counts toward PIN success above this
     pin_ev_patience: int = 3            # consecutive good EV windows -> ready for FINETUNE
@@ -464,11 +465,31 @@ class SAEEventControlScheduler:
         """True when L0 is within the PIN band (+/- pin_l0_band_abs) of target."""
         return abs(current_l0 - self.config.target_l0) <= self.config.pin_l0_band_abs
 
+    def _l0_escaped_pin_band(self, current_l0: float) -> bool:
+        """True when a PINned L0 has drifted far enough that PIN's premise is void.
+
+        PIN freezes the dual on the assumption that L0 is locked at target. A mass
+        dead-feature reset can revive thousands of features in one step and blow L0
+        far past the band; with the dual frozen there is no restoring force, so the
+        run coasts to max_steps at the wrong sparsity (observed: MiniCPM5-1B L13-L15
+        finished at L0 ~1670-1717 against target 50). Releasing on escape hands
+        lambda back to the integrator.
+
+        The release band is deliberately much wider than the entry band, so normal
+        PIN oscillation (observed +/-3 around target) can never trip it. Only a
+        genuine blowout does.
+        """
+        cfg = self.config
+        return abs(current_l0 - cfg.target_l0) > cfg.pin_l0_release_frac * cfg.target_l0
+
     def _enter_phase(self, new_phase: str, reason: str):
         """Transition the phase machine, reset phase_step, capture PIN entry state.
 
-        No actuator reads self.phase at this branch, so a transition has no
-        behavioral effect beyond logging and bookkeeping.
+        NOTE: this docstring previously claimed no actuator reads self.phase, so a
+        transition was purely cosmetic. That is no longer true and was the cause of
+        a real control failure. `_update_dual` early-returns on phase == "PIN" (the
+        lambda freeze), so entering and leaving PIN directly gates whether the
+        sparsity integrator runs at all. Treat phase transitions as actuator changes.
         """
         if new_phase == self.phase:
             return
@@ -494,9 +515,12 @@ class SAEEventControlScheduler:
               f"(lambda={self.lambda_l0:.3e}; {reason})")
 
     def _maybe_update_phase(self, l0, ev):
-        """Observation-only phase detection.
+        """Phase detection. NOT observation-only: the phase gates the dual.
 
         - DESCENT -> PIN when L0 enters the band around target.
+        - PIN -> DESCENT when L0 escapes the release band. This one IS an actuator
+          change: _update_dual early-returns on phase == "PIN", so leaving PIN is
+          what hands lambda back to the integrator. See _l0_escaped_pin_band.
         - In PIN, count consecutive EV windows at/above pin_ev_thresh, and LOG
           (but do not act on) FINETUNE readiness and PIN timeout. Actual FINETUNE
           release (Task 6A) and timeout return-to-DESCENT (Task 6C) land later.
@@ -512,6 +536,18 @@ class SAEEventControlScheduler:
                     f"L0={l0:.2f} within +/-{cfg.pin_l0_band_abs} of target {cfg.target_l0:.1f}",
                 )
         elif self.phase == "PIN":
+            # Premise check first: a PINned L0 that has escaped the band means the
+            # frozen dual is holding the wrong lambda with no way to correct. Release
+            # before anything else in this branch reads pin state.
+            if l0 is not None and self._l0_escaped_pin_band(float(l0)):
+                self._enter_phase(
+                    "DESCENT",
+                    f"L0={l0:.1f} escaped PIN release band "
+                    f"(+/-{cfg.pin_l0_release_frac * cfg.target_l0:.1f} of "
+                    f"{cfg.target_l0:.1f}); releasing frozen dual",
+                )
+                self.pin_ev_count = 0
+                return
             if ev is not None:
                 if ev >= cfg.pin_ev_thresh:
                     self.pin_ev_count += 1

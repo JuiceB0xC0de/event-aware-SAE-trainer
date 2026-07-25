@@ -504,3 +504,58 @@ def test_slingshot_gain_fallback_without_preflight_stats():
     assert _slingshot_sched(ref=None, probe=None, layer=24)._effective_slingshot_gain() == 8.0
     assert _slingshot_sched(ref=None, probe=None, layer=2)._effective_slingshot_gain() == 24.0
     assert _slingshot_sched(ref=None, probe=None, layer=None)._effective_slingshot_gain() == 24.0
+
+
+# --- PIN release on L0 escape -------------------------------------------------
+# Regression guard for the MiniCPM5-1B L13-L15 control failure: a mass dead-feature
+# reset blew L0 from 50 to ~1700 while the phase machine was PINned, and because the
+# dual is frozen in PIN there was no restoring force. All three layers coasted to
+# max_steps at ~34x the target sparsity.
+
+
+def _pinned_sched(**overrides):
+    """A scheduler already sitting in PIN with L0 at target."""
+    sched = _make_scheduler(**overrides)
+    sched._maybe_update_phase(l0=500.0, ev=0.90)
+    assert sched.phase == "PIN"
+    return sched
+
+
+def test_pin_releases_when_l0_escapes_band():
+    sched = _pinned_sched()
+    # Blowout well outside +/-25% of target 500 -> release back to DESCENT.
+    sched._maybe_update_phase(l0=1700.0, ev=0.97)
+    assert sched.phase == "DESCENT"
+    assert sched.pin_ev_count == 0
+
+
+def test_pin_release_unfreezes_the_dual():
+    # The point of releasing is that the integrator runs again. In PIN the dual
+    # update early-returns and lambda cannot move; after release it must.
+    sched = _pinned_sched()
+    lam_pinned = sched.lambda_l0
+    sched._dual_update(1700.0)
+    assert sched.lambda_l0 == lam_pinned, "lambda moved while PINned"
+
+    sched._maybe_update_phase(l0=1700.0, ev=0.97)
+    assert sched.phase == "DESCENT"
+    sched._dual_update(1700.0)
+    assert sched.lambda_l0 > lam_pinned, "lambda did not move after PIN release"
+
+
+def test_pin_holds_through_normal_oscillation():
+    # Observed healthy PIN behaviour oscillates a few counts around target. The
+    # release band is deliberately wide so this can never trip it.
+    sched = _pinned_sched()
+    for l0 in (497.0, 503.0, 490.0, 510.0, 520.0, 480.0):
+        sched._maybe_update_phase(l0=l0, ev=0.96)
+        assert sched.phase == "PIN", f"released on benign L0={l0}"
+
+
+def test_pin_release_band_is_configurable():
+    sched = _pinned_sched(pin_l0_release_frac=0.10)
+    # 10% of 500 -> release above 550. 540 holds, 600 releases.
+    sched._maybe_update_phase(l0=540.0, ev=0.96)
+    assert sched.phase == "PIN"
+    sched._maybe_update_phase(l0=600.0, ev=0.96)
+    assert sched.phase == "DESCENT"
