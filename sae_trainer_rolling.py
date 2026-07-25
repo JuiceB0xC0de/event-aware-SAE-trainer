@@ -140,6 +140,20 @@ def _aggressive_k_aux_k(target_l0: int) -> int:
     return max(8, min(AUX_K, target_l0 // 2))
 
 
+def _pick_dead_rollback(buf, ceiling: float):
+    """Newest buffered log window whose dead_pct is at or under `ceiling`, else None.
+
+    Newest-first because we want the most-trained state that still has a live feature
+    tail, not the healthiest one. On MiniCPM5-1B L13 the buffer at the breach held
+    steps 1500/1750/2000/2250 at 0.0/0.1/0.8/8.8% dead, and step 2000 is the pick:
+    L0 49.3, EV 0.949, dead 0.8%.
+    """
+    for s in reversed(buf):
+        if s["dead"] is not None and s["dead"] <= ceiling:
+            return s
+    return None
+
+
 def _aggressive_k_reset_threshold(target_l0: int) -> int:
     """Dead features accumulate faster at low L0; reset/resample them sooner."""
     if target_l0 <= 100:
@@ -1870,6 +1884,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     best_ev = -float("inf"); best_ev_step = 0; best_ev_l0 = 0.0
     best_state_in_memory = None; best_state_pending = False
     best_ev_persist_margin = 0.005
+    # Dead-feature ceiling with rollback. Deep layers starve their feature tail the
+    # moment PIN freezes the dual: observed MiniCPM5-1B L13 going 0.8% -> 8.8% dead in
+    # a single 250-step window at PIN entry, while EV moved 0.949 -> 0.948. AuxK cannot
+    # catch it (AUX_DEAD_THRESHOLD is 250 steps of silence, longer than the collapse).
+    # So instead of trying to revive forward, keep the last few logged states and walk
+    # BACK to the newest one still under the ceiling. On L13 that lands step 2000:
+    # L0 49.3, EV 0.949, dead 0.8% -- four thousandths of EV for 9x fewer dead features.
+    # Ceiling of 1.0% never fires on layers that behave (0-12 here peaked at 0.58%),
+    # so this is inert on healthy runs.
+    dead_stop_pct = 1.0
+    dead_rollback_slots = 4
+    dead_state_buf = []  # list of dicts: step / dead / ev / l0 / state (CPU tensors)
     ev_decline_margin = 0.035
     ev_decline_floor = 0.95
     ev_decline_patience = 8
@@ -2277,6 +2303,39 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 res_var_d = (acts_mb.float() - xh_p.float()).pow(2).mean(dim=0)
                 var_d = acts_mb.float().var(dim=0)
                 ev_perdim = 1.0 - (res_var_d / var_d.clamp_min(1e-6)).mean().item()
+
+            # -- dead-feature ceiling with rollback -----------------------------
+            # Buffer this window, then if dead has breached the ceiling walk back to
+            # the newest buffered state still under it and stop there. Runs before
+            # anything downstream reads dead/ev/l0_val, so the printed line, the W&B
+            # row, meta.json and sae.pt all describe the SAME weights.
+            dead_state_buf.append({
+                "step": step, "dead": dead, "ev": ev, "l0": l0_val,
+                "state": {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()},
+            })
+            if len(dead_state_buf) > dead_rollback_slots:
+                dead_state_buf.pop(0)
+            if dead > dead_stop_pct:
+                _pick = _pick_dead_rollback(dead_state_buf, dead_stop_pct)
+                if _pick is not None:
+                    sae.load_state_dict(_pick["state"])
+                    print(f"  [DEAD ROLLBACK @ {step}] dead={dead:.2f}% breached "
+                          f"{dead_stop_pct:.2f}% ceiling -> restored step {_pick['step']} "
+                          f"(dead={_pick['dead']:.2f}% ev={_pick['ev']:.4f} L0={_pick['l0']:.2f})")
+                    # Re-point the reported metrics at the restored state.
+                    dead = _pick["dead"]; ev = _pick["ev"]; l0_val = _pick["l0"]
+                    scheduler.stop_reason = (
+                        f"dead-feature ceiling: breached {dead_stop_pct:.2f}%, rolled back to "
+                        f"step {_pick['step']} (dead={_pick['dead']:.2f}%, EV={_pick['ev']:.4f}, "
+                        f"L0={_pick['l0']:.2f})")
+                else:
+                    print(f"  [DEAD CEILING @ {step}] dead={dead:.2f}% breached "
+                          f"{dead_stop_pct:.2f}% ceiling and no buffered window is under it; "
+                          f"stopping without rollback")
+                    scheduler.stop_reason = (
+                        f"dead-feature ceiling: breached {dead_stop_pct:.2f}% with no clean "
+                        f"state in the last {len(dead_state_buf)} windows")
+                scheduler.should_stop = True
         else:
             dead = None; ev = None; ev_perdim = None
 

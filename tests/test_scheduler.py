@@ -559,3 +559,39 @@ def test_pin_release_band_is_configurable():
     assert sched.phase == "PIN"
     sched._maybe_update_phase(l0=600.0, ev=0.96)
     assert sched.phase == "DESCENT"
+
+
+# --- dead-feature ceiling rollback --------------------------------------------
+# Regression guard for the MiniCPM5-1B deep-layer collapse: at PIN entry the feature
+# tail starves inside a single 250-step window (L13 observed 0.8% -> 8.8% dead while
+# EV moved 0.949 -> 0.948). AuxK cannot respond because AUX_DEAD_THRESHOLD is 250
+# steps of silence. So the trainer buffers recent log windows and walks back.
+
+import sae_trainer_rolling as t
+
+
+def _w(step, dead):
+    return {"step": step, "dead": dead, "ev": 0.95, "l0": 49.0, "state": None}
+
+
+def test_dead_rollback_picks_newest_under_ceiling():
+    # The real L13 buffer at the breach.
+    buf = [_w(1500, 0.0), _w(1750, 0.1), _w(2000, 0.8), _w(2250, 8.8)]
+    pick = t._pick_dead_rollback(buf, 1.0)
+    assert pick["step"] == 2000, "should take the most-trained state under the ceiling"
+
+
+def test_dead_rollback_returns_none_when_all_breached():
+    buf = [_w(2250, 8.8), _w(2500, 18.4), _w(2750, 26.0)]
+    assert t._pick_dead_rollback(buf, 1.0) is None
+
+
+def test_dead_rollback_ceiling_is_inclusive():
+    buf = [_w(1000, 0.5), _w(1250, 1.0)]
+    assert t._pick_dead_rollback(buf, 1.0)["step"] == 1250
+
+
+def test_dead_rollback_skips_none_dead():
+    # Non-log windows carry dead=None and must never be selected.
+    buf = [_w(1000, 0.4), _w(1250, None), _w(1500, None)]
+    assert t._pick_dead_rollback(buf, 1.0)["step"] == 1000
