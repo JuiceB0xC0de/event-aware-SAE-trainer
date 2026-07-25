@@ -1830,8 +1830,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     log_window_start = time.time()
     log_window_tokens = 0
 
-    # -- optional step-level timing (set SAE_TIMING=1 to enable) -----------------
-    do_timing = os.environ.get("SAE_TIMING", "").lower() in ("1", "true", "yes", "on")
+    # -- optional step-level timing ----------------------------------------------
+    # SAE_TIMING=1/true/on -> print every step; SAE_TIMING=N -> print every N steps;
+    # unset/0/off -> disabled. Accumulators for the [TIMING @ LOG_EVERY] aggregate
+    # run on every step regardless of the print interval.
+    _timing_env = os.environ.get("SAE_TIMING", "").strip().lower()
+    if _timing_env in ("1", "true", "yes", "on"):
+        timing_every = 1
+    elif _timing_env.isdigit() and int(_timing_env) > 0:
+        timing_every = int(_timing_env)
+    else:
+        timing_every = 0
+    do_timing = timing_every > 0
     if do_timing:
         timing = {
             "t_provider": 0.0,      # wall-time accumulator (last LOG_EVERY steps)
@@ -2226,17 +2236,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 - timing["_last_fwd_bwd"]
                 - timing["_last_opt_norm"],
             )
-            print(
-                f"  [STEP-TIME {step:>4}] "
-                f"total={t_step_total*1000:>6.1f}ms "
-                f"provider={timing['_last_provider']*1000:>6.1f}ms "
-                f"fwd_bwd={timing['_last_fwd_bwd']*1000:>6.1f}ms "
-                f"opt_norm={timing['_last_opt_norm']*1000:>6.1f}ms "
-                f"errbuf={timing['_last_errbuf']*1000:>6.1f}ms "
-                f"other={t_other*1000:>6.1f}ms "
-                f"step_tok/s={step_tok_s:>7.1f} "
-                f"wall_tok/s={wall_tok_s:>7.1f}"
-            )
+            if step % timing_every == 0:
+                print(
+                    f"  [STEP-TIME {step:>4}] "
+                    f"total={t_step_total*1000:>6.1f}ms "
+                    f"provider={timing['_last_provider']*1000:>6.1f}ms "
+                    f"fwd_bwd={timing['_last_fwd_bwd']*1000:>6.1f}ms "
+                    f"opt_norm={timing['_last_opt_norm']*1000:>6.1f}ms "
+                    f"errbuf={timing['_last_errbuf']*1000:>6.1f}ms "
+                    f"other={t_other*1000:>6.1f}ms "
+                    f"step_tok/s={step_tok_s:>7.1f} "
+                    f"wall_tok/s={wall_tok_s:>7.1f}"
+                )
 
         if is_log_step:
             dead = revival.dead_pct(LOG_EVERY)

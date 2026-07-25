@@ -53,7 +53,7 @@ def _env():
     os.environ.setdefault("SAE_MICROBATCH_TOKENS", "32768")
     os.environ.setdefault("SAE_USE_TRITON", "0")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    os.environ.setdefault("SAE_TIMING", "1")
+    os.environ.setdefault("SAE_TIMING", "25")
     os.environ.setdefault("WANDB_PROJECT", "minicpm5-1b-sae")
 
 
