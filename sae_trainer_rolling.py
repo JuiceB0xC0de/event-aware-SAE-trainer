@@ -140,6 +140,53 @@ def _aggressive_k_aux_k(target_l0: int) -> int:
     return max(8, min(AUX_K, target_l0 // 2))
 
 
+# --- console colour -----------------------------------------------------------
+# The per-step panel scrolls fast and the three numbers that decide whether a layer
+# is any good (L0, dead, EV) were the same shade as the twenty that don't matter.
+# Colour is written into the log FILE too, on purpose: runs live under nohup, so
+# isatty() is False and a tty check would make the output monotone exactly where
+# it's read from. Set SAE_NO_COLOR=1 to turn it off.
+_SAE_COLOR = os.environ.get("SAE_NO_COLOR", "").strip().lower() not in ("1", "true", "yes", "on")
+
+
+def _c(text, code: str) -> str:
+    """Wrap text in an ANSI SGR code, or return it untouched when colour is off."""
+    return f"\033[{code}m{text}\033[0m" if _SAE_COLOR else str(text)
+
+
+def _c_dead(v: float, ceiling: float = 1.0) -> str:
+    """dead%: red once it breaches the ceiling, yellow at half of it, green below."""
+    s = f"{v:.1f}%"
+    if v > ceiling:
+        return _c(s, "1;91")
+    if v > ceiling / 2:
+        return _c(s, "93")
+    return _c(s, "92")
+
+
+def _c_ev(v: float, floor: float = 0.95) -> str:
+    """EV: green at or above the quality gate, yellow within 5 points, red below."""
+    s = f"{v:.3f}"
+    if v >= floor:
+        return _c(s, "1;92")
+    if v >= floor - 0.05:
+        return _c(s, "93")
+    return _c(s, "91")
+
+
+def _c_l0(v: float, target: float) -> str:
+    """L0: green inside 5% of target, yellow inside 20%, red outside."""
+    s = f"{v:.1f}"
+    if target <= 0:
+        return s
+    rel = abs(v - target) / target
+    if rel <= 0.05:
+        return _c(s, "1;92")
+    if rel <= 0.20:
+        return _c(s, "93")
+    return _c(s, "1;91")
+
+
 def _pick_dead_rollback(buf, ceiling: float):
     """Newest buffered log window whose dead_pct is at or under `ceiling`, else None.
 
@@ -2319,9 +2366,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 _pick = _pick_dead_rollback(dead_state_buf, dead_stop_pct)
                 if _pick is not None:
                     sae.load_state_dict(_pick["state"])
-                    print(f"  [DEAD ROLLBACK @ {step}] dead={dead:.2f}% breached "
-                          f"{dead_stop_pct:.2f}% ceiling -> restored step {_pick['step']} "
-                          f"(dead={_pick['dead']:.2f}% ev={_pick['ev']:.4f} L0={_pick['l0']:.2f})")
+                    _tag = _c(f"  [DEAD ROLLBACK @ {step}]", "1;95")
+                    _bad = _c(f"{dead:.2f}%", "1;91")
+                    _pd = _c(f"{_pick['dead']:.2f}%", "1;92")
+                    _pe = _c_ev(_pick["ev"])
+                    _pl = _c_l0(_pick["l0"], sae_cfg.target_l0)
+                    _ps = _c(str(_pick["step"]), "1;97")
+                    print(f"{_tag} dead={_bad} breached {dead_stop_pct:.2f}% ceiling"
+                          f" -> restored step {_ps} (dead={_pd} ev={_pe} L0={_pl})")
                     # Re-point the reported metrics at the restored state.
                     dead = _pick["dead"]; ev = _pick["ev"]; l0_val = _pick["l0"]
                     scheduler.stop_reason = (
@@ -2505,9 +2557,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             metrics["dead_pct"].append(round(dead, 2))
             metrics["resampled"].append(revival.total_resampled)
             metrics["ev"].append(ev)
-            print(f"  step={step:>5} mode={scheduler.mode:<9s} phase={scheduler.phase:<8s} "
+            print(f"  step={_c(f'{step:>5}', '1;97')} mode={scheduler.mode:<9s} "
+                  f"phase={_c(f'{scheduler.phase:<8s}', '96')} "
                   f"recon={recon_val:.5f} "
-                  f"L0={l0_val:.1f} dead={dead:.1f}% ev={ev:.3f} evd={ev_perdim:.3f} thr={thr.mean().item():.3f} "
+                  f"L0={_c_l0(l0_val, sae_cfg.target_l0)} "
+                  f"dead={_c_dead(dead, dead_stop_pct)} "
+                  f"ev={_c_ev(ev)} "
+                  f"evd={ev_perdim:.3f} thr={thr.mean().item():.3f} "
                   f"ultra={int(ultra_active):>4d} lr={scheduler.optimizer.param_groups[0]['lr']:.2e} "
                   f"lam={scheduler.lambda_l0:.2e} tok/s={tokens_per_sec/1e3:.1f}k "
                   f"tokens={step*BATCH_TOKENS/1e6:.1f}M")
