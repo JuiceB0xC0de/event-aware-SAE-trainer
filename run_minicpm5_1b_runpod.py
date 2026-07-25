@@ -38,7 +38,7 @@ from huggingface_hub import HfApi, create_repo, upload_folder
 
 
 MODEL_ID = "openbmb/MiniCPM5-1B"
-HF_SAE_REPO = "juiceb0xc0de/minicpm5-1b-sae"
+HF_SAE_REPO = "juiceb0xc0de/minicpm5-1b-SAE"
 SLUG = MODEL_ID.replace("/", "_").lower()
 DATA_DIR = Path("/workspace/data")
 SAE_DIR = DATA_DIR / "saes" / SLUG
