@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-26
+
+### Added
+- **PIN stop gate**: the scheduler pins convergence once L0 holds inside the target
+  band and stops the layer early; the pin is released if L0 escapes the band.
+- **Hard 1% dead-feature ceiling** with rollback to the last clean window.
+- **Per-dimension EV logging** alongside the scalar EV.
+- **`--norm-ref` / activation-norm reference**: reuse a prior run's activation
+  normalization when retraining, persisted with the resume pool.
+- **`rolling-float` / `rolling-hf-float` capture modes**: hoist/drop blocks so only
+  the active sandwich sits in VRAM.
+- **`run_atlas.py` config-driven runner**: one YAML per model under `configs/`,
+  CLI overrides on top; replaces the per-model runner scripts.
+- **CI**: pytest suite runs on every push and pull request.
+- **Streaming fallback** when pre-tokenized shards are absent.
+
+### Fixed
+- AuxK dead-set cache was being reset every step, neutering dead-feature revival.
+- Streaming-tokenizer fallback could use the wrong model's tokenizer.
+- `HF_SAE_REPO` env var handling was case-sensitive.
+- Global `*.json` gitignore rule was swallowing `configs/`.
+- `validate_floating_window` walks the pool chain contiguously for sparse layer
+  lists and creates the token dir before shard capture.
+
+### Removed
+- Per-model and cloud-runner scripts; `run_atlas.py` + `configs/` is the single
+  entry point above the trainer.
+
 ## [0.2.1] - 2026-06-20
 
 ### Fixed

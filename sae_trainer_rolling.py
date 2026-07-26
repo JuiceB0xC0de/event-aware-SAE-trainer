@@ -91,6 +91,11 @@ PRETOK_DIR = str(DATA_DIR / "pretok" / "fineweb-edu")        # optional pre-toke
 ROLLCACHE  = os.environ.get("SAE_SCRATCH_DIR", str(DATA_DIR / "rollcache"))
 HARD_STOP_LAYER = 15                       # exclusive upper bound; never touch 15+
 
+# -- Corpus + model loading (set via CLI/config only, no env) ---------------
+CORPUS_ID         = "HuggingFaceFW/fineweb-edu"
+CORPUS_TEXT_FIELD = "text"
+TRUST_REMOTE_CODE = False
+
 # -- Hyperparameters --------------------------------------------------------
 D_IN          = 1536        # fallback residual width; auto-detected from the model config at run time
 EXPANSION     = 32          # SAE dictionary size = EXPANSION * d_in (Llama-Scope-class config)
@@ -638,7 +643,9 @@ class StreamingBatchDataset(IterableDataset):
     Module-level class so it stays picklable for worker processes."""
 
     def __init__(self, hf_token, model_id, batch_tokens,
-                 max_seq_len: int = 4096, shuffle_buffer: int = 10_000, seed: int = 0):
+                 max_seq_len: int = 4096, shuffle_buffer: int = 10_000, seed: int = 0,
+                 corpus_id: str = None, corpus_text_field: str = None,
+                 trust_remote_code: bool = False):
         super().__init__()
         self.hf_token = hf_token
         self.model_id = model_id
@@ -646,6 +653,9 @@ class StreamingBatchDataset(IterableDataset):
         self.max_seq_len = max_seq_len
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
+        self.corpus_id = corpus_id or CORPUS_ID
+        self.corpus_text_field = corpus_text_field or CORPUS_TEXT_FIELD
+        self.trust_remote_code = trust_remote_code
 
     def __iter__(self):
         import random as _random
