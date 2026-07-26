@@ -5,17 +5,24 @@
 checkpoint*.pt
 
 # Data, activations, corpora
-*.json
 *.jsonl
 *.parquet
 rollcache/
 atlas_download/
 data/
 
+# Run outputs & local tooling state
+# (NOTE: do not re-add a global "*.json" here -- it silently swallows
+#  config files. Ignore generated JSON by location instead.)
+artifacts/
+.claude/
+**/live_tune.json
+
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
 .ipynb_checkpoints/
