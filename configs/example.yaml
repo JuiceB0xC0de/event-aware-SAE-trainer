@@ -64,9 +64,10 @@ defaults:
   microbatch_tokens: 32768
 
   # Rolling modes only: how many previous layers' pools stay on disk as
-  # rollback insulation. Retraining L-k needs pool[L-k] present; anything
-  # deeper re-enters via the hooked bootstrap (one full capture pass).
-  # Each extra pool costs its full disk size. Ignored under `auto` capture.
+  # rollback insulation (default 3). Retraining L-k needs pool[L-k] present;
+  # anything deeper re-enters via the hooked bootstrap (one full capture
+  # pass). Each pool costs its full disk size -- set 1 on disk-tight pods.
+  # Ignored under `auto` capture.
   pool_retention: 3
 
 # Extra environment variables, applied with setdefault before training.

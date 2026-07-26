@@ -244,7 +244,7 @@ def main():
     max_steps = pick(args.max_steps, "max_steps", 5000)
     target_l0 = pick(args.target_l0, "target_l0", None)
     microbatch = pick(args.microbatch_tokens, "microbatch_tokens", None)
-    pool_retention = pick(args.pool_retention, "pool_retention", 1)
+    pool_retention = pick(args.pool_retention, "pool_retention", 3)
 
     corpus_cfg = cfg.get("corpus") or {}
     corpus = args.corpus or corpus_cfg.get("id")

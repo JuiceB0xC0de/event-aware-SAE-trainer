@@ -2734,7 +2734,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       evict_model: bool = True, target_l0: int = None, cpu: bool = False,
                       norm_ref: float = None, corpus: str = None,
                       corpus_text_field: str = None, corpus_prefix: str = None,
-                      trust_remote_code: bool = False, pool_retention: int = 1):
+                      trust_remote_code: bool = False, pool_retention: int = 3):
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -2771,8 +2771,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         TRUST_REMOTE_CODE = True
         print("  [config] trust_remote_code enabled")
     pool_retention = max(1, int(pool_retention))
-    if pool_retention > 1:
-        print(f"  [config] pool retention: {pool_retention} previous pools kept on disk")
+    print(f"  [config] pool retention: {pool_retention} previous pool(s) kept on disk")
     if expansion:
         EXPANSION = int(expansion)
     if target_l0 is not None and target_l0 > 0:
@@ -3171,9 +3170,9 @@ def main():
                    help="string prepended to every corpus text, e.g. a model's domain tag")
     p.add_argument("--trust-remote-code", action="store_true",
                    help="pass trust_remote_code=True to tokenizer/model loads (custom_code repos)")
-    p.add_argument("--pool-retention", type=int, default=1,
+    p.add_argument("--pool-retention", type=int, default=3,
                    help="previous layers' pools kept on disk as rollback insulation "
-                        "(default 1 = current layer only; each extra pool costs its full disk size)")
+                        "(default 3; use 1 on disk-tight pods -- each pool costs its full disk size)")
     p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
 
