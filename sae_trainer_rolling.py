@@ -2734,7 +2734,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       evict_model: bool = True, target_l0: int = None, cpu: bool = False,
                       norm_ref: float = None, corpus: str = None,
                       corpus_text_field: str = None, corpus_prefix: str = None,
-                      trust_remote_code: bool = False):
+                      trust_remote_code: bool = False, pool_retention: int = 1):
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -2770,6 +2770,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     if trust_remote_code:
         TRUST_REMOTE_CODE = True
         print("  [config] trust_remote_code enabled")
+    pool_retention = max(1, int(pool_retention))
+    if pool_retention > 1:
+        print(f"  [config] pool retention: {pool_retention} previous pools kept on disk")
     if expansion:
         EXPANSION = int(expansion)
     if target_l0 is not None and target_l0 > 0:
@@ -3082,10 +3085,11 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                                   activation_norm_ref=activation_norm_ref)
             # Pool retention policy with pipeline:
             #   - We just trained L. Pool L+1 was pre-produced from L.
-            #   - We no longer need L-1 as a source (L+1 came from L).
-            #   - Keep L as source for L+2 production.
-            #   - Delete L-1 and below to cap disk at ~2 active pools + resume.
-            cutoff = L - 1 if pre_produced_next else L - 2
+            #   - Keep L as source for L+2 production, plus `pool_retention - 1`
+            #     older pools as rollback insulation (retraining L-k needs pool[L-k]
+            #     on disk; anything deeper re-enters via the hooked bootstrap).
+            #   - Delete everything below that to cap disk.
+            cutoff = L - pool_retention if pre_produced_next else L - pool_retention - 1
             for old_L in range(cutoff, walk_start - 1, -1):
                 if old_L < 0:
                     continue
@@ -3167,6 +3171,9 @@ def main():
                    help="string prepended to every corpus text, e.g. a model's domain tag")
     p.add_argument("--trust-remote-code", action="store_true",
                    help="pass trust_remote_code=True to tokenizer/model loads (custom_code repos)")
+    p.add_argument("--pool-retention", type=int, default=1,
+                   help="previous layers' pools kept on disk as rollback insulation "
+                        "(default 1 = current layer only; each extra pool costs its full disk size)")
     p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
 
@@ -3179,7 +3186,8 @@ def main():
         expansion=args.expansion, evict_model=args.evict_model,
         target_l0=args.target_l0, cpu=args.cpu, norm_ref=args.norm_ref,
         corpus=args.corpus, corpus_text_field=args.corpus_text_field,
-        corpus_prefix=args.corpus_prefix, trust_remote_code=args.trust_remote_code)
+        corpus_prefix=args.corpus_prefix, trust_remote_code=args.trust_remote_code,
+        pool_retention=args.pool_retention)
     print(f"\nDone. {res}")
 
 

@@ -191,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--seed", type=int, default=0)
     ov.add_argument("--bdec-batches", type=int, default=50)
     ov.add_argument("--resume-from", type=str, default=None)
+    ov.add_argument("--pool-retention", type=int, default=None)
     ov.add_argument("--corpus", type=str, default=None)
     ov.add_argument("--corpus-text-field", type=str, default=None)
     ov.add_argument("--corpus-prefix", type=str, default=None)
@@ -243,6 +244,7 @@ def main():
     max_steps = pick(args.max_steps, "max_steps", 5000)
     target_l0 = pick(args.target_l0, "target_l0", None)
     microbatch = pick(args.microbatch_tokens, "microbatch_tokens", None)
+    pool_retention = pick(args.pool_retention, "pool_retention", 1)
 
     corpus_cfg = cfg.get("corpus") or {}
     corpus = args.corpus or corpus_cfg.get("id")
@@ -337,6 +339,7 @@ def main():
         corpus_text_field=corpus_text_field,
         corpus_prefix=corpus_prefix,
         trust_remote_code=trust_remote_code,
+        pool_retention=pool_retention,
     )
 
     if push and hub_id:
