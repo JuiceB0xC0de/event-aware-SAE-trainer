@@ -1,0 +1,54 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheel (~200MB) instead of the default CUDA build
+          # (multi-GB). Runners have no GPU, so the CUDA build is dead weight.
+          pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            "torch>=2.6.0,<2.8.0"
+          # Everything else the tests actually import. Deliberately NOT
+          # requirements.txt -- that pulls torchvision/torchaudio/wandb/datasets,
+          # none of which the CPU test suite touches.
+          pip install \
+            "numpy>=1.26.0,<3.0.0" \
+            "transformers>=5.0.0" \
+            "pytest>=8.0"
+
+      - name: Show environment
+        run: |
+          python -c "import torch, transformers; print('torch', torch.__version__); print('transformers', transformers.__version__); print('cuda', torch.cuda.is_available())"
+
+      - name: Run tests
+        # Tests needing a GPU are marked @pytest.mark.gpu and skip themselves
+        # when CUDA is unavailable, so the full suite is safe on CPU runners.
+        run: pytest -q
