@@ -1,0 +1,45 @@
+# Gemma-3n / Gemma-4 family.
+#
+#   python run_atlas.py --model gemma4
+#   python run_atlas.py --model gemma4 --model-id google/gemma-4-E4B-it
+#
+# NOTE: this family uses the Gemma-specific `rolling` capture path, not
+# rolling-hf. The two are not interchangeable -- Gemma-3n/4 carry PLE
+# tables (embed_tokens_per_layer, per_layer_model_projection) that the
+# Llama-style path does not know about.
+
+model_id:      google/gemma-4-E2B-it
+hf_sae_repo:   null          # null -> derived from model_id at runtime
+wandb_project: gemma4-sae
+
+architecture:
+  n_layers: null    # null -> read from AutoConfig.num_hidden_layers
+  d_in: null        # null -> auto-detected by the trainer
+
+defaults:
+  capture:           rolling
+  expansion:         32
+  pool_batches:      1000
+  max_steps:         5000
+  target_l0:         50
+  microbatch_tokens: 32768
+
+env:
+  SAE_TIMING: "1"
+
+notes: |
+  IMPORTANT: the `rolling` capture path is hard-clamped at layer 15
+  (HARD_STOP_LAYER, exclusive upper bound) because of the Gemma KV-share
+  boundary. Requesting a higher end layer will be clamped automatically.
+  To train layers 15+, use `--capture auto` instead:
+
+    python run_atlas.py --model gemma4 --capture auto --layer-range 15,42
+
+  E2B: d_in 1536 -> 49,152 features at 32x.
+  E4B: d_in 2560 -> 81,920 features at 32x (shards ~168MB each).
+
+  Multimodal checkpoints are not plain AutoModelForCausalLM; the trainer
+  falls back automatically when the CausalLM load path fails.
+
+  Disk is the binding constraint here: E2B runs ~101GB per 1000-batch
+  pool, plus a resume copy resident. Size the volume before starting.

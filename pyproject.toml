@@ -69,7 +69,7 @@ Homepage = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
 Repository = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
 
 [tool.setuptools]
-py-modules = ["sae_trainer_rolling", "sae_scheduler", "operator_atoms"]
+py-modules = ["sae_trainer_rolling", "sae_scheduler"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
