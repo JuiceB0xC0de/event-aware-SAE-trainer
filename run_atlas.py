@@ -76,7 +76,7 @@ def _slug(model_id: str) -> str:
     return model_id.replace("/", "_").lower()
 
 
-def resolve_n_layers(model_id: str, pinned) -> int:
+def resolve_n_layers(model_id: str, pinned, trust_remote_code: bool = False) -> int:
     """Layer count from the config if pinned, else the model's own HF config.
 
     Auto-detection is what makes one config cover a whole model family.
@@ -86,7 +86,7 @@ def resolve_n_layers(model_id: str, pinned) -> int:
 
     from transformers import AutoConfig
 
-    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
     for obj in (cfg, getattr(cfg, "text_config", None)):
         n = getattr(obj, "num_hidden_layers", None) if obj is not None else None
         if n:
@@ -191,11 +191,15 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--seed", type=int, default=0)
     ov.add_argument("--bdec-batches", type=int, default=50)
     ov.add_argument("--resume-from", type=str, default=None)
+    ov.add_argument("--corpus", type=str, default=None)
+    ov.add_argument("--corpus-text-field", type=str, default=None)
+    ov.add_argument("--corpus-prefix", type=str, default=None)
     ov.add_argument("--norm-ref", type=float, default=None,
                     help="pin activation_norm_ref (L0 probe norm) when retraining "
                          "a mid-chain layer in a fresh process")
 
     fl = p.add_argument_group("flags")
+    fl.add_argument("--trust-remote-code", action="store_true")
     fl.add_argument("--no-pretok", action="store_true")
     fl.add_argument("--no-push", action="store_true")
     fl.add_argument("--no-model-evict", action="store_true")
@@ -240,6 +244,12 @@ def main():
     target_l0 = pick(args.target_l0, "target_l0", None)
     microbatch = pick(args.microbatch_tokens, "microbatch_tokens", None)
 
+    corpus_cfg = cfg.get("corpus") or {}
+    corpus = args.corpus or corpus_cfg.get("id")
+    corpus_text_field = args.corpus_text_field or corpus_cfg.get("text_field")
+    corpus_prefix = args.corpus_prefix or corpus_cfg.get("prefix")
+    trust_remote_code = args.trust_remote_code or bool(cfg.get("trust_remote_code"))
+
     if push and not os.environ.get("HF_TOKEN"):
         raise SystemExit("HF_TOKEN env var required (or run with --no-push)")
 
@@ -265,7 +275,7 @@ def main():
     if args.layer_range:
         start, end = map(int, args.layer_range.split(","))
     else:
-        n_layers = resolve_n_layers(model_id, arch.get("n_layers"))
+        n_layers = resolve_n_layers(model_id, arch.get("n_layers"), trust_remote_code)
         start, end = 0, n_layers - 1
 
     sae_dir = data_dir / "saes" / _slug(model_id)
@@ -277,6 +287,11 @@ def main():
     print(f"  Model:       {model_id}")
     print(f"  Layers:      {start}-{end} ({end - start + 1} layers)")
     print(f"  Capture:     {capture}")
+    if corpus:
+        print(f"  Corpus:      {corpus} (field={corpus_text_field or 'text'}, "
+              f"prefix={corpus_prefix!r})")
+    if trust_remote_code:
+        print("  Remote code: trusted")
     print(f"  Expansion:   {expansion}x")
     print(f"  Pool batches:{pool_batches}")
     print(f"  Max steps:   {max_steps}")
@@ -318,6 +333,10 @@ def main():
         target_l0=target_l0,
         cpu=args.cpu,
         norm_ref=args.norm_ref,
+        corpus=corpus,
+        corpus_text_field=corpus_text_field,
+        corpus_prefix=corpus_prefix,
+        trust_remote_code=trust_remote_code,
     )
 
     if push and hub_id:

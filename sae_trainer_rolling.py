@@ -94,6 +94,7 @@ HARD_STOP_LAYER = 15                       # exclusive upper bound; never touch 
 # -- Corpus + model loading (set via CLI/config only, no env) ---------------
 CORPUS_ID         = "HuggingFaceFW/fineweb-edu"
 CORPUS_TEXT_FIELD = "text"
+CORPUS_PREFIX     = ""      # prepended to every corpus text (e.g. a domain tag)
 TRUST_REMOTE_CODE = False
 
 # -- Hyperparameters --------------------------------------------------------
@@ -645,7 +646,7 @@ class StreamingBatchDataset(IterableDataset):
     def __init__(self, hf_token, model_id, batch_tokens,
                  max_seq_len: int = 4096, shuffle_buffer: int = 10_000, seed: int = 0,
                  corpus_id: str = None, corpus_text_field: str = None,
-                 trust_remote_code: bool = False):
+                 corpus_prefix: str = None, trust_remote_code: bool = False):
         super().__init__()
         self.hf_token = hf_token
         self.model_id = model_id
@@ -655,6 +656,7 @@ class StreamingBatchDataset(IterableDataset):
         self.seed = seed
         self.corpus_id = corpus_id or CORPUS_ID
         self.corpus_text_field = corpus_text_field or CORPUS_TEXT_FIELD
+        self.corpus_prefix = corpus_prefix if corpus_prefix is not None else CORPUS_PREFIX
         self.trust_remote_code = trust_remote_code
 
     def __iter__(self):
@@ -668,11 +670,13 @@ class StreamingBatchDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info is not None else 1
         _random.seed(self.seed * 7919 + worker_id)
 
-        tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=self.hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id, token=self.hf_token,
+            trust_remote_code=self.trust_remote_code)
 
-        def _open_fineweb():
+        def _open_corpus():
             ds = load_dataset(
-                "HuggingFaceFW/fineweb-edu",
+                self.corpus_id,
                 split="train", streaming=True, token=self.hf_token,
             )
             ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
@@ -680,16 +684,17 @@ class StreamingBatchDataset(IterableDataset):
                 ds = ds.shard(num_shards=num_workers, index=worker_id)
             return ds
 
-        fw_iter = iter(_open_fineweb())
+        fw_iter = iter(_open_corpus())
 
         def _next_text():
             nonlocal fw_iter
             while True:
                 try:
                     row = next(fw_iter)
-                    return row.get("text", "")
+                    text = row.get(self.corpus_text_field, "")
+                    return (self.corpus_prefix + text) if text else text
                 except StopIteration:
-                    fw_iter = iter(_open_fineweb())
+                    fw_iter = iter(_open_corpus())
 
         def _tokenize(text: str):
             return tokenizer(
@@ -774,6 +779,8 @@ def _build_token_dataset(hf_token, batch_tokens, seed: int = 0,
     return StreamingBatchDataset(
         hf_token=hf_token, model_id=model_id or MODEL_ID,
         batch_tokens=batch_tokens, max_seq_len=4096, seed=seed,
+        corpus_id=CORPUS_ID, corpus_text_field=CORPUS_TEXT_FIELD,
+        corpus_prefix=CORPUS_PREFIX, trust_remote_code=TRUST_REMOTE_CODE,
     )
 
 
@@ -1256,16 +1263,37 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
 
     print(f"  [produce L{layer}] hidden-states capture over {n} batches ...")
     t0 = time.time()
+
+    # Custom-code models may accept output_hidden_states but never populate it
+    # (out.hidden_states stays None). Fall back to a forward hook on the target
+    # block; hooks observe the real forward, so correctness is unaffected.
+    hook_state = {}
+
+    def _grab(_module, _inp, out):
+        hook_state["hidden"] = out[0] if isinstance(out, tuple) else out
+
+    hook_handle = None
     for i in range(n):
         ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
         with torch.no_grad():
             out = model(input_ids=ids, use_cache=False, output_hidden_states=True)
         # hidden_states[0] = embeddings input, hidden_states[k] = output of block k-1
-        hidden = out.hidden_states[layer + 1]
+        if out.hidden_states is not None:
+            hidden = out.hidden_states[layer + 1]
+        else:
+            if hook_handle is None:
+                print(f"  [produce L{layer}] model ignores output_hidden_states; "
+                      f"switching to forward-hook capture")
+                hook_handle = decoder_layers[layer].register_forward_hook(_grab)
+                with torch.no_grad():
+                    model(input_ids=ids, use_cache=False)
+            hidden = hook_state.pop("hidden")
         _write_shard(dst_dir, i, hidden)
         if (i + 1) % 500 == 0:
             tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
             print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
+    if hook_handle is not None:
+        hook_handle.remove()
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
@@ -2704,7 +2732,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       push: bool = True, capture: str = "auto", model_id: str = None,
                       hub_id: str = None, wandb_project: str = None, expansion: int = None,
                       evict_model: bool = True, target_l0: int = None, cpu: bool = False,
-                      norm_ref: float = None):
+                      norm_ref: float = None, corpus: str = None,
+                      corpus_text_field: str = None, corpus_prefix: str = None,
+                      trust_remote_code: bool = False):
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -2725,9 +2755,21 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # -- config bus: thread runtime overrides into the module globals that the rest of
     #    the code (train_sae_on_activations, dataset builder, paths) already reads ------
     global MODEL_ID, SAE_DIR, SAE_HUB_ID, WANDB_PROJECT, EXPANSION, N_FEATURES, K, K_INIT
+    global CORPUS_ID, CORPUS_TEXT_FIELD, CORPUS_PREFIX, TRUST_REMOTE_CODE
     if model_id:
         MODEL_ID = model_id
         SAE_DIR = str(DATA_DIR / "saes" / _slug(MODEL_ID))
+    if corpus:
+        CORPUS_ID = corpus
+        print(f"  [config] corpus: {CORPUS_ID}")
+    if corpus_text_field:
+        CORPUS_TEXT_FIELD = corpus_text_field
+    if corpus_prefix:
+        CORPUS_PREFIX = corpus_prefix
+        print(f"  [config] corpus prefix: {CORPUS_PREFIX!r}")
+    if trust_remote_code:
+        TRUST_REMOTE_CODE = True
+        print("  [config] trust_remote_code enabled")
     if expansion:
         EXPANSION = int(expansion)
     if target_l0 is not None and target_l0 > 0:
@@ -2758,6 +2800,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     tokenizer_kwargs = {"token": hf_token} if not is_local else {}
     if is_local:
         tokenizer_kwargs["local_files_only"] = True
+    if TRUST_REMOTE_CODE:
+        tokenizer_kwargs["trust_remote_code"] = True
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
     bos_token_id = tokenizer.bos_token_id or 2
     try:
@@ -2765,6 +2809,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         model_kwargs = {"token": hf_token, "dtype": torch.bfloat16, "device_map": "cpu"}
         if is_local:
             model_kwargs["local_files_only"] = True
+        if TRUST_REMOTE_CODE:
+            model_kwargs["trust_remote_code"] = True
         model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
     except (ValueError, KeyError, OSError) as e:
         # Multimodal checkpoints (e.g. Gemma-4) aren't plain CausalLM -- fall back.
@@ -2773,6 +2819,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         model_kwargs = {"token": hf_token, "dtype": torch.bfloat16, "device_map": "cpu"}
         if is_local:
             model_kwargs["local_files_only"] = True
+        if TRUST_REMOTE_CODE:
+            model_kwargs["trust_remote_code"] = True
         model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **model_kwargs)
     model.eval()
     for p in model.parameters():
@@ -3083,6 +3131,14 @@ def main():
                    help="pin activation_norm_ref (the chain's L0 probe norm). Required when "
                         "retraining a mid-chain layer in a fresh process, otherwise the first "
                         "trained layer self-references and gets maximum slingshot gain.")
+    p.add_argument("--corpus", type=str, default=None,
+                   help=f"HF dataset id streamed for activations (default {CORPUS_ID})")
+    p.add_argument("--corpus-text-field", type=str, default=None,
+                   help="column holding the text (default 'text')")
+    p.add_argument("--corpus-prefix", type=str, default=None,
+                   help="string prepended to every corpus text, e.g. a model's domain tag")
+    p.add_argument("--trust-remote-code", action="store_true",
+                   help="pass trust_remote_code=True to tokenizer/model loads (custom_code repos)")
     p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
 
@@ -3093,7 +3149,9 @@ def main():
         resume_from=args.resume_from, push=args.push, capture=args.capture,
         model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
         expansion=args.expansion, evict_model=args.evict_model,
-        target_l0=args.target_l0, cpu=args.cpu, norm_ref=args.norm_ref)
+        target_l0=args.target_l0, cpu=args.cpu, norm_ref=args.norm_ref,
+        corpus=args.corpus, corpus_text_field=args.corpus_text_field,
+        corpus_prefix=args.corpus_prefix, trust_remote_code=args.trust_remote_code)
     print(f"\nDone. {res}")
 
 
