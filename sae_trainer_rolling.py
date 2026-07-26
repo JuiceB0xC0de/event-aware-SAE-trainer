@@ -2900,8 +2900,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # gives the first retrained layer ratio=1.0 and therefore maximum slingshot gain.
     activation_norm_ref = norm_ref
     t0 = time.time()
-    # rolling must walk from 0 to build the residual chain; hook capture is independent
-    # per layer, so it starts at start_layer.
+    # rolling walks the residual chain; hook capture is independent per layer, so it
+    # starts at start_layer. A mid-chain start under rolling/rolling-hf is bootstrapped
+    # below via one hooked capture pass instead of walking the chain from 0.
     walk_start = 0 if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float") else start_layer
 
     # -- rolling resume: if a previous run persisted the last completed layer's pool,
@@ -2925,14 +2926,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float"):
         if resume_from and explicit_resume_layer >= 0:
-            # Explicit --resume-from under rolling: we must regenerate the full residual
-            # chain from L0 up to the target layer because the persistent resume pool is
-            # only saved after a layer *completes*. Keep start_layer at the checkpoint
-            # layer so training skips the lower layers, but produce all pools below it.
+            # Explicit --resume-from under rolling. The persistent resume pool is only
+            # saved after a layer *completes*, so the chain has no source here; the
+            # bootstrap below produces pool[start_layer] directly (or, for float
+            # modes, the chain is walked from L0 with training skipped below target).
             walk_start = 0
             start_layer = min(start_layer, explicit_resume_layer)
             print(f"  [resume] explicit checkpoint for layer {explicit_resume_layer}; "
-                  f"regenerating chain from L0 and training from L{start_layer}")
+                  f"training from L{start_layer}")
         elif not resume_from:
             resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
             if resume_layer >= 0:
@@ -2960,6 +2961,33 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                     if _sd.exists():
                         _rm_pool(_sd)
                         print(f"  [cleanup] deleted stale pre-resume pool L{_stale}")
+        if start_layer > walk_start and capture in ("rolling", "rolling-hf"):
+            # Chain entry ramp: produce pool[start_layer] directly from hooked
+            # full forwards instead of walking the chain up from L{walk_start}.
+            # One capture pass replaces every intermediate block walk and pool.
+            # Float modes keep the chain walk -- a full forward needs all prefix
+            # blocks resident in VRAM, which is what those modes exist to avoid.
+            print(f"  [bootstrap] chain entry at L{start_layer}: hooked full-forward "
+                  f"capture replaces walking L{walk_start}..L{start_layer - 1}")
+            _produce_pool_hooked(model, decoder_layers, start_layer, tok_dir,
+                                 pool_dir_for(start_layer), device)
+            walk_start = start_layer
+            if activation_norm_ref is None:
+                import json as _json
+                _prev_meta = Path(SAE_DIR) / f"layer_{start_layer - 1}_s{seed}" / "meta.json"
+                try:
+                    with open(_prev_meta) as _f:
+                        _ref = _json.load(_f).get("activation_norm_ref")
+                except OSError:
+                    _ref = None
+                if _ref and _ref > 0:
+                    activation_norm_ref = float(_ref)
+                    print(f"  [bootstrap] restored activation_norm_ref="
+                          f"{activation_norm_ref:.5f} from {_prev_meta}")
+                else:
+                    print("  [bootstrap] WARNING: no activation_norm_ref found in "
+                          f"{_prev_meta}; pass --norm-ref to pin the chain norm "
+                          "(first trained layer self-references otherwise)")
 
     for L in range(walk_start, end_layer + 1):
         dst_dir = pool_dir_for(L)
