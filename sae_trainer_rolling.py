@@ -119,8 +119,11 @@ OBS_EVERY     = int(os.environ.get("SAE_OBS_EVERY", "100"))
 # Aggressive-K early-stop gate. EV is not comparable across depth -- it falls as the
 # residual stream's norm grows, so a floor tuned on shallow layers silently blocks the
 # stop on every deep one and burns the full step budget for nothing.
-K_STOP_L0_REL   = float(os.environ.get("SAE_STOP_L0_REL", "0.15"))
-K_STOP_EV_FLOOR = float(os.environ.get("SAE_STOP_EV_FLOOR", "0.95"))
+# These are read at the USE site, not here: run_atlas applies the config `env:` block
+# after importing this module, so a module-level os.environ read is frozen before the
+# config is ever seen.
+K_STOP_L0_REL_DEFAULT   = "0.15"
+K_STOP_EV_FLOOR_DEFAULT = "0.90"
 LR_WARMUP_STEPS = 300
 TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
