@@ -3306,7 +3306,11 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     marker_path.parent.mkdir(parents=True, exist_ok=True)
 
     def pool_dir_for(L):
-        return _pool_dir(f"pool_L{L:02d}_s{seed}")
+        # Model slug in the name, same as the token pool. Without it, switching
+        # models against the same SAE_DATA_DIR silently reuses the previous model's
+        # activations -- which raises only if d_in happens to differ. Two models at
+        # the same width would train on the wrong stream with no error at all.
+        return _pool_dir(f"pool_{_slug(MODEL_ID)}_L{L:02d}_s{seed}")
 
     results = {}
     # The slingshot gain and LR multipliers scale by probe/ref norm ratio. The ref
