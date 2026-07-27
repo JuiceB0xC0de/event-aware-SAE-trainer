@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-07-27
+
+### Fixed
+- **Activation pools are namespaced by model.** Pool directories were `pool_L00_s0`
+  with no model in the name, while the token pool already carried one. Pointing the
+  same `SAE_DATA_DIR` at a second model silently reused the first model's
+  activations. It raised here only because `d_in` differed (2048 vs 1024) — **two
+  models of the same width would have trained on the wrong stream with no error at
+  all.** Now `pool_{model_slug}_L00_s0`. The rolling resume pool was already safe;
+  its manifest checks `model_id`.
+
 ## [0.7.0] - 2026-07-27
 
 > Inert by default. With `SAE_SPARSE_DECODE=0` results are identical to 0.6.1.
