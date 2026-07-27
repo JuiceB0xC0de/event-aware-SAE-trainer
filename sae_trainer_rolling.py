@@ -889,6 +889,132 @@ def _is_hf_rolling_supported(text_model, decoder_layers):
         return False
 
 
+def _find_rope_fn(model, text_model):
+    """Locate a callable returning (cos, sin) for a sequence length.
+
+    Custom-code decoders usually precompute RoPE on the top-level module rather
+    than exposing an HF `rotary_emb` submodule. Returns None if nothing matches.
+    """
+    for obj in (model, text_model, getattr(model, "model", None)):
+        if obj is None:
+            continue
+        fn = getattr(obj, "_get_rope", None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _is_generic_rolling_supported(model, text_model, decoder_layers):
+    """True for custom decoders whose blocks take (x, cos, sin) positionally.
+
+    This is the escape hatch for `trust_remote_code` architectures that cannot use
+    the Llama-shaped path: they still walk one block at a time, which is the entire
+    point of rolling capture. Without it `auto` re-runs the FULL model once per
+    layer -- O(n_layers^2) block evaluations instead of O(n_layers).
+    """
+    import inspect
+    if len(decoder_layers) == 0:
+        return False
+    if model.get_input_embeddings() is None:
+        return False
+    if _find_rope_fn(model, text_model) is None:
+        return False
+    try:
+        params = list(inspect.signature(decoder_layers[0].forward).parameters)
+    except Exception:
+        return False
+    return len(params) >= 3 and params[1] == "cos" and params[2] == "sin"
+
+
+def _make_generic_invariants(model, text_model, ids):
+    """Per-batch invariants for custom (x, cos, sin) decoder blocks."""
+    import torch
+    embed = model.get_input_embeddings()
+    rope_fn = _find_rope_fn(model, text_model)
+    with torch.no_grad():
+        inputs_embeds = embed(ids)
+        cos, sin = rope_fn(inputs_embeds.shape[1], inputs_embeds.device, torch.float32)
+    return {"inputs_embeds": inputs_embeds, "cos": cos, "sin": sin}
+
+
+def _run_generic_block(layer, hidden, inv):
+    """Run one custom decoder block in rolling mode."""
+    import torch
+    with torch.no_grad():
+        out = layer(hidden, inv["cos"], inv["sin"])
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _verify_generic_rolling(model, text_model, decoder_layers, ids, device, tol=2e-2):
+    """Check the single-block walk reproduces the model's own forward at layer 0.
+
+    A wrong block signature or a missing per-layer input (structural bias, an
+    alternating layer type) would silently produce garbage activations rather than
+    raise, and every SAE downstream would train on them. So prove it once against
+    a forward hook before trusting the fast path.
+    """
+    import torch
+    grabbed = {}
+
+    def _grab(_m, _i, out):
+        grabbed["hidden"] = out[0] if isinstance(out, tuple) else out
+
+    handle = decoder_layers[0].register_forward_hook(_grab)
+    try:
+        with torch.no_grad():
+            model(input_ids=ids, use_cache=False)
+    finally:
+        handle.remove()
+    if "hidden" not in grabbed:
+        return False, "hook never fired"
+
+    inv = _make_generic_invariants(model, text_model, ids)
+    rolled = _run_generic_block(decoder_layers[0], inv["inputs_embeds"], inv)
+
+    ref = grabbed["hidden"].float()
+    got = rolled.float()
+    if ref.shape != got.shape:
+        return False, f"shape {tuple(got.shape)} != {tuple(ref.shape)}"
+    denom = ref.abs().max().clamp_min(1e-6)
+    err = (ref - got).abs().max() / denom
+    return bool(err <= tol), f"max rel err {err:.2e} (tol {tol:g})"
+
+
+def _produce_pool_generic_rolling(model, text_model, decoder_layers, layer, tok_dir,
+                                  src_dir, dst_dir, device):
+    """Custom-arch single-block rolling capture.
+
+    layer 0: embed + block 0 over the token pool.
+    layer>=1: block L over src_dir (= pool[L-1]).
+    """
+    import time
+    import torch
+
+    tok_paths = _shard_paths(tok_dir)
+    n = len(tok_paths)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if len(_shard_paths(dst_dir)) >= n:
+        print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
+        return
+
+    print(f"  [produce L{layer}] generic rolling block {layer} over {n} batches ...")
+    t0 = time.time()
+    report_every = max(1, n // 10)
+    for i in range(n):
+        ids = _read_shard(tok_dir, i).to(device)
+        inv = _make_generic_invariants(model, text_model, ids)
+        if layer == 0:
+            hidden = inv["inputs_embeds"]
+        else:
+            hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds"].dtype)
+        out = _run_generic_block(decoder_layers[layer], hidden, inv)
+        _write_shard(dst_dir, i, out)
+        if (i + 1) % report_every == 0:
+            tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
+            print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
+    print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
+
+
 def _make_llama_invariants(text_model, ids):
     """Per-batch invariants for generic HF decoder rolling single-block capture.
 
@@ -2806,7 +2932,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     if wandb_project is not None:
         WANDB_PROJECT = wandb_project
 
-    assert capture in ("auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float"), \
+    assert capture in ("auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
+                       "rolling-generic"), \
         f"unknown --capture {capture!r}"
     if capture in ("rolling", "rolling-float") and end_layer > HARD_STOP_LAYER:
         print(f"  [scope] rolling clamps end_layer {end_layer} -> {HARD_STOP_LAYER} "
@@ -2861,6 +2988,19 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
               f"falling back to auto")
         capture = "auto"
 
+    # `auto` re-runs the FULL model once per layer to read one block's output, which
+    # is O(n_layers^2) block evaluations across a walk. If the blocks take (x, cos, sin)
+    # we can walk them one at a time off the previous pool instead -- O(n_layers) --
+    # which is the entire reason the rolling pools exist. Verify against the model's
+    # own forward before trusting it; a silent mismatch would poison every layer.
+    # Signature introspection is free; the correctness proof needs the token pool, so
+    # it runs once that exists (below). The candidate flag is needed here because it
+    # changes the disk estimate: rolling keeps a source and a destination pool.
+    generic_rolling_candidate = (
+        capture == "auto"
+        and _is_generic_rolling_supported(model, text_model, decoder_layers)
+    )
+
     # Floating window: keep the full model on CPU, pin tiny shared components to GPU,
     # and let the production loop move only the active 1-2 decoder blocks to GPU.
     use_floating_window = (capture in ("rolling-float", "rolling-hf-float") and device.type == "cuda")
@@ -2892,8 +3032,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # Auto/hook capture is independent per layer -- only one pool is on disk at a
     # time (plus resume-copy headroom), so the 2x pipeline term over-estimates peak
     # and would falsely block valid auto runs.
-    pool_multiplier = 2.2 if capture in ("rolling", "rolling-float", "rolling-hf") else 1.2
-    n_pools_desc = "2 pipelined pools" if capture in ("rolling", "rolling-float", "rolling-hf") else "1 pool"
+    two_pool = capture in ("rolling", "rolling-float", "rolling-hf") or generic_rolling_candidate
+    pool_multiplier = 2.2 if two_pool else 1.2
+    n_pools_desc = "2 pipelined pools" if two_pool else "1 pool"
     peak_gb = pool_batches * shard_gb * pool_multiplier + 4
     free_gb = shutil.disk_usage(ROLLCACHE).free / 1e9
     sentinel = free_gb > 1e6                                          # overlay fs -> unreliable
@@ -2916,6 +3057,19 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir, bos_token_id,
                         model_id=MODEL_ID, vocab_size=vocab_size)
 
+    # Now that the token pool exists, prove the single-block walk reproduces the
+    # model's own forward before switching onto it. Costs one 2-sequence forward.
+    if generic_rolling_candidate:
+        probe_ids = _read_shard(tok_dir, 0)[:2].to(device)
+        ok, detail = _verify_generic_rolling(model, text_model, decoder_layers, probe_ids, device)
+        if ok:
+            print(f"  [capture] blocks take (x, cos, sin) and match the model's own forward "
+                  f"({detail}); single-block rolling instead of a full forward per layer")
+            capture = "rolling-generic"
+        else:
+            print(f"  [capture] single-block walk did NOT match the model forward ({detail}); "
+                  f"staying on full-forward hooks")
+
     marker_path = Path(SAE_DIR) / f"atlas_marker_s{seed}.json"
     marker_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2932,7 +3086,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # rolling walks the residual chain; hook capture is independent per layer, so it
     # starts at start_layer. A mid-chain start under rolling/rolling-hf is bootstrapped
     # below via one hooked capture pass instead of walking the chain from 0.
-    walk_start = 0 if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float") else start_layer
+    walk_start = 0 if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
+                                  "rolling-generic") else start_layer
 
     # -- rolling resume: if a previous run persisted the last completed layer's pool,
     #    resume the chain from that layer instead of regenerating everything from 0.
@@ -2953,7 +3108,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         except Exception:
             pass
 
-    if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float"):
+    if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
+                   "rolling-generic"):
         if resume_from and explicit_resume_layer >= 0:
             # Explicit --resume-from under rolling. The persistent resume pool is only
             # saved after a layer *completes*, so the chain has no source here; the
@@ -3020,7 +3176,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
 
     for L in range(walk_start, end_layer + 1):
         dst_dir = pool_dir_for(L)
-        if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float"):
+        if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
+                       "rolling-generic"):
             src_dir = pool_dir_for(L - 1) if L >= 1 else None
             consume_src = True
             if L == resume_layer + 1 and resume_layer >= 0:
@@ -3033,6 +3190,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             if capture in ("rolling", "rolling-float"):
                 _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
                               dst_dir, device)
+            elif capture == "rolling-generic":
+                _produce_pool_generic_rolling(model, text_model, decoder_layers, L, tok_dir,
+                                              src_dir, dst_dir, device)
             else:
                 _produce_pool_hf_rolling(model, text_model, decoder_layers, L, tok_dir, src_dir,
                                          dst_dir, device)
@@ -3048,6 +3208,9 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                     if capture in ("rolling", "rolling-float"):
                         _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
                                       dst_dir, next_dir, device)
+                    elif capture == "rolling-generic":
+                        _produce_pool_generic_rolling(model, text_model, decoder_layers, L + 1,
+                                                      tok_dir, dst_dir, next_dir, device)
                     else:
                         _produce_pool_hf_rolling(model, text_model, decoder_layers, L + 1,
                                                  tok_dir, dst_dir, next_dir, device)
@@ -3103,7 +3266,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         if evict_model and not use_floating_window:
             model.to(device)
 
-        if capture in ("rolling", "rolling-hf", "rolling-hf-float"):
+        if capture in ("rolling", "rolling-hf", "rolling-hf-float", "rolling-generic"):
             # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
