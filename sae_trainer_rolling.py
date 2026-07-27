@@ -1011,22 +1011,45 @@ def _produce_pool_generic_rolling(model, text_model, decoder_layers, layer, tok_
         print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
         return
 
-    print(f"  [produce L{layer}] generic rolling block {layer} over {n} batches ...")
+    is_moe = bool(getattr(decoder_layers[layer], "is_moe", False))
+    print(f"  [produce L{layer}] generic rolling block {layer} over {n} batches "
+          f"({'MoE' if is_moe else 'dense'} ffn) ...")
     t0 = time.time()
+    # Capture throughput varies >2x across layers. Split the loop into read / compute /
+    # write so the cause is visible instead of inferred: MoE blocks run a Python loop
+    # over experts (compute), while a cold source pool costs page-cache misses (read).
+    t_read = t_fwd = t_write = 0.0
     report_every = max(1, n // 10)
     for i in range(n):
+        _t = time.perf_counter()
         ids = _read_shard(tok_dir, i).to(device)
         inv = _make_generic_invariants(model, text_model, ids)
         if layer == 0:
             hidden = inv["inputs_embeds"]
         else:
             hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds"].dtype)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_read += time.perf_counter() - _t
+
+        _t = time.perf_counter()
         out = _run_generic_block(decoder_layers[layer], hidden, inv)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_fwd += time.perf_counter() - _t
+
+        _t = time.perf_counter()
         _write_shard(dst_dir, i, out)
+        t_write += time.perf_counter() - _t
+
         if (i + 1) % report_every == 0:
             tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
             print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
-    print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
+    total = max(time.time() - t0, 1e-9)
+    print(f"  [produce L{layer}] done in {total/60:.1f}min -> {dst_dir}")
+    print(f"  [produce L{layer}] read={t_read:.1f}s ({t_read/total*100:.0f}%)  "
+          f"fwd={t_fwd:.1f}s ({t_fwd/total*100:.0f}%)  "
+          f"write={t_write:.1f}s ({t_write/total*100:.0f}%)  ffn={'MoE' if is_moe else 'dense'}")
 
 
 def _make_llama_invariants(text_model, ids):
