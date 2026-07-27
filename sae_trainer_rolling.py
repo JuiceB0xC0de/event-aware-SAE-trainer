@@ -2498,13 +2498,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # Observation-only trace through the warmup collapse window. L0 and recon are
         # already accumulated per step, so this costs one threshold reduction.
         if OBS_EVERY > 0 and (step == 1 or (step % OBS_EVERY == 0 and not is_log_step)):
+            # EV here is the same global-variance form the log line uses: batch
+            # variance plus the recon already accumulated this step, so it costs one
+            # reduction and no extra SAE forward. dead_pct only reads silence
+            # counters. Both are the numbers that say whether the layer is any good.
             with torch.no_grad():
                 thr_obs = sae.log_threshold.exp().mean().item()
-            # Bold marker + L0 coloured by distance to target, so the trace is
-            # scannable against a wall of STEP-TIME lines.
+                total_var_obs = full_batch.float().var().item()
+            ev_obs = 1.0 - (recon_val / total_var_obs) if total_var_obs > 0 else 0.0
+            dead_obs = revival.dead_pct(LOG_EVERY)
             print(f"{_c('  >> OBS', '1;96')} {_c(f'{step:>5}', '1;96')}  "
-                  f"L0={_c_l0(l0_val, sae_cfg.target_l0)}  recon={recon_val:.5f}  "
-                  f"lam={scheduler.lambda_l0:.3e}  thr={thr_obs:.4f}")
+                  f"L0={_c_l0(l0_val, sae_cfg.target_l0)}  "
+                  f"EV={_c_ev(ev_obs)}  dead={_c_dead(dead_obs)}  thr={thr_obs:.4f}")
 
         if do_timing:
             t_step_total = time.perf_counter() - t_step_start
