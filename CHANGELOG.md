@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-07-26
+
+### Added
+- **Mid-chain bootstrap**: rolling runs can start at any layer without
+  regenerating the pool chain from L0. Entry uses one hooked full-forward
+  capture pass, and `activation_norm_ref` is restored from the previous
+  layer's `meta.json` so the chain norm stays consistent. Warns and falls
+  back to self-referencing if no reference is found — pass `--norm-ref`
+  to pin it explicitly.
+- **`pool_retention` / `--pool-retention`**: how many previous layers'
+  pools stay on disk as rollback insulation.
+
+### Changed
+- Pool retention now defaults to **3** (was 1). Catching a bad layer late
+  no longer means recomputing the whole chain — you can restart from L-3.
+  Costs up to 2 additional pools of disk; lower it with
+  `--pool-retention 1` if the volume is tight.
+
 ## [0.3.0] - 2026-07-26
 
 ### Added
