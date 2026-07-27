@@ -3147,6 +3147,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 print(f"  [resume] pool L{start_layer} already on disk; chain resumes "
                       f"at L{start_layer} instead of rebuilding from L{walk_start}")
                 walk_start = start_layer
+                # Anything below the new entry point is unreachable: the walk starts
+                # here and the retention loop only ever walks down to walk_start, so
+                # these would sit on disk for the whole run.
+                for _stale in range(0, walk_start):
+                    _sd = pool_dir_for(_stale)
+                    if _sd.exists():
+                        _rm_pool(_sd)
+                        print(f"  [cleanup] deleted unreachable pool L{_stale}")
 
             resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
             if resume_layer >= 0:
