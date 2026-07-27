@@ -57,6 +57,47 @@ def test_forward_value_matches():
     assert torch.allclose(fast, ref, atol=1e-12)
 
 
+def test_autocast_bf16_matches_plain_linear():
+    """Regression: autocast is on in forward but OFF in backward.
+
+    A custom autograd.Function sees autocast during forward -- so addmm returns
+    bf16 -- but the backward runs with autocast disabled, so hand-written matmuls
+    get whatever dtype the saved tensors happen to have. `x` is bf16 and `b_dec` is
+    an fp32 parameter, so `x - b_dec` promotes to fp32 and the backward hit
+    "expected mat1 and mat2 to have the same dtype". Gradients must also come back
+    in the parameters' dtypes, which is what autocast does for a plain nn.Linear.
+    """
+    torch.manual_seed(3)
+    sae = t._make_sae(d_in=8, n_features=16, seed=3)
+    x = torch.randn(10, 8, dtype=torch.bfloat16)
+
+    def run(fast):
+        prev = t.SAE_FAST_PREBIAS
+        t.SAE_FAST_PREBIAS = fast
+        try:
+            for p in (sae.W_enc.weight, sae.W_enc.bias, sae.b_dec):
+                p.grad = None
+            with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+                pre = sae._pre(x)
+            pre.float().pow(2).sum().backward()
+            return (sae.W_enc.weight.grad.clone(),
+                    sae.W_enc.bias.grad.clone(),
+                    sae.b_dec.grad.clone())
+        finally:
+            t.SAE_FAST_PREBIAS = prev
+
+    fast_w, fast_be, fast_bd = run(True)     # must not raise
+    ref_w, ref_be, ref_bd = run(False)
+
+    for g, p in ((fast_w, sae.W_enc.weight), (fast_be, sae.W_enc.bias), (fast_bd, sae.b_dec)):
+        assert g.dtype == p.dtype, f"gradient dtype {g.dtype} != parameter dtype {p.dtype}"
+
+    # bf16 accumulation, so this is a loose agreement check, not bit-equality.
+    assert torch.allclose(fast_w, ref_w, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(fast_be, ref_be, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(fast_bd, ref_bd, atol=2e-2, rtol=2e-2)
+
+
 def test_fallback_when_input_needs_grad():
     """A caller that needs grad wrt x must transparently get the plain path."""
     torch.manual_seed(2)

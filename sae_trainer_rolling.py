@@ -456,19 +456,27 @@ def _ensure_sae_classes():
         def forward(ctx, x, weight, b_enc, b_dec):
             xc = x - b_dec
             pre = torch.addmm(b_enc, xc, weight.t())
-            ctx.save_for_backward(xc, weight)
+            # Autocast is active here but DISABLED during backward, so the saved
+            # tensors must already agree with the dtype the gradient arrives in --
+            # otherwise the hand-written matmuls below see bf16 against fp32. `pre`
+            # is whatever autocast produced, so match it.
+            ctx.save_for_backward(xc.to(pre.dtype), weight.to(pre.dtype))
+            ctx.param_dtypes = (weight.dtype, b_enc.dtype, b_dec.dtype)
             return pre
 
         @staticmethod
         def backward(ctx, dpre):
             xc, weight = ctx.saved_tensors
-            dpre2 = dpre.reshape(-1, dpre.shape[-1])
+            w_dt, be_dt, bd_dt = ctx.param_dtypes
+            dpre2 = dpre.reshape(-1, dpre.shape[-1]).to(xc.dtype)
             xc2 = xc.reshape(-1, xc.shape[-1])
             dpre_sum = dpre2.sum(0)                      # [F], the reassociation
             dW = dpre2.t() @ xc2                         # [F, d]
             db_enc = dpre_sum
             db_dec = -(dpre_sum @ weight)                # [F] @ [F, d] -> [d], a GEMV
-            return None, dW, db_enc, db_dec
+            # Gradients must come back in the parameters' own dtypes, which is what
+            # autocast would have done for us on the plain nn.Linear path.
+            return None, dW.to(w_dt), db_enc.to(be_dt), db_dec.to(bd_dt)
 
     class _JumpReLU(torch.autograd.Function):
         """JumpReLU activation with straight-through estimator for threshold gradient."""
