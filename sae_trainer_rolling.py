@@ -2754,6 +2754,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             #    is the real convergence signal. Stop before feature death sets in.
             if aggressive_k and step >= 750:
                 l0_rel_err = abs(l0_val - K) / max(K, 1.0)
+                K_STOP_L0_REL = float(os.environ.get("SAE_STOP_L0_REL", K_STOP_L0_REL_DEFAULT))
+                K_STOP_EV_FLOOR = float(os.environ.get("SAE_STOP_EV_FLOOR", K_STOP_EV_FLOOR_DEFAULT))
                 if l0_rel_err <= K_STOP_L0_REL and ev >= K_STOP_EV_FLOOR:
                     if not hasattr(sae, "_k_converge_counter"):
                         sae._k_converge_counter = 0
