@@ -77,6 +77,8 @@ class SAEAECSConfig:
     al_landing_zone_rel: float = 0.35    # final-stretch lambda boost zone above target
     al_landing_min_progress: float = 0.08  # L0/step; below this while above band = stalled
     al_landing_gain_max: float = 16.0    # max multiplier on dual gain in final stretch
+    al_recovery_gain_max: float = 8.0    # max multiplier when UNDER target, so lambda can
+                                         # unwind at a rate comparable to how it wound up
     al_slingshot_overshoot_rel: float = 0.10  # aim below K before releasing lambda pressure
     al_slingshot_gain_max: float = 24.0   # dual gain while L0 is still above K
 
@@ -741,7 +743,15 @@ class SAEEventControlScheduler:
     def _landing_lambda_gain(self, current_l0: float, control_error: float) -> float:
         cfg = self.config
         if control_error <= 0:
-            return 1.0
+            # Recovery gain. lambda winds UP through the slingshot branch below at up
+            # to _effective_slingshot_gain() (24x on early layers) but historically
+            # unwound at a flat 1.0x, so a warmup overshoot took thousands of steps to
+            # give back. Scale the downward gain with how far under target we are,
+            # capped well below the slingshot so this can never outrun it. Near target
+            # this is ~1.0x, leaving endgame convergence behaviour untouched.
+            target = max(cfg.target_l0, 1e-8)
+            under_rel = min(1.0, -control_error / target)     # 0 at target, 1 at L0=0
+            return 1.0 + (cfg.al_recovery_gain_max - 1.0) * under_rel
         if current_l0 > cfg.target_l0:
             return self._effective_slingshot_gain()
         target = max(cfg.target_l0, 1e-8)
