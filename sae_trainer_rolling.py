@@ -40,7 +40,7 @@ $SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 import math
 import os
@@ -128,6 +128,11 @@ K_STOP_EV_FLOOR_DEFAULT = "0.90"
 # one of the six equal GEMMs in a step. SAE_FAST_PREBIAS=0 falls back to plain
 # autograd, which is the reference the test compares against.
 SAE_FAST_PREBIAS = os.environ.get("SAE_FAST_PREBIAS", "1").lower() not in ("0", "false", "no", "off")
+# Gathered decoder (see _SparseDecode). Off by default until it has a measured
+# before/after on real hardware -- it is exact, but it is not yet proven faster.
+SAE_SPARSE_DECODE = os.environ.get("SAE_SPARSE_DECODE", "0").lower() in ("1", "true", "yes", "on")
+SAE_SPARSE_DECODE_KMAX = int(os.environ.get("SAE_SPARSE_DECODE_KMAX", "512"))
+SAE_SPARSE_DECODE_CHUNK = int(os.environ.get("SAE_SPARSE_DECODE_CHUNK", "1024"))
 LR_WARMUP_STEPS = 300
 TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
@@ -478,6 +483,68 @@ def _ensure_sae_classes():
             # autocast would have done for us on the plain nn.Linear path.
             return None, dW.to(w_dt), db_enc.to(be_dt), db_dec.to(bd_dt)
 
+    class _SparseDecode(torch.autograd.Function):
+        """x_hat = acts @ W_dec.T + b_dec, evaluated over the active set only.
+
+        `acts` is ~0.1% dense (K=50 of F=65536), so the dense decoder GEMM and the
+        dense decoder-weight gradient are both almost entirely multiplication by
+        zero. Both become gathers:
+
+            forward   embedding_bag over the active indices   O(B*K*d)
+            grad_W    scatter-add over the same indices       O(B*K*d)
+            grad_acts grad_out @ W_dec   -- DENSE, unchanged  O(B*F*d)
+
+        Exact algebraically, NOT bit-identical: `index_add_` accumulates with atomics,
+        so the summation order for a feature that fires on many tokens varies between
+        runs, and in bf16 that is visible. Expect agreement to floating-point
+        tolerance, not equality -- the CPU float64 tests hold to 1e-12, a GPU bf16 run
+        will not.
+
+        grad_acts stays dense deliberately. The JumpReLU threshold STE masks on
+        `(pre - threshold).abs() < bandwidth`, which spans features on BOTH sides of
+        the threshold, and it consumes `pre * grad_feat`. Features just *below*
+        threshold are inactive, so a gathered gradient would zero exactly the term
+        that tells the threshold to come down -- and with slack=0 (L0 under target)
+        that is the only surviving term. Sparsifying it silently breaks threshold
+        adaptation, so this removes two of the six equal GEMMs, not three.
+        """
+        @staticmethod
+        def forward(ctx, acts, weight, bias, idx, val, chunk):
+            # weight is nn.Linear's [d, F]; embedding_bag wants [F, d]. The
+            # transposed view is accepted directly -- no 537MB contiguous copy.
+            out = torch.nn.functional.embedding_bag(
+                idx, weight.t(), mode="sum", per_sample_weights=val)
+            if bias is not None:
+                out = out + bias
+            ctx.save_for_backward(weight, idx, val)
+            ctx.chunk = chunk
+            ctx.has_bias = bias is not None
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            weight, idx, val = ctx.saved_tensors
+            go = grad_out.contiguous()
+
+            # term 3: dense, so the STE band keeps its below-threshold signal.
+            grad_acts = go @ weight
+
+            # term 4: scatter-add. Chunked over the batch so the [B, K, d] product
+            # is never materialised -- at B=32768, K=150, d=2048 that tensor alone
+            # would be 20GB.
+            grad_w_t = torch.zeros_like(weight.t())
+            B = go.shape[0]
+            step = max(1, int(ctx.chunk))
+            for s in range(0, B, step):
+                e = min(s + step, B)
+                contrib = go[s:e].unsqueeze(1) * val[s:e].unsqueeze(2)   # [c, K, d]
+                grad_w_t.index_add_(0, idx[s:e].reshape(-1),
+                                    contrib.reshape(-1, contrib.shape[-1]))
+            grad_weight = grad_w_t.t()
+
+            grad_bias = go.sum(0) if ctx.has_bias else None
+            return grad_acts, grad_weight, grad_bias, None, None, None
+
     class _JumpReLU(torch.autograd.Function):
         """JumpReLU activation with straight-through estimator for threshold gradient."""
         @staticmethod
@@ -593,6 +660,9 @@ def _ensure_sae_classes():
             # overridden at runtime (live-tune knob for widening the gradient
             # channel).  Default matches the module constant.
             self.ste_bandwidth = STE_BANDWIDTH
+            # Sparse-decode bookkeeping (see decode()).
+            self._sparse_decode_calls = 0
+            self._sparse_decode_fallbacks = 0
             # W_dec orthonormal, W_enc tied to W_dec.T at init (Anthropic recipe)
             nn.init.orthogonal_(self.W_dec.weight)
             self._normalize_decoder()
@@ -715,8 +785,33 @@ def _ensure_sae_classes():
             """Fused activation + L0 gate: returns (feat_acts, gate) in one pass."""
             return self._jumprelu_forward(pre, need_gate=True)
 
-        def decode(self, acts: "torch.Tensor") -> "torch.Tensor":
-            return self.W_dec(acts) + self.b_dec
+        def decode(self, acts: "torch.Tensor", active_max: "Optional[int]" = None
+                   ) -> "torch.Tensor":
+            """Decode. `active_max` is the largest per-token active count.
+
+            Pass it when the caller already has `gate` -- the training loop reduces
+            `gate.sum(dim=-1)` for L0 anyway, so reusing it removes a full [B, F]
+            scan from this path. Omitted, it costs one extra pass over acts.
+            """
+            if not SAE_SPARSE_DECODE or acts.dim() != 2:
+                return self.W_dec(acts) + self.b_dec
+            if active_max is None:
+                with torch.no_grad():
+                    nnz = int((acts != 0).sum(dim=1).max().item())
+            else:
+                nnz = int(active_max)
+            # Fall back rather than truncate: dropping a live feature would corrupt
+            # the reconstruction silently. Kmax is generous, so this is the tail case.
+            kmax = min(int(SAE_SPARSE_DECODE_KMAX), acts.shape[1])
+            if nnz == 0 or nnz > kmax:
+                # Counted, not silent: if this is a meaningful fraction of steps the
+                # gather overhead is being paid for nothing.
+                self._sparse_decode_fallbacks += 1
+                return self.W_dec(acts) + self.b_dec
+            self._sparse_decode_calls += 1
+            val, idx = torch.topk(acts, nnz, dim=1)
+            return _SparseDecode.apply(acts, self.W_dec.weight, self.b_dec,
+                                       idx, val, SAE_SPARSE_DECODE_CHUNK)
 
         def forward(self, x: "torch.Tensor", k: int = K):
             acts = self.encode(x, k=k)
@@ -2417,7 +2512,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     # Standard PyTorch forward (also used as Triton fallback).
                     pre = sae.encode_pre(acts_mb)
                     feat_acts, gate = sae.jumprelu_with_gate(pre)
-                    x_hat = sae.decode(feat_acts)
+                    # Per-token active counts, reduced once and used twice: the
+                    # sparse decoder needs the max, the sparsity term needs the mean.
+                    gate_counts = gate.sum(dim=-1, dtype=torch.float32)
+                    active_max = (int(gate_counts.max().item())
+                                  if SAE_SPARSE_DECODE else None)
+                    x_hat = sae.decode(feat_acts, active_max=active_max)
 
                     # Cast to fp32 only for loss computation (numerical stability)
                     residual_float = acts_mb.float() - x_hat.float()
@@ -2425,7 +2525,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
                     # Sparsity penalty -- IN-GRAPH so the L0 straight-through estimator
                     # actually trains the JumpReLU thresholds.
-                    l0_mb = gate.sum(dim=-1, dtype=torch.float32).mean()
+                    l0_mb = gate_counts.mean()
                     slack = (l0_mb - sae_cfg.target_l0).clamp(min=0.0)
                     sparsity_loss = (
                         scheduler.lambda_l0 * slack

@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-07-27
+
+> Inert by default. With `SAE_SPARSE_DECODE=0` results are identical to 0.6.1.
+
+### Added
+- **Gathered decoder** (`_SparseDecode`), behind `SAE_SPARSE_DECODE`. The latent is
+  ~0.1% dense (K=50 of F=65536), so the decoder forward and the decoder weight
+  gradient are almost entirely multiplication by zero. Both become gathers:
+
+      forward     embedding_bag over active indices     O(B*K*d)
+      grad_W      chunked scatter-add, same indices     O(B*K*d)
+      grad_acts   grad_out @ W_dec -- DENSE, unchanged  O(B*F*d)
+
+  Two of the six equal-sized GEMMs in a step disappear.
+
+  `grad_acts` stays dense deliberately. The threshold STE masks on
+  `(pre - threshold).abs() < bandwidth`, a band spanning **both** sides of the
+  threshold, and consumes `pre * grad_feat`. Features just below threshold are
+  inactive, so a gathered gradient there would zero exactly the term that pulls the
+  threshold down — and with `slack=0` (L0 under target) that is the only surviving
+  term. Sparsifying it would silently break threshold adaptation, so this takes two
+  GEMMs rather than three.
+
+  Exact algebraically, **not bit-identical**: `index_add_` accumulates with atomics,
+  so summation order varies for features firing on many tokens and bf16 will show
+  it. CPU float64 tests hold to 1e-12; a GPU bf16 run will not.
+
+  Falls back to dense when the active set is empty or exceeds `SAE_SPARSE_DECODE_KMAX`
+  — never truncates, since dropping a live feature corrupts the reconstruction
+  silently. Fallbacks are counted on the SAE so a high rate is visible.
+
+  **Speed is unmeasured on GPU.** Baseline is 173ms `fwd_bwd_cuda` at d=2048,
+  F=65536 on an H100 (254 TFLOP/s, 26% of peak). Two of the five remaining GEMMs is
+  ~70ms of that if the gather overhead doesn't eat it. Measure before trusting.
+
+- `SAE_SPARSE_DECODE`, `SAE_SPARSE_DECODE_KMAX`, `SAE_SPARSE_DECODE_CHUNK`.
+
+### Changed
+- Per-token active counts are reduced once and used twice — max for the decoder,
+  mean for the sparsity term. `l0_mb` is unchanged and still in-graph.
+- `decode()` takes an optional `active_max` so callers holding `gate` can skip a
+  full `[B, F]` scan.
+
 ## [0.6.0] - 2026-07-27
 
 > Not numerically identical to 0.5.0: the encoder backward changes accumulation
