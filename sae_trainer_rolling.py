@@ -110,6 +110,12 @@ SEQ_LEN       = 2_048       # length passed to the model (attention is O(seq^2))
 N_STEPS       = 15_000      # peak-EV early-stop usually fires well before this
 LR            = 2e-4
 LOG_EVERY     = 250
+# Observation-only L0 trace. LOG_EVERY is load-bearing -- it is the AL dual-update
+# cadence, the dead-feature window and the fire-rate window -- so it must not be
+# lowered just to see more. This is a pure print cadence and gates nothing. It
+# exists because the sparsity collapse happens inside the first LOG_EVERY steps,
+# where nothing was being recorded at all.
+OBS_EVERY     = int(os.environ.get("SAE_OBS_EVERY", "100"))
 LR_WARMUP_STEPS = 300
 TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
@@ -2488,6 +2494,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         else:
             grad_norm_val = 0.0
         l0_val = accum_l0 / accum_steps
+
+        # Observation-only trace through the warmup collapse window. L0 and recon are
+        # already accumulated per step, so this costs one threshold reduction.
+        if OBS_EVERY > 0 and (step == 1 or (step % OBS_EVERY == 0 and not is_log_step)):
+            with torch.no_grad():
+                thr_obs = sae.log_threshold.exp().mean().item()
+            print(f"  [OBS {step:>5}] L0={l0_val:7.1f} recon={recon_val:.5f} "
+                  f"lam={scheduler.lambda_l0:.3e} thr={thr_obs:.4f}")
 
         if do_timing:
             t_step_total = time.perf_counter() - t_step_start

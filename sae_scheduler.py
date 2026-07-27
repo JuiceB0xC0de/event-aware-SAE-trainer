@@ -849,10 +849,23 @@ class SAEEventControlScheduler:
         # any threshold overshoot and let L0 recover.  This is the symmetric
         # counterpart — without it, the nudge can overshoot alone because
         # there's no restoring force pulling thresholds back down.
-        undershoot = 1.0 - overshoot  # e.g. 0.2 if L0 is 80% of target
-        nudge = -cfg.threshold_nudge_undershoot_gain * undershoot
-        # Apply undershoot correction at base frequency
-        should_apply = (step % cfg.threshold_nudge_every == 0)
+        # Mirror the overshoot branch so severity actually reaches the actuator.
+        # The old law was `-gain * (1 - L0/target)`. Since `1 - L0/target` -> 1.0 as
+        # L0 -> 0, the pull-up was hard-capped at `undershoot_gain` (0.04) no matter
+        # how far under target the layer sat, while the push-down side scales to
+        # gain_max (0.25). A layer that starts at L0=2.6 against target 50 therefore
+        # crawled back at the same rate as one sitting at 45.
+        undershoot = 1.0 - overshoot                       # 0..1, ->1 as L0 -> 0
+        severity = 1.0 / max(overshoot, 1e-3)              # target/L0, unbounded
+        scale = max(1.0, severity / max(cfg.threshold_nudge_overshoot_scale, 0.01))
+        effective_gain = min(cfg.threshold_nudge_undershoot_gain * scale,
+                             cfg.threshold_nudge_gain_max)
+        nudge = -effective_gain * undershoot
+        # Escalate frequency when far under, matching the overshoot path.
+        freq = cfg.threshold_nudge_every
+        if severity > cfg.threshold_nudge_freq_overshoot:
+            freq = max(1, freq // 2)
+        should_apply = (step % freq == 0)
         return nudge, should_apply
 
     # -- W_enc gradient dampening ------------------------------------------------
