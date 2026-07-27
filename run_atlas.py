@@ -188,6 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--max-steps", type=int, default=None)
     ov.add_argument("--target-l0", type=int, default=None)
     ov.add_argument("--microbatch-tokens", type=int, default=None)
+    ov.add_argument("--timing-every", type=int, default=None,
+                    help="[STEP-TIME] print cadence in steps; 0 disables. Overrides config env and $SAE_TIMING.")
     ov.add_argument("--seed", type=int, default=0)
     ov.add_argument("--bdec-batches", type=int, default=50)
     ov.add_argument("--resume-from", type=str, default=None)
@@ -269,8 +271,14 @@ def main():
     # hf_transfer is retired; Xet is the current fast-download path.
     # (HF_HUB_ENABLE_HF_TRANSFER is deprecated and now only emits a warning.)
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    # The config env block is an explicit user choice, so it overrides whatever the
+    # shell happens to have exported -- setdefault here would invert the documented
+    # CLI > config > defaults precedence.
     for k, v in (cfg.get("env") or {}).items():
-        os.environ.setdefault(str(k), str(v))
+        os.environ[str(k)] = str(v)
+    # CLI beats both the config env block and the inherited shell value.
+    if args.timing_every is not None:
+        os.environ["SAE_TIMING"] = str(max(0, args.timing_every))
     os.environ["WANDB_PROJECT"] = wandb_project
 
     # ---- layer range -----------------------------------------------------

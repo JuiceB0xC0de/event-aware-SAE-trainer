@@ -111,6 +111,7 @@ N_STEPS       = 15_000      # peak-EV early-stop usually fires well before this
 LR            = 2e-4
 LOG_EVERY     = 250
 LR_WARMUP_STEPS = 300
+TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
 # JumpReLU / aux-loss / resampling knobs
 INIT_THRESHOLD = 0.1        # initial per-feature threshold
@@ -1929,17 +1930,23 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     log_window_start = time.time()
     log_window_tokens = 0
 
-    # -- optional step-level timing ----------------------------------------------
-    # SAE_TIMING=1/true/on -> print every step; SAE_TIMING=N -> print every N steps;
-    # unset/0/off -> disabled. Accumulators for the [TIMING @ LOG_EVERY] aggregate
-    # run on every step regardless of the print interval.
+    # -- step-level timing --------------------------------------------------------
+    # SAE_TIMING=N -> print every N steps; unset/true/on -> every TIMING_EVERY_DEFAULT
+    # steps; 0/off/false -> disabled. SAE_TIMING=1 prints every step, which is a wall
+    # of text on a fast layer -- use it for debugging, not for watching a run.
+    # Accumulators for the [TIMING @ LOG_EVERY] aggregate run on every step regardless
+    # of the print interval.
     _timing_env = os.environ.get("SAE_TIMING", "").strip().lower()
-    if _timing_env in ("1", "true", "yes", "on"):
-        timing_every = 1
+    if _timing_env == "":
+        timing_every = TIMING_EVERY_DEFAULT
+    elif _timing_env in ("0", "off", "false", "no"):
+        timing_every = 0
+    elif _timing_env in ("true", "yes", "on"):
+        timing_every = TIMING_EVERY_DEFAULT
     elif _timing_env.isdigit() and int(_timing_env) > 0:
         timing_every = int(_timing_env)
     else:
-        timing_every = 0
+        timing_every = TIMING_EVERY_DEFAULT
     do_timing = timing_every > 0
     if do_timing:
         timing = {
@@ -2884,7 +2891,11 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     # -- token pool (once -- same tokens flow through every layer) ------------
     # Token ids are model-specific; cache them under the model slug so switching
     # models doesn't reuse a stale pool.
-    vocab_size = tokenizer.vocab_size or getattr(tcfg, "vocab_size", None)
+    # The model config is the authority: its vocab_size sizes the embedding matrix,
+    # which is the real bound on a legal token id. `tokenizer.vocab_size` excludes
+    # added special tokens (FIM, ChatML, domain tags), so it under-reports and
+    # rejects valid ids. `len(tokenizer)` counts them, hence the fallback order.
+    vocab_size = getattr(tcfg, "vocab_size", None) or len(tokenizer)
     tok_dir = _pool_dir(f"tokens_{_slug(MODEL_ID)}_s{seed}")
     _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir, bos_token_id,
                         model_id=MODEL_ID, vocab_size=vocab_size)
@@ -3144,6 +3155,8 @@ def main():
                    help="Path to checkpoint_full.pt to resume training from.")
     p.add_argument("--no-pretok", dest="use_pretok", action="store_false",
                    help="stream + tokenize FineWeb-Edu live instead of using pre-tokenized shards")
+    p.add_argument("--timing-every", type=int, default=None,
+                   help=f"[STEP-TIME] print cadence in steps (default {TIMING_EVERY_DEFAULT}); 0 disables. Overrides $SAE_TIMING.")
     p.add_argument("--max-steps", type=int, default=N_STEPS, help="cap steps (smoke tests)")
     p.add_argument("--bdec-batches", type=int, default=BDEC_INIT_BATCHES)
     p.add_argument("--hub-id", default=None,
@@ -3175,6 +3188,11 @@ def main():
                         "(default 3; use 1 on disk-tight pods -- each pool costs its full disk size)")
     p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
+
+    # Timing cadence is read from the environment deep in the training loop, so the
+    # flag lands there rather than threading a parameter through every call site.
+    if args.timing_every is not None:
+        os.environ["SAE_TIMING"] = str(max(0, args.timing_every))
 
     res = run_atlas_rolling(
         start_layer=args.start_layer, end_layer=args.end_layer, seed=args.seed,
