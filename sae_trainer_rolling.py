@@ -116,6 +116,11 @@ LOG_EVERY     = 250
 # exists because the sparsity collapse happens inside the first LOG_EVERY steps,
 # where nothing was being recorded at all.
 OBS_EVERY     = int(os.environ.get("SAE_OBS_EVERY", "100"))
+# Aggressive-K early-stop gate. EV is not comparable across depth -- it falls as the
+# residual stream's norm grows, so a floor tuned on shallow layers silently blocks the
+# stop on every deep one and burns the full step budget for nothing.
+K_STOP_L0_REL   = float(os.environ.get("SAE_STOP_L0_REL", "0.15"))
+K_STOP_EV_FLOOR = float(os.environ.get("SAE_STOP_EV_FLOOR", "0.95"))
 LR_WARMUP_STEPS = 300
 TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
@@ -2746,15 +2751,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             #    is the real convergence signal. Stop before feature death sets in.
             if aggressive_k and step >= 750:
                 l0_rel_err = abs(l0_val - K) / max(K, 1.0)
-                if l0_rel_err <= 0.15 and ev >= 0.95:
+                if l0_rel_err <= K_STOP_L0_REL and ev >= K_STOP_EV_FLOOR:
                     if not hasattr(sae, "_k_converge_counter"):
                         sae._k_converge_counter = 0
                     sae._k_converge_counter += LOG_EVERY
                     if sae._k_converge_counter >= 500:
                         scheduler.should_stop = True
                         scheduler.stop_reason = (
-                            f"Aggressive-K convergence: L0={l0_val:.1f} within 15% of K={K}, "
-                            f"EV={ev:.3f} >= 0.95 for {sae._k_converge_counter} steps"
+                            f"Aggressive-K convergence: L0={l0_val:.1f} within "
+                            f"{K_STOP_L0_REL*100:.0f}% of K={K}, EV={ev:.3f} >= "
+                            f"{K_STOP_EV_FLOOR:.2f} for {sae._k_converge_counter} steps"
                         )
                         print(f"  [AGGRESSIVE-K STOP @ {step}] {scheduler.stop_reason}")
                 else:
