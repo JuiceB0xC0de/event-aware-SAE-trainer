@@ -1284,7 +1284,7 @@ def _produce_pool_hf_rolling(model, text_model, decoder_layers, layer, tok_dir, 
             hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds"].dtype)
         out = _run_hf_block(decoder_layers[layer], hidden, inv)
         _write_shard(dst_dir, i, out)
-        if (i + 1) % 500 == 0:
+        if (i + 1) % max(1, n // 10) == 0:
             tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
             print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
@@ -1574,7 +1574,7 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
         bos = torch.full((n_seqs, 1), bos_token_id, dtype=real.dtype)
         ids = torch.cat([bos, real], dim=1)                # [n_seqs, SEQ_LEN]
         torch.save(ids.cpu(), tok_dir / f"shard_{i:05d}.pt")
-        if (i + 1) % 500 == 0:
+        if (i + 1) % max(1, pool_batches // 10) == 0:
             print(f"    token shard {i+1}/{pool_batches}")
     del it, dataset
     print(f"  [tokens] done -> {tok_dir}")
@@ -1637,7 +1637,7 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
                     model(input_ids=ids, use_cache=False)
             hidden = hook_state.pop("hidden")
         _write_shard(dst_dir, i, hidden)
-        if (i + 1) % 500 == 0:
+        if (i + 1) % max(1, n // 10) == 0:
             tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
             print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     if hook_handle is not None:
@@ -1676,7 +1676,7 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
             hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds0"].dtype)
         out = _run_block(decoder_layers, tcfg, layer, hidden, inv)
         _write_shard(dst_dir, i, out)
-        if (i + 1) % 500 == 0:
+        if (i + 1) % max(1, n // 10) == 0:
             tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
             print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
