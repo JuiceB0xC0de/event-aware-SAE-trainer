@@ -14,7 +14,7 @@ Two control loops, one event detection engine.
 """
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.5.0"
 
 import json
 import math
@@ -849,8 +849,14 @@ class SAEEventControlScheduler:
                 freq = max(1, freq // 2)
             should_apply = (step % freq == 0)
 
-            # Also suppress if below the old L0-min gate (safety net)
-            if current_l0 < cfg.threshold_nudge_l0_min and target < cfg.threshold_nudge_l0_min:
+            # Safety net, expressed RELATIVE to target. The old form compared L0 and
+            # target against threshold_nudge_l0_min=550, an absolute count tuned for
+            # K=500. At K=50 both sides are permanently under 550, so this branch was
+            # switched off for the whole run -- the nudge could only ever push L0 UP,
+            # never down, while lambda pushed down continuously. A one-sided pulse
+            # actuator against an integrator is a limit cycle, which is the shakiness
+            # around target. Relative form behaves identically at K=500 and K=50.
+            if (current_l0 - target) / target < cfg.threshold_nudge_deadband_rel:
                 should_apply = False
 
             return nudge, should_apply

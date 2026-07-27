@@ -40,7 +40,7 @@ $SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.5.0"
 
 import math
 import os
@@ -145,6 +145,25 @@ def _resolve_hf_token():
 
 # JumpReLU / aux-loss / resampling knobs
 INIT_THRESHOLD = 0.1        # initial per-feature threshold
+
+
+def _revive_log_threshold(log_threshold, revive_mask):
+    """Threshold to hand a revived feature: the median of the living ones.
+
+    INIT_THRESHOLD is an ABSOLUTE activation-scale constant. Activations are never
+    normalized, and residual-stream RMS climbs with depth (CodVa: 2.83 at L3 -> 3.68
+    at L6; MiniCPM: 0.13 -> 7.09), so 0.1 is ~0.75 sigma on an early layer and ~0.014
+    sigma on a deep one. Reviving into that means the feature fires on essentially
+    every token, which is a discrete upward L0 kick that grows with depth -- injected
+    into a control loop that has no idea it happened. The live median is scale-free
+    by construction and puts revived features back where the layer actually sits.
+    """
+    import torch
+    alive = ~revive_mask
+    if bool(alive.any()):
+        return log_threshold[alive].median()
+    return torch.tensor(math.log(INIT_THRESHOLD), device=log_threshold.device,
+                        dtype=log_threshold.dtype)
 STE_BANDWIDTH  = 0.1        # epsilon for the straight-through estimator
 BDEC_INIT_BATCHES = 50      # batches used to estimate b_dec mean
 AUX_DEAD_THRESHOLD = 250    # steps without firing before a feature gets aux-loss revival
@@ -2473,12 +2492,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 very_dead = revival.very_dead_mask(K)
                 n_reset = int(very_dead.sum().item())
                 if n_reset > 0:
-                    sae.log_threshold.data[very_dead] = math.log(INIT_THRESHOLD)
+                    _rev = _revive_log_threshold(sae.log_threshold.data, very_dead)
+                    sae.log_threshold.data[very_dead] = _rev
                     state = optimizer.state.get(sae.log_threshold, {})
                     if "exp_avg" in state:
                         state["exp_avg"][very_dead] = 0.0; state["exp_avg_sq"][very_dead] = 0.0
                     revival.clear_silence(very_dead)
-                    print(f"  [RESET @ {step}] theta->{INIT_THRESHOLD} for {n_reset} dead")
+                    print(f"  [RESET @ {step}] theta->{float(_rev.exp()):.4f} "
+                          f"(live median) for {n_reset} dead")
                 revival.record_reset(n_reset)
 
         if buffer_err_this_step:
@@ -2508,7 +2529,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             n_res = resample_dead_neurons(dead_mask, [t.to(device) for t in err_buffer])
             if n_res > 0:
                 with torch.no_grad():
-                    sae.log_threshold.data[dead_mask] = math.log(INIT_THRESHOLD)
+                    sae.log_threshold.data[dead_mask] = _revive_log_threshold(
+                        sae.log_threshold.data, dead_mask)
                     state = optimizer.state.get(sae.log_threshold, {})
                     if "exp_avg" in state:
                         state["exp_avg"][dead_mask] = 0.0; state["exp_avg_sq"][dead_mask] = 0.0

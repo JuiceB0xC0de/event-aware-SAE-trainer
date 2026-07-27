@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-07-27
+
+> Runs are **not numerically comparable to 0.4.0**: controller behaviour and the
+> default early-stop thresholds both changed.
+
+### Added
+- **`rolling-generic` capture**: single-block rolling for custom architectures
+  whose decoder blocks take `(x, cos, sin)` positionally, using
+  `get_input_embeddings()` and a `_get_rope`-style helper. `auto` promotes to it
+  automatically, but only after verifying the single-block walk reproduces the
+  model's own forward on a probe batch — a wrong block signature would produce
+  garbage activations silently rather than raise. `auto` previously ran a **full
+  model forward per layer** on these models, i.e. O(n_layers²) block evaluations.
+  Measured on CodVa-1-Small: 69.5k → 205k tok/s, max relative error 0.00e+00.
+- **Capture timing breakdown**: per-layer read / forward / write split and a
+  MoE-vs-dense label on the produce line.
+- **`OBS` trace**: step 1 then every `SAE_OBS_EVERY` steps (default 100),
+  reporting L0, EV, dead% and threshold, colour-coded. `LOG_EVERY` is
+  deliberately untouched — it is the AL dual cadence and the dead/fire-rate
+  window, not a print interval.
+- **`--timing-every`** on both entry points; `[STEP-TIME]` now defaults to every
+  25 steps instead of off.
+- **`SAE_STOP_L0_REL` / `SAE_STOP_EV_FLOOR`**: the Aggressive-K stop thresholds
+  are no longer literals.
+
+### Changed
+- **Threshold nudge is two-sided again.** The overshoot gate compared L0 and
+  target against an absolute feature count tuned for `K=500`. At `K=50` both
+  sides sat permanently under it, so the downward nudge never fired for an
+  entire run while λ pushed down continuously — a one-sided pulse actuator
+  against an integrator. The gate is now relative to target and behaves
+  identically at either K.
+- **Undershoot nudge scales with severity** instead of being capped at a flat
+  gain, and escalates its frequency when far under target, mirroring the
+  overshoot path.
+- **Dual update has a recovery gain below target.** λ wound up at up to 24×
+  through the slingshot and unwound at exactly 1×, so λ ratcheted upward across
+  a run even with L0 centred on target (observed: 2.4e-3 → 6.9e-3 while L0 sat
+  at 46–56).
+- **Revived features get the live median threshold**, not `INIT_THRESHOLD`.
+  0.1 is an absolute activation-scale constant: ~0.75σ on an early layer and
+  ~0.03σ on a deep one, so revival injected a depth-dependent discrete L0 step
+  that the controller had no visibility into.
+- **Default early-stop EV floor 0.95 → 0.90.** EV declines with depth as the
+  residual-stream norm grows, so a floor tuned on shallow layers blocked the
+  stop on every deep one and burned the full step budget.
+- **Config `env:` overrides the inherited shell**, matching the documented
+  `CLI > config > defaults` precedence. Previously `setdefault` let a stale
+  export beat an explicit config value.
+- **Rolling chain resumes at `start_layer`** when its pool is already on disk
+  instead of rebuilding from L0, and removes pools below the entry point that
+  the retention loop can never reach.
+
+### Fixed
+- **`vocab_size` is read from the model config**, not `tokenizer.vocab_size`.
+  The latter excludes added tokens, so every model with FIM / ChatML / domain
+  tags failed the token-range check and refused to train.
+- **HF credentials resolve from `hf auth login`** as well as `HF_TOKEN`; a
+  CLI-only login no longer aborts a push-enabled run, and one call site could
+  raise `KeyError` outright.
+
 ## [0.4.0] - 2026-07-26
 
 ### Added
