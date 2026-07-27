@@ -75,9 +75,6 @@ def test_saved_tensors_match_output_dtype():
     torch.manual_seed(3)
     sae = t._make_sae(d_in=8, n_features=16, seed=3)
 
-    captured = {}
-    real_save = torch.autograd.function.FunctionCtx.save_for_backward
-
     for x_dtype in (torch.float32, torch.bfloat16):
         x = torch.randn(10, 8).to(x_dtype)
         t.SAE_FAST_PREBIAS = True
@@ -86,8 +83,8 @@ def test_saved_tensors_match_output_dtype():
         xc = (x - sae.b_dec).to(pre.dtype)
         assert xc.dtype == pre.dtype, (
             f"saved xc dtype {xc.dtype} must match forward output {pre.dtype}")
-        captured[x_dtype] = pre.dtype
-    assert captured  # sanity
+
+
 
 
 def test_grads_come_back_in_parameter_dtypes():
