@@ -3134,6 +3134,17 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             print(f"  [resume] explicit checkpoint for layer {explicit_resume_layer}; "
                   f"training from L{start_layer}")
         elif not resume_from:
+            # Retained pools are the cheapest resume there is: pool[L] is all that
+            # training layer L needs, and pool[L] is also the only input needed to
+            # produce pool[L+1]. So if the chain already reaches start_layer, walk
+            # from there -- rebuilding earlier pools regenerates data nothing reads.
+            # This is what pool_retention keeps them around FOR.
+            if (start_layer > walk_start
+                    and len(_shard_paths(pool_dir_for(start_layer))) >= pool_batches):
+                print(f"  [resume] pool L{start_layer} already on disk; chain resumes "
+                      f"at L{start_layer} instead of rebuilding from L{walk_start}")
+                walk_start = start_layer
+
             resume_layer = _find_resume_layer(seed, pool_batches, MODEL_ID, capture)
             if resume_layer >= 0:
                 walk_start = max(walk_start, resume_layer + 1)
