@@ -113,6 +113,22 @@ LOG_EVERY     = 250
 LR_WARMUP_STEPS = 300
 TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
+
+def _resolve_hf_token():
+    """Explicit env vars first, then the token stored by `hf auth login`.
+
+    Being logged in through the CLI is the normal case; requiring HF_TOKEN in the
+    environment on top of that is a papercut, not a security boundary.
+    """
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
+
 # JumpReLU / aux-loss / resampling knobs
 INIT_THRESHOLD = 0.1        # initial per-feature threshold
 STE_BANDWIDTH  = 0.1        # epsilon for the straight-through estimator
@@ -2703,7 +2719,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
     if push and SAE_HUB_ID:
         from huggingface_hub import HfApi
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        hf_token = _resolve_hf_token()
         api = HfApi(token=hf_token)
         try:
             api.create_repo(SAE_HUB_ID, repo_type="model", exist_ok=True, private=False)
@@ -2797,7 +2813,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
               f"(Gemma KV-share boundary)")
         end_layer = HARD_STOP_LAYER
 
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    hf_token = _resolve_hf_token()
     device = torch.device("cpu" if cpu else "cuda")
     torch.manual_seed(seed)
 

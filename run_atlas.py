@@ -38,6 +38,22 @@ CONFIG_DIR = REPO_ROOT / "configs"
 CAPTURE_CHOICES = ["auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float"]
 
 
+def resolve_hf_token():
+    """Explicit env vars first, then the token stored by `hf auth login`.
+
+    Being logged in through the CLI is the normal case; requiring HF_TOKEN in the
+    environment on top of that is a papercut, not a security boundary.
+    """
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # config loading
 # --------------------------------------------------------------------------
@@ -123,9 +139,9 @@ def resolve_hub_id(cfg_repo, model_id: str, push: bool) -> str | None:
 def push_layer(sae_dir: Path, hub_id: str, layer: int, seed: int = 0) -> bool:
     from huggingface_hub import HfApi, create_repo, upload_folder
 
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = resolve_hf_token()
     if not token:
-        print(f"[HF push L{layer:02d}] no HF_TOKEN, skipping")
+        print(f"[HF push L{layer:02d}] no HF credentials (env or `hf auth login`), skipping")
         return False
 
     layer_dir = sae_dir / f"layer_{layer:02d}_s{seed}"
@@ -157,7 +173,7 @@ def push_summary(sae_dir: Path, hub_id: str, summary: dict):
     with open(path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
-    HfApi(token=os.environ["HF_TOKEN"]).upload_file(
+    HfApi(token=resolve_hf_token()).upload_file(
         path_or_fileobj=str(path),
         path_in_repo="run_summary.json",
         repo_id=hub_id,
@@ -254,8 +270,9 @@ def main():
     corpus_prefix = args.corpus_prefix or corpus_cfg.get("prefix")
     trust_remote_code = args.trust_remote_code or bool(cfg.get("trust_remote_code"))
 
-    if push and not os.environ.get("HF_TOKEN"):
-        raise SystemExit("HF_TOKEN env var required (or run with --no-push)")
+    if push and not resolve_hf_token():
+        raise SystemExit(
+            "no HF credentials: run `hf auth login`, set HF_TOKEN, or pass --no-push")
 
     # ---- environment -----------------------------------------------------
     data_dir = Path(os.environ.setdefault("SAE_DATA_DIR", "./data"))
