@@ -2500,8 +2500,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if OBS_EVERY > 0 and (step == 1 or (step % OBS_EVERY == 0 and not is_log_step)):
             with torch.no_grad():
                 thr_obs = sae.log_threshold.exp().mean().item()
-            print(f"  [OBS {step:>5}] L0={l0_val:7.1f} recon={recon_val:.5f} "
-                  f"lam={scheduler.lambda_l0:.3e} thr={thr_obs:.4f}")
+            # Bold marker + L0 coloured by distance to target, so the trace is
+            # scannable against a wall of STEP-TIME lines.
+            print(f"{_c('  >> OBS', '1;96')} {_c(f'{step:>5}', '1;96')}  "
+                  f"L0={_c_l0(l0_val, sae_cfg.target_l0)}  recon={recon_val:.5f}  "
+                  f"lam={scheduler.lambda_l0:.3e}  thr={thr_obs:.4f}")
 
         if do_timing:
             t_step_total = time.perf_counter() - t_step_start
