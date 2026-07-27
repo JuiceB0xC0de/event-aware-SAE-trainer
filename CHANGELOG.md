@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-07-27
+
+> Not numerically identical to 0.5.0: the encoder backward changes accumulation
+> order. The result is the same quantity by exact algebra, not the same bits.
+
+### Added
+- **Reassociated encoder pre-bias gradient** (`_EncoderPreBias`). A JumpReLU step
+  is six GEMMs of `2*B*d*F`, all the same size. One of them exists only because
+  `b_dec` needs a gradient: autograd forms the full `[B,F] x [F,d]` grad_input and
+  then reduces it over the batch. The batch sum commutes with the right-multiply,
+
+      d(loss)/d(b_dec) = -sum_b (dpre_b @ W_enc) = -(sum_b dpre_b) @ W_enc
+
+  so the same value comes from an `[F]` reduction plus one GEMV. That removes ~1/6
+  of the step's FLOPs. Exact, not an approximation.
+
+  Falls back to plain autograd whenever `x` requires grad, so callers that need
+  `grad_x` are unaffected. `SAE_FAST_PREBIAS=0` disables it outright.
+
+  **Measured:** gradients match plain autograd to 1e-10 in float64 and the forward
+  to 1e-12 (`tests/test_prebias_reassociation.py`). Encoder-only throughput on CPU
+  improves 18% at `B=512,d=256,F=8192` and 24% at `B=1024,d=512,F=16384`, the
+  trend rising with size as GEMMs come to dominate. **The full-step speedup on GPU
+  is not yet measured** — the prediction is ~17%, i.e. `fwd_bwd_cuda` moving from
+  123–125ms to roughly 103–108ms at CodVa's shape. Treat that as a hypothesis with
+  a test attached, not a result.
+
 ## [0.5.0] - 2026-07-27
 
 > Runs are **not numerically comparable to 0.4.0**: controller behaviour and the

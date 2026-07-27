@@ -40,7 +40,7 @@ $SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 import math
 import os
@@ -124,6 +124,10 @@ OBS_EVERY     = int(os.environ.get("SAE_OBS_EVERY", "100"))
 # config is ever seen.
 K_STOP_L0_REL_DEFAULT   = "0.15"
 K_STOP_EV_FLOOR_DEFAULT = "0.90"
+# Reassociated b_dec gradient in the encoder (see _EncoderPreBias). Exact, removes
+# one of the six equal GEMMs in a step. SAE_FAST_PREBIAS=0 falls back to plain
+# autograd, which is the reference the test compares against.
+SAE_FAST_PREBIAS = os.environ.get("SAE_FAST_PREBIAS", "1").lower() not in ("0", "false", "no", "off")
 LR_WARMUP_STEPS = 300
 TIMING_EVERY_DEFAULT = 25   # [STEP-TIME] cadence; override via SAE_TIMING or --timing-every
 
@@ -431,6 +435,41 @@ def _ensure_sae_classes():
     import torch
     import torch.nn as nn
 
+    class _EncoderPreBias(torch.autograd.Function):
+        """pre = (x - b_dec) @ W_enc.T + b_enc, with the b_dec gradient reassociated.
+
+        The naive graph makes autograd form grad_input = dpre @ W_enc -- a full
+        [B, F] x [F, d] GEMM, the same size as the encoder forward -- and then reduce
+        it over the batch to get a [d] vector for b_dec. But the batch sum commutes
+        with the right-multiply:
+
+            d(loss)/d(b_dec) = -sum_b (dpre_b @ W_enc) = -(sum_b dpre_b) @ W_enc
+
+        so the same value comes from an [F] reduction followed by one [1,F]x[F,d]
+        GEMV. That is 2*B*d*F FLOPs removed -- one of the six equal-sized GEMMs in a
+        JumpReLU step, i.e. ~1/6 of the whole thing. Exact, not an approximation.
+
+        x is activation data and never requires grad, so grad_x is never formed
+        either; callers that do need it fall back to the plain path below.
+        """
+        @staticmethod
+        def forward(ctx, x, weight, b_enc, b_dec):
+            xc = x - b_dec
+            pre = torch.addmm(b_enc, xc, weight.t())
+            ctx.save_for_backward(xc, weight)
+            return pre
+
+        @staticmethod
+        def backward(ctx, dpre):
+            xc, weight = ctx.saved_tensors
+            dpre2 = dpre.reshape(-1, dpre.shape[-1])
+            xc2 = xc.reshape(-1, xc.shape[-1])
+            dpre_sum = dpre2.sum(0)                      # [F], the reassociation
+            dW = dpre2.t() @ xc2                         # [F, d]
+            db_enc = dpre_sum
+            db_dec = -(dpre_sum @ weight)                # [F] @ [F, d] -> [d], a GEMV
+            return None, dW, db_enc, db_dec
+
     class _JumpReLU(torch.autograd.Function):
         """JumpReLU activation with straight-through estimator for threshold gradient."""
         @staticmethod
@@ -643,12 +682,19 @@ def _ensure_sae_classes():
                     gate.register_hook(self._gate_hook_save_grad)
             return (feat_acts, gate) if need_gate else feat_acts
 
+        def _pre(self, x: "torch.Tensor") -> "torch.Tensor":
+            """Encoder pre-activation, reassociated when x carries no gradient."""
+            if SAE_FAST_PREBIAS and torch.is_grad_enabled() and not x.requires_grad:
+                return _EncoderPreBias.apply(
+                    x, self.W_enc.weight, self.W_enc.bias, self.b_dec)
+            return self.W_enc(x - self.b_dec)
+
         def encode(self, x: "torch.Tensor", k: int = K) -> "torch.Tensor":
-            pre = self.W_enc(x - self.b_dec)
+            pre = self._pre(x)
             return self._jumprelu_forward(pre, need_gate=False)
 
         def encode_pre(self, x: "torch.Tensor") -> "torch.Tensor":
-            return self.W_enc(x - self.b_dec)
+            return self._pre(x)
 
         def apply_jumprelu(self, pre: "torch.Tensor") -> "torch.Tensor":
             return self._jumprelu_forward(pre, need_gate=False)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "event-aware-sae-trainer"
-version = "0.5.0"
+version = "0.6.0"
 description = "Self-tuning sparse autoencoder trainer for language model interpretability research"
 readme = "README.md"
 license = { text = "MIT" }
