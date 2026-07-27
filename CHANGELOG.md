@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2] - 2026-07-27
+
+### Added
+- **Killswitch keys on the existing `live_tune.json`.** Two levels, same file:
+
+      {"stop": true}       ends the CURRENT layer cleanly at the next 50-step poll
+                           -- normal early-stop path, so sae.pt and meta.json are
+                           written and the layer pushes -- then the walk continues
+      {"halt_run": true}   stops the whole walk before the next layer starts, and
+                           prints the --layer-range needed to resume
+
+  Both accept `"stop_reason"` for the log line. Fail-open by design: a missing,
+  empty, unreadable or malformed file is a no-op, since a typo in a control file
+  should not end eight hours of GPU time.
+
+  This makes the file watchable — something reading `>> OBS` lines can decide "EV
+  has been flat for 900 steps" and act on it with one line of JSON, alongside the
+  `target_l0` / `ste_bandwidth` / `lambda_l0_override` knobs that were already there.
+
+- `SAE_CONTROL_FILE` overrides the control-file path (default `/tmp/live_tune.json`).
+
+### Changed
+- **The container-local control file is now always polled.** Previously the whole
+  live-tune mechanism was inert unless `live_tune_path` was set in config, so the
+  documented `/tmp/live_tune.json` fallback never actually fired. It works with no
+  setup now — but a stale `/tmp/live_tune.json` left on a pod will be picked up
+  where it was previously ignored.
+
 ## [0.7.1] - 2026-07-27
 
 ### Fixed

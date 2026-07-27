@@ -40,7 +40,7 @@ $SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 import math
 import os
@@ -1375,6 +1375,37 @@ class FloatingLayerWindow:
 # ===========================================================================
 #  Pool I/O  (activation shards on container-local NVMe at ROLLCACHE)
 # ===========================================================================
+
+CONTROL_FILE = os.environ.get("SAE_CONTROL_FILE", "/tmp/live_tune.json")
+
+
+def _control_says_halt():
+    """Read the control file for a run-level halt. Returns (halt, reason).
+
+    Two levels, both driven by the same JSON file:
+
+        {"stop": true}      -> scheduler ends the CURRENT layer cleanly (saved,
+                               metadata written, pushed) and the walk continues
+        {"halt_run": true}  -> the walk stops before starting the next layer
+
+    Deliberately fail-open: a malformed or unreadable file never stops a run, since
+    a typo in a control file should not kill eight hours of GPU time.
+    """
+    import json
+    p = Path(CONTROL_FILE)
+    try:
+        if not p.exists():
+            return False, ""
+        text = p.read_text().strip()
+        if not text:
+            return False, ""
+        obj = json.loads(text)
+    except Exception:
+        return False, ""
+    if not isinstance(obj, dict) or not bool(obj.get("halt_run", False)):
+        return False, ""
+    return True, str(obj.get("stop_reason", "")).strip() or f"halt_run set in {p}"
+
 
 def _pool_dir(tag: str) -> Path:
     return Path(ROLLCACHE) / tag
@@ -2822,8 +2853,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             with torch.no_grad():
                 sae.log_threshold.data += nudge_val
             if is_log_step:
-                direction = "UP" if nudge_val > 0 else "DOWN"
-                print(f"  [THRESH NUDGE @ {step}] direction={direction}"
+                # Spell out both directions: the nudge moves the THRESHOLD, and the
+                # sign of its effect on L0 is the opposite. "DOWN" alone reads like
+                # L0 is falling when it means the opposite.
+                direction = ("thr UP -> L0 down" if nudge_val > 0
+                             else "thr DOWN -> L0 up")
+                print(f"  [THRESH NUDGE @ {step}] {direction} "
                       f"nudge={nudge_val:+.5f} L0={l0_val:.1f} "
                       f"target={sae_cfg.target_l0:.0f} "
                       f"new_thr_mean={sae.log_threshold.exp().mean().item():.4f}")
@@ -3430,6 +3465,12 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                           "(first trained layer self-references otherwise)")
 
     for L in range(walk_start, end_layer + 1):
+        halt, why = _control_says_halt()
+        if halt:
+            print(f"\n  [KILLSWITCH] halting before L{L}: {why}")
+            print(f"  [KILLSWITCH] completed layers are saved and pushed; "
+                  f"resume with --layer-range \"{L},{end_layer}\"")
+            break
         dst_dir = pool_dir_for(L)
         if capture in ("rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
                        "rolling-generic"):

@@ -14,9 +14,10 @@ Two control loops, one event detection engine.
 """
 from __future__ import annotations
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 import json
+import os
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -222,7 +223,9 @@ class SAEAECSConfig:
     # The scheduler picks up changes every live_tune_every steps.
     # Set to None or "" to disable. Set to a path like "live_tune.json" to enable.
     live_tune_path: Optional[str] = None
-    live_tune_path_alt: str = "/tmp/live_tune.json"  # fallback: always container-local
+    # Container-local control file. $SAE_CONTROL_FILE overrides. Always polled, so
+    # the killswitch works with no config change: echo '{"stop": true}' > this path.
+    live_tune_path_alt: str = os.environ.get("SAE_CONTROL_FILE", "/tmp/live_tune.json")
     live_tune_every: int = 50        # check for overrides every N steps
 
     # -- Phase control (DESCENT / PIN / FINETUNE) -----------------------------
@@ -600,7 +603,10 @@ class SAEEventControlScheduler:
         self.phase_step += 1   # steps since current phase entered (reset on _enter_phase)
 
         # -- Live-tune: pick up runtime parameter overrides from JSON file --
-        if self.config.live_tune_path and self.total_steps % max(1, self.config.live_tune_every) == 0:
+        # The alt path is always present, so the control file works without any
+        # config change -- that is the point of a killswitch.
+        if ((self.config.live_tune_path or getattr(self.config, "live_tune_path_alt", None))
+                and self.total_steps % max(1, self.config.live_tune_every) == 0):
             self._apply_live_tune()
 
         ev_check_due = (
@@ -1348,6 +1354,19 @@ class SAEEventControlScheduler:
             if cfg.verbose and self.total_steps % 500 == 0:
                 print(f"  [live-tune] WARNING: failed to read {best_p}: {e}")
             return
+        # -- Killswitch. Checked before the tunables so it lands on the very first
+        # poll after the file is written, regardless of what else is in it.
+        # Writing {"stop": true} ends the current layer cleanly: the trainer takes
+        # its normal early-stop path, so the SAE is saved, metadata is written and
+        # the layer is pushed. It is a stop, not a crash.
+        if bool(overrides.get("stop", False)) and not self.should_stop:
+            self.should_stop = True
+            reason = str(overrides.get("stop_reason", "")).strip()
+            self.stop_reason = (
+                f"external stop via {best_p}" + (f": {reason}" if reason else ""))
+            prefix = f"[{self.mode_label}] " if self.mode_label else ""
+            print(f"  {prefix}[KILLSWITCH @ step {self.total_steps}] {self.stop_reason}")
+
         applied = {}
         for key, expected_type in self._LIVE_TUNE_KEYS.items():
             if key not in overrides:
