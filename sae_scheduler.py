@@ -14,7 +14,7 @@ Two control loops, one event detection engine.
 """
 from __future__ import annotations
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 import json
 import os
@@ -242,6 +242,15 @@ class SAEAECSConfig:
     pin_timeout_steps: int = 2000       # max steps in PIN before bailing back to DESCENT
     pin_ev_thresh: float = 0.95         # EV window counts toward PIN success above this
     pin_ev_patience: int = 3            # consecutive good EV windows -> ready for FINETUNE
+    # Feature-tail guard. PIN's premise is "sparsity is locked, let EV catch up".
+    # If the dictionary is shedding active features while lambda is frozen, that
+    # premise is void the same way an escaped L0 voids it -- EV is being bought
+    # by collapsing the tail, not by learning. dead_pct is a lagging indicator
+    # here (features go rare long before they go silent), so gate on the count of
+    # features firing above the ultra-active rate, relative to its PIN-entry value.
+    pin_ultra_release_frac: float = 0.70  # ultra_frac < this * entry value -> leave PIN
+    pin_ultra_patience: int = 2           # consecutive low windows before releasing
+    pin_ultra_max_releases: int = 2       # releases before stopping instead of re-PINning
     finetune_dual_step: float = 1e-9    # dual ascent step used during FINETUNE
     finetune_lambda_release_frac: float = 0.10  # lambda set to this fraction of pinned on release
     deep_layer_slingshot_gain: float = 8.0      # slingshot gain floor (deep-layer fallback)
@@ -434,6 +443,9 @@ class SAEEventControlScheduler:
         self.pinned_lambda: Optional[float] = None  # lambda captured on PIN entry
         self.pin_ev_count: int = 0         # consecutive good-EV windows seen in PIN
         self.pin_retry_count: int = 0      # times PIN timed out back to DESCENT
+        self.pin_ultra_entry: Optional[float] = None  # ultra_frac at PIN entry
+        self.pin_ultra_low_count: int = 0  # consecutive windows below the release ratio
+        self.pin_ultra_releases: int = 0   # times the tail guard has released PIN
 
     def seed_lambda(self, initial_l0: float):
         """Seed lambda proportional to initial L0 overshoot.
@@ -505,6 +517,11 @@ class SAEEventControlScheduler:
             self.pin_entry_step = self.total_steps
             self.pinned_lambda = self.lambda_l0
             self.pin_ev_count = 0
+            # Captured lazily from the first ultra_frac seen inside PIN, so the
+            # baseline is a real measurement rather than whatever happened to be
+            # cached from the last DESCENT window.
+            self.pin_ultra_entry = None
+            self.pin_ultra_low_count = 0
         prefix = f"[{self.mode_label}] " if self.mode_label else ""
         if new_phase == "FINETUNE" and self.pinned_lambda is not None:
             # Re-pin the ceiling so a stale/lowered lambda_l0_max (e.g. from a live
@@ -519,10 +536,13 @@ class SAEEventControlScheduler:
         print(f"{prefix}[PHASE] {old} -> {new_phase} @ step {self.total_steps} "
               f"(lambda={self.lambda_l0:.3e}; {reason})")
 
-    def _maybe_update_phase(self, l0, ev):
+    def _maybe_update_phase(self, l0, ev, ultra_frac=None):
         """Phase detection. NOT observation-only: the phase gates the dual.
 
         - DESCENT -> PIN when L0 enters the band around target.
+        - PIN -> DESCENT when the ultra-active feature count collapses relative to
+          its PIN-entry value. Also an actuator change, and for the same reason as
+          the L0 escape: PIN froze the dual on a premise that no longer holds.
         - PIN -> DESCENT when L0 escapes the release band. This one IS an actuator
           change: _update_dual early-returns on phase == "PIN", so leaving PIN is
           what hands lambda back to the integrator. See _l0_escaped_pin_band.
@@ -553,6 +573,41 @@ class SAEEventControlScheduler:
                 )
                 self.pin_ev_count = 0
                 return
+            # Feature-tail premise check. Same shape as the L0 escape above: the
+            # frozen dual is only defensible while the dictionary it froze is
+            # still intact. Inert when the caller supplies no ultra signal.
+            if ultra_frac is not None:
+                if self.pin_ultra_entry is None:
+                    self.pin_ultra_entry = float(ultra_frac)
+                elif self.pin_ultra_entry > 0:
+                    ratio = float(ultra_frac) / self.pin_ultra_entry
+                    if ratio < cfg.pin_ultra_release_frac:
+                        self.pin_ultra_low_count += 1
+                    else:
+                        self.pin_ultra_low_count = 0
+                    if self.pin_ultra_low_count >= cfg.pin_ultra_patience:
+                        self.pin_ultra_releases += 1
+                        detail = (f"ultra-active features fell to {ratio*100:.0f}% of "
+                                  f"the PIN-entry count over {self.pin_ultra_low_count} "
+                                  f"windows (< {cfg.pin_ultra_release_frac*100:.0f}%)")
+                        if self.pin_ultra_releases > cfg.pin_ultra_max_releases:
+                            self.should_stop = True
+                            self.stop_reason = (
+                                f"feature-tail collapse: {detail}; PIN released "
+                                f"{self.pin_ultra_releases - 1} times already and the tail "
+                                f"kept shedding, so further training is buying EV by "
+                                f"killing features"
+                            )
+                            print(f"{prefix}[TAIL STOP] {self.stop_reason}")
+                            return
+                        self._enter_phase(
+                            "DESCENT",
+                            f"{detail}; releasing frozen dual "
+                            f"(release {self.pin_ultra_releases}/"
+                            f"{cfg.pin_ultra_max_releases})",
+                        )
+                        self.pin_ev_count = 0
+                        return
             if ev is not None:
                 if ev >= cfg.pin_ev_thresh:
                     self.pin_ev_count += 1
@@ -572,7 +627,10 @@ class SAEEventControlScheduler:
         """Advance scheduler one step.
 
         Args:
-            signals: dict with "loss", "grad_norm" + optional "l0", "ev", "dead_pct".
+            signals: dict with "loss", "grad_norm" + optional "l0", "ev",
+                "dead_pct", "activation_norm", "ultra_frac" (fraction of the
+                dictionary firing above the ultra-active rate; drives the PIN
+                feature-tail guard and is optional/fail-open).
 
         Returns:
             Current mode string.
@@ -628,7 +686,7 @@ class SAEEventControlScheduler:
 
         # -- Phase machine (observation only; no actuator reads self.phase) --
         if ev_check_due:
-            self._maybe_update_phase(l0, ev)
+            self._maybe_update_phase(l0, ev, signals.get("ultra_frac"))
 
         # -- LAMBDA update: Augmented Lagrangian dual ascent (default) OR legacy P-ctrl --
         if l0 is not None:
@@ -1307,6 +1365,8 @@ class SAEEventControlScheduler:
         "pin_ev_patience": float,      # consecutive good EV windows for PIN EV-ready
         "pin_timeout_steps": float,    # max PIN polish steps before stop is allowed
         "pin_l0_band_abs": float,      # |L0-target| band for DESCENT -> PIN entry
+        "pin_ultra_release_frac": float,  # ultra-tail ratio that releases PIN
+        "pin_ultra_patience": float,      # low windows before the tail guard fires
     }
 
     def _apply_live_tune(self):

@@ -2,6 +2,100 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-07-27
+
+Two control decisions were being made from signals that could not support them.
+Both showed up on the same run (antares-350m L5, 4251 steps, which should have
+stopped around 2000).
+
+### Added
+- **PIN feature-tail guard.** PIN freezes the dual on the premise that sparsity is
+  locked and EV just needs time to catch up. That premise is void if the dictionary
+  is shedding active features, because the EV gain is then being bought by killing
+  the tail rather than by learning. The guard captures the ultra-active feature
+  fraction on PIN entry and releases PIN back to DESCENT when it falls below
+  `pin_ultra_release_frac` (default 0.70) of that baseline for `pin_ultra_patience`
+  (default 2) consecutive windows.
+
+  On the run that motivated it, ultra fell 31300 → 15497 over 2000 PIN steps with
+  lambda frozen the whole way. `dead_pct` read 0.0% throughout: features go *rare*
+  long before they go *silent*, so the existing dead-feature ceiling is a lagging
+  indicator here and never fired.
+
+  If the tail keeps collapsing after being handed back to the dual
+  (`pin_ultra_max_releases`, default 2), the run stops instead of cycling — at that
+  point more training is only trading features for EV, and the best-EV checkpoint
+  is already on disk.
+
+  Structurally this is the same premise check as the existing L0-escape release,
+  and it sits next to it. Fail-open: schedulers called without an `ultra_frac`
+  signal behave exactly as before.
+
+- `pin_ultra_release_frac` and `pin_ultra_patience` are live-tunable.
+- W&B: `train/explained_variance_smooth`, `features/ultra_active_frac`.
+
+### Changed
+- **Stop gates read a smoothed EV, not a single batch's.** Batch-to-batch EV spread
+  is routinely ±0.08 — wider than the margins the gates compare against — so gating
+  on a raw sample made each gate partly a coin flip. Observed directly: EV bounced
+  0.779–0.939 between adjacent windows while the layer was, by every other measure,
+  converged and stable.
+
+  Two concrete failures this caused. The Aggressive-K stop needs its EV floor held
+  for 500 steps, and the counter reset on every unlucky batch, so it never fired and
+  the layer fell through to the much later AL-convergence path. And `best_ev`
+  latched onto the single luckiest measurement, which both misreports the peak and
+  makes the post-peak decline margin trip against a peak that never really existed.
+
+  The gates now read a rolling **median** (`SAE_EV_SMOOTH`, default 5 samples).
+  Median rather than mean because the failure being defended against is one outlier
+  batch, which a mean passes through in proportion to its size. Below 3 samples the
+  raw value is used, so early-run behavior is unchanged.
+
+  Affects: Aggressive-K early stop, post-peak collapse guard, `best_ev` / best-state
+  persistence, and the EV the scheduler sees (so `pin_ev_thresh` too). The raw value
+  is still what gets printed and logged as `ev`; the smoothed one prints as `evs`.
+
+- **`>> OBS` samples now count.** They were computing the same global-variance EV as
+  the log line and throwing it away. Feeding them into the smoothing window roughly
+  doubles the sample rate the gates see at no cost.
+
+### Fixed
+- **Gradient norm is a control signal, not a log value.** Since 7920d89 (2026-06-15)
+  the trainer passed `grad_norm=0.0` on non-log steps, on the stated theory that it
+  was "only needed for logging/W&B". The scheduler pushes it into a 50-deep window
+  that `_detect_base_event()` reads on every step, so those zeros were false
+  observations rather than skipped samples. At `LOG_EVERY=250` the window held at
+  most one real reading and was all-zero for 200 of every 250 steps, the last-10
+  mean sat under `plateau_grad_norm_thresh` (1e-4), and PLATEAU latched the mode
+  machine out of BASELINE into EXPLORE (1.5x LR, 0.5x weight decay) for the rest of
+  the run. `GRADIENT_SPIKE` was simultaneously dead: over 49 zeros and one reading
+  `g`, the EMA gives mu = 0.03g and sigma = 0.168g, so the z-score is 5.77 for any
+  `g` against a threshold of 10.
+
+  Activation required passing `event_warmup_steps` (5000) plus ~10 steps for the
+  last real reading to age out. Every accepted MiniCPM and Qwen layer stopped
+  between 1501 and 4751 steps, so no shipped atlas layer was affected, but
+  `N_STEPS` defaults to 15_000: the exposure was entirely in long runs, which are
+  disproportionately the ones already failing to converge.
+
+  Now read every step. Regression coverage in `tests/test_grad_norm_signal.py`,
+  including a source guard, since this is a tempting optimisation that already
+  shipped once. If it ever needs deferring again, teach the scheduler that `None`
+  means "no observation" and rescale its window first: swapping `0.0` for `None`
+  without changing cadence would turn a 50-step window into a 12,500-step one.
+
+- **Removed two write-only loss accumulators.** `accum_sparsity_loss` and
+  `accum_aux_loss` were initialised and accumulated but never read by the
+  scheduler, the log line, or W&B. Their `.item()` calls cost a synchronous D2H
+  copy per microbatch for values nothing consumed. `accum_recon_loss` and
+  `accum_l0` stay: both feed control every step.
+
+### Note
+`best_ev` now tracks smoothed EV, so the persisted best state can lag the true peak
+by up to half a window. That is deliberate: it beats persisting whatever weights
+happened to coincide with a lucky measurement.
+
 ## [0.7.2] - 2026-07-27
 
 ### Added

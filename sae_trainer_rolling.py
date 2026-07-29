@@ -40,10 +40,12 @@ $SAE_SCRATCH_DIR; HF_TOKEN read from the environment. d_in is auto-detected.
 """
 from __future__ import annotations
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 import math
 import os
+import statistics
+from collections import deque
 from pathlib import Path
 
 class IterableDataset:
@@ -124,6 +126,28 @@ OBS_EVERY     = int(os.environ.get("SAE_OBS_EVERY", "100"))
 # config is ever seen.
 K_STOP_L0_REL_DEFAULT   = "0.15"
 K_STOP_EV_FLOOR_DEFAULT = "0.90"
+# Every EV number in this trainer is one batch's measurement, and batch-to-batch
+# spread is routinely +/-0.08 -- wider than any of the margins the stop gates
+# compare against. Gating on a raw sample makes a gate a coin flip: the
+# Aggressive-K counter resets on a single unlucky batch and never reaches its
+# patience, while `best_ev` latches onto the single luckiest one and makes the
+# post-peak decline margin trip against a peak that never really existed.
+# So the gates read a rolling MEDIAN instead. Median, not mean, because the
+# failure being defended against is one outlier batch, which a mean would let
+# through in proportion to its size.
+EV_SMOOTH_N = int(os.environ.get("SAE_EV_SMOOTH", "5"))
+# Below this many samples the window is not yet meaningful and the raw value is
+# used, so early-run behavior is unchanged.
+EV_SMOOTH_MIN = 3
+
+
+def _ev_smoothed(hist, raw):
+    """Median of the recent EV window, falling back to `raw` while it fills."""
+    if raw is None:
+        return None
+    if len(hist) < EV_SMOOTH_MIN:
+        return raw
+    return statistics.median(hist)
 # Reassociated b_dec gradient in the encoder (see _EncoderPreBias). Exact, removes
 # one of the six equal GEMMs in a step. SAE_FAST_PREBIAS=0 falls back to plain
 # autograd, which is the reference the test compares against.
@@ -2352,6 +2376,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         timing = None
 
     best_ev = -float("inf"); best_ev_step = 0; best_ev_l0 = 0.0
+    # Fed by BOTH the OBS trace and the log window. The OBS samples were already
+    # being computed and thrown away; they are the same global-variance EV the log
+    # line reports, so counting them roughly doubles the sample rate the gates see
+    # for free.
+    ev_hist = deque(maxlen=EV_SMOOTH_N)
+    ultra_frac = None  # last log window's ultra-active fraction, for the PIN guard
     best_state_in_memory = None; best_state_pending = False
     best_ev_persist_margin = 0.005
     # Dead-feature ceiling with rollback. Deep layers starve their feature tail the
@@ -2432,8 +2462,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         optimizer.zero_grad()
         accum_recon_loss = 0.0
         accum_l0 = 0.0
-        accum_sparsity_loss = 0.0
-        accum_aux_loss = 0.0
         fired_accum = torch.zeros(N_FEATURES, device=device, dtype=torch.bool)
 
         # Get full batch and split into microbatches for accumulation. The double-buffer
@@ -2580,10 +2608,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
             loss.backward()
 
+            # Only recon and L0 are read downstream: recon_val feeds the scheduler and
+            # l0_val feeds the W_enc dampener plus the scheduler, both every step. The
+            # sparsity/aux accumulators were write-only, so their .item() calls cost a
+            # synchronous D2H copy per microbatch for values nothing consumed.
             accum_recon_loss += recon_loss.detach().item() * accum_steps
             accum_l0 += l0_mb.detach().item()
-            accum_sparsity_loss += sparsity_loss.detach().item() * accum_steps
-            accum_aux_loss += aux_loss.detach().item() * accum_steps
             with torch.no_grad():
                 if triton_ok_this_step:
                     # The fused kernel does not return gate, so recompute it cheaply
@@ -2621,8 +2651,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             t_opt_start = time.perf_counter()
 
         # Single optimizer step after accumulation.
-        # grad_norm is only needed for logging/W&B, so defer the .item() sync
-        # to log steps. clip_grad_norm_ returns a tensor; we keep it as such.
+        # NOTE: grad_norm is a control signal, not a log value -- the scheduler pushes
+        # it into its event-detection window on every step. It must be read every step
+        # (see the sync below). clip_grad_norm_ returns the PRE-clipping total norm.
         grad_norm_t = nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
 
         # -- W_enc gradient dampening when L0 >> target -------------------------
@@ -2726,11 +2757,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         recon_val = accum_recon_loss / accum_steps
         is_log_step = (step % LOG_EVERY == 0)
-        # grad_norm is only needed for logging/W&B; sync it only on log steps.
-        if is_log_step:
-            grad_norm_val = grad_norm_t.item()
-        else:
-            grad_norm_val = 0.0
+        # Every step, unconditionally. SAESignalBuffer.push_base() appends this to a
+        # 50-deep window that _detect_base_event() reads on EVERY step, so a synthetic
+        # 0.0 on non-log steps is not a missing sample -- it is a false observation.
+        # With LOG_EVERY=250 the window went all-zero, the last-10 mean fell under
+        # plateau_grad_norm_thresh (1e-4), and PLATEAU -> EXPLORE latched the mode
+        # machine at 1.5x LR / 0.5x weight decay for the rest of any run past ~5010
+        # steps. If this sync ever needs deferring again, teach the scheduler that
+        # None means "no observation" first and rescale its window to match.
+        grad_norm_val = grad_norm_t.item()
         l0_val = accum_l0 / accum_steps
 
         # Observation-only trace through the warmup collapse window. L0 and recon are
@@ -2745,9 +2780,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 total_var_obs = full_batch.float().var().item()
             ev_obs = 1.0 - (recon_val / total_var_obs) if total_var_obs > 0 else 0.0
             dead_obs = revival.dead_pct(LOG_EVERY)
+            # A real measurement, so it counts toward the window the stop gates read.
+            ev_hist.append(ev_obs)
+            ev_obs_s = _ev_smoothed(ev_hist, ev_obs)
             print(f"{_c('  >> OBS', '1;96')} {_c(f'{step:>5}', '1;96')}  "
                   f"L0={_c_l0(l0_val, sae_cfg.target_l0)}  "
-                  f"EV={_c_ev(ev_obs)}  dead={_c_dead(dead_obs)}  thr={thr_obs:.4f}")
+                  f"EV={_c_ev(ev_obs)} (smooth {_c_ev(ev_obs_s)})  "
+                  f"dead={_c_dead(dead_obs)}  thr={thr_obs:.4f}")
 
         if do_timing:
             t_step_total = time.perf_counter() - t_step_start
@@ -2797,6 +2836,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 res_var_d = (acts_mb.float() - xh_p.float()).pow(2).mean(dim=0)
                 var_d = acts_mb.float().var(dim=0)
                 ev_perdim = 1.0 - (res_var_d / var_d.clamp_min(1e-6)).mean().item()
+                # Ultra-active count is read here rather than down in the print
+                # block because the PIN feature-tail guard consumes it inside
+                # scheduler.step(), which runs first. reset_fire_counts() still
+                # happens at the print site, so the window is unchanged.
+                fire_rate = revival.fire_rate(LOG_EVERY)
+                ultra_active = (fire_rate > 0.10).float().sum().item()
+                ultra_frac = ultra_active / max(N_FEATURES, 1)
+            ev_hist.append(ev)
 
             # -- dead-feature ceiling with rollback -----------------------------
             # Buffer this window, then if dead has breached the ceiling walk back to
@@ -2838,11 +2885,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         else:
             dead = None; ev = None; ev_perdim = None
 
+        # Everything downstream that makes a DECISION about the run reads this,
+        # not `ev`. `ev` stays raw for display so the spread is still visible.
+        ev_s = _ev_smoothed(ev_hist, ev)
+
         if do_timing:
             t_cpu_post_start = time.perf_counter()
         scheduler.step({"loss": recon_val, "grad_norm": grad_norm_val,
-                        "l0": l0_val, "ev": ev, "dead_pct": dead,
-                        "activation_norm": activation_norm_step})
+                        "l0": l0_val, "ev": ev_s, "dead_pct": dead,
+                        "activation_norm": activation_norm_step,
+                        "ultra_frac": ultra_frac if is_log_step else None})
 
         # -- L0-proportional threshold nudge: bypasses STE gradient bottleneck -------
         # Scales gain and frequency with overshoot, has symmetric undershoot
@@ -2897,8 +2949,6 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         if is_log_step:
             with torch.no_grad():
                 thr = sae.log_threshold.exp()
-                fire_rate = revival.fire_rate(LOG_EVERY)
-                ultra_active = (fire_rate > 0.10).float().sum().item()
             now = time.time()
             tokens_per_sec = log_window_tokens / max(now - log_window_start, 1e-6)
             log_window_start = now; log_window_tokens = 0
@@ -2945,11 +2995,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                           "t_fwd_bwd_wall", "t_cpu_post", "n_steps"):
                     timing[k] = 0.0
 
-            if ev > best_ev:
-                best_ev = ev; best_ev_step = step; best_ev_l0 = l0_val
+            # Smoothed, so "best" means the best the layer actually got rather than
+            # the best single batch it ever drew. The saved weights lag the true
+            # peak by up to half a window; that is the correct trade against
+            # persisting whatever state happened to coincide with a lucky measurement.
+            if ev_s > best_ev:
+                best_ev = ev_s; best_ev_step = step; best_ev_l0 = l0_val
                 best_state_in_memory = {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()}
                 best_state_pending = True
-            elif best_state_pending and ev < best_ev - best_ev_persist_margin:
+            elif best_state_pending and ev_s < best_ev - best_ev_persist_margin:
                 best_ckpt = Path(SAE_DIR) / f"layer_{layer:02d}_s{seed}{out_suffix}_latest" / "checkpoint_best.pt"
                 best_ckpt.parent.mkdir(parents=True, exist_ok=True)
                 bp = {"step": best_ev_step, "sae_state": best_state_in_memory,
@@ -2969,13 +3023,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 and best_ev > -float("inf")
                 and l0_crossed_target
             ):
-                if _post_peak_decline_is_bad(ev, best_ev, ev_decline_margin, ev_decline_floor):
+                if _post_peak_decline_is_bad(ev_s, best_ev, ev_decline_margin, ev_decline_floor):
                     ev_below_peak_streak += 1
                 else:
                     ev_below_peak_streak = 0
                 if ev_below_peak_streak >= ev_decline_patience:
                     scheduler.should_stop = True
-                    scheduler.stop_reason = (f"Post-peak quality collapse after target cross: EV {ev:.4f} below "
+                    scheduler.stop_reason = (f"Post-peak quality collapse after target cross: EV {ev_s:.4f} below "
                                              f"floor {ev_decline_floor:.2f} and peak "
                                              f"{best_ev:.4f}@{best_ev_step} by >= {ev_decline_margin:.3f} "
                                              f"for {ev_decline_patience} windows "
@@ -2990,7 +3044,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 l0_rel_err = abs(l0_val - K) / max(K, 1.0)
                 K_STOP_L0_REL = float(os.environ.get("SAE_STOP_L0_REL", K_STOP_L0_REL_DEFAULT))
                 K_STOP_EV_FLOOR = float(os.environ.get("SAE_STOP_EV_FLOOR", K_STOP_EV_FLOOR_DEFAULT))
-                if l0_rel_err <= K_STOP_L0_REL and ev >= K_STOP_EV_FLOOR:
+                if l0_rel_err <= K_STOP_L0_REL and ev_s >= K_STOP_EV_FLOOR:
                     if not hasattr(sae, "_k_converge_counter"):
                         sae._k_converge_counter = 0
                     sae._k_converge_counter += LOG_EVERY
@@ -2998,7 +3052,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         scheduler.should_stop = True
                         scheduler.stop_reason = (
                             f"Aggressive-K convergence: L0={l0_val:.1f} within "
-                            f"{K_STOP_L0_REL*100:.0f}% of K={K}, EV={ev:.3f} >= "
+                            f"{K_STOP_L0_REL*100:.0f}% of K={K}, EV={ev_s:.3f} >= "
                             f"{K_STOP_EV_FLOOR:.2f} for {sae._k_converge_counter} steps"
                         )
                         print(f"  [AGGRESSIVE-K STOP @ {step}] {scheduler.stop_reason}")
@@ -3016,7 +3070,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                   f"recon={recon_val:.5f} "
                   f"L0={_c_l0(l0_val, sae_cfg.target_l0)} "
                   f"dead={_c_dead(dead, dead_stop_pct)} "
-                  f"ev={_c_ev(ev)} "
+                  f"ev={_c_ev(ev)} evs={_c_ev(ev_s)} "
                   f"evd={ev_perdim:.3f} thr={thr.mean().item():.3f} "
                   f"ultra={int(ultra_active):>4d} lr={scheduler.optimizer.param_groups[0]['lr']:.2e} "
                   f"lam={scheduler.lambda_l0:.2e} tok/s={tokens_per_sec/1e3:.1f}k "
@@ -3024,6 +3078,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             if use_wandb:
                 wandb.log({"train/recon_loss": recon_val, "train/mean_l0": l0_val,
                            "train/dead_pct": dead, "train/explained_variance": ev,
+                           "train/explained_variance_smooth": ev_s,
+                           "features/ultra_active_frac": ultra_frac,
                            "train/ev_perdim": ev_perdim,
                            "train/lr": scheduler.optimizer.param_groups[0]["lr"],
                            "train/lambda_l0": scheduler.lambda_l0,
