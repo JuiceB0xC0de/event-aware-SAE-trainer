@@ -66,6 +66,7 @@ python run_atlas.py --config ./my-model.yaml
 | `--max-steps` | `15000` | Per-layer cap; early stop usually fires first. |
 | `--hub-id` | off | Upload target for trained SAEs. |
 | `--wandb-project` | off | Metrics logging. |
+| `--group-similarity` | off | Group-SAE: cosine floor for sharing one SAE across similar contiguous layers. See below. |
 
 ## Resume
 
@@ -83,6 +84,17 @@ pytest
 ```
 
 CPU-only; covers the SAE architecture, scheduler integrator, dataset dispatch, CLI, and exact capture-vs-forward checks. A GPU smoke test runs with `-m gpu` when CUDA is available.
+
+## Group-SAE — adapted from *Group-SAE: Efficient Training of Sparse Autoencoders for Large Language Models via Layer Groups*
+
+Adjacent decoder layers carry near-identical residual-stream representations, so training a separate SAE for each is largely redundant. With `--group-similarity <cos>`, the atlas run groups **contiguous** layers whose mean-activation signature stays within that cosine floor of their group's first ("anchor") layer, trains one SAE for the anchor, and shares it verbatim with the rest of the group — cutting `train_sae_on_activations` calls roughly in proportion to the grouping.
+
+```bash
+# one SAE per group of layers that stay within cos>=0.95 of their anchor
+python sae_trainer_rolling.py --model-id <hf-model-id> --end-layer 28 --group-similarity 0.95
+```
+
+Opt-in and off by default: without the flag, behavior is unchanged (one SAE per layer). Signatures are read from the activation pools the run already produces, so grouping adds no extra capture pass. Shared members are written locally with a `shared_from` tag in `meta.json`; per-group HF upload of members is out of scope. Adapted from [arXiv:2410.21508](https://arxiv.org/abs/2410.21508); the paper's offline fixed-K agglomerative clustering over a full similarity matrix is replaced here by a single-pass, threshold-driven contiguous grouping that fits the trainer's streaming residual-chain walk.
 
 ## License
 

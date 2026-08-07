@@ -1457,6 +1457,40 @@ def _rm_pool(dir_path: Path):
         shutil.rmtree(dir_path, ignore_errors=True)
 
 
+def _reuse_sae_for_layer(anchor_layer: int, member_layer: int, seed: int) -> dict:
+    """Group-SAE reuse: share the anchor layer's trained SAE with `member_layer`.
+
+    Group-SAE (arXiv:2410.21508) trains one SAE per *group* of similar contiguous
+    layers rather than one per layer. Once the group's anchor is trained, its
+    dictionary is shared verbatim by the other members: copy the anchor's output
+    directory to the member's and rewrite the layer id + provenance in meta.json.
+    Returns the member's final-metrics dict (same shape train_sae_on_activations
+    returns) tagged with `shared_from` so downstream tooling can tell trained
+    layers from reused ones.
+    """
+    import json
+    import shutil
+    anchor_dir = Path(SAE_DIR) / f"layer_{anchor_layer:02d}_s{seed}"
+    member_dir = Path(SAE_DIR) / f"layer_{member_layer:02d}_s{seed}"
+    if not (anchor_dir / "sae.pt").exists():
+        raise FileNotFoundError(
+            f"anchor SAE missing at {anchor_dir}; cannot share to L{member_layer}")
+    _rm_pool(member_dir)                      # clear any stale member output
+    shutil.copytree(anchor_dir, member_dir)
+    metrics = {}
+    meta_path = member_dir / "meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["layer"] = member_layer
+        meta["shared_from"] = anchor_layer
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        metrics = dict(meta.get("final_metrics") or {})
+    metrics["shared_from"] = anchor_layer
+    return metrics
+
+
 def _resume_pool_dir(seed: int) -> Path:
     """Persistent rolling-resume directory. Holds the pool of the last completed
     layer so a restart can resume the residual chain without regenerating from L0."""
@@ -3206,7 +3240,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       evict_model: bool = True, target_l0: int = None, cpu: bool = False,
                       norm_ref: float = None, corpus: str = None,
                       corpus_text_field: str = None, corpus_prefix: str = None,
-                      trust_remote_code: bool = False, pool_retention: int = 3):
+                      trust_remote_code: bool = False, pool_retention: int = 3,
+                      group_similarity: float = None):
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
@@ -3220,7 +3255,12 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     target_l0: override the global L0 target K (default 500). Use for aggressive sparsity tests.
     cpu: force CPU training (no CUDA). Will be SLOW - for debugging only.
     model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
-    max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
+    max_steps/bdec_batches/push: cap work + skip upload for smoke tests.
+    group_similarity: opt-in Group-SAE (arXiv:2410.21508). When set to a cosine
+        floor in [-1,1], contiguous layers whose residual-stream signature stays
+        within that floor of the current group's anchor reuse the anchor's SAE
+        instead of training their own -- one SAE per group, not per layer. Off
+        (None) keeps the one-SAE-per-layer behavior unchanged."""
     import time
     import torch
 
@@ -3404,6 +3444,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         return _pool_dir(f"pool_{_slug(MODEL_ID)}_L{L:02d}_s{seed}")
 
     results = {}
+    # Group-SAE state: the anchor is the first layer of the current group and the
+    # only one trained; later contiguous layers similar enough to it reuse its SAE.
+    if group_similarity is not None:
+        from layer_groups import mean_activation_signature, should_share_with_anchor
+        print(f"  [group-sae] enabled: contiguous layers within cos>={group_similarity:.3f} "
+              f"of their group anchor reuse the anchor's SAE (arXiv:2410.21508)")
+    group_anchor_layer = -1
+    group_anchor_sig = None
     # The slingshot gain and LR multipliers scale by probe/ref norm ratio. The ref
     # must be the norm of the chain's FIRST layer (L0), not whichever layer this
     # process happens to train first -- a resume that starts mid-chain with ref=None
@@ -3590,22 +3638,39 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        provider = RollingActivationProvider(dst_dir, device, seed=seed)
-        try:
-            # Determine resume checkpoint for this layer
-            layer_resume = None
-            if resume_from:
-                # Only apply the explicit resume to the layer the checkpoint belongs to.
-                # The orchestrator skips earlier layers via resume_layer / walk_start above.
-                layer_resume = resume_from
-            res = train_sae_on_activations(L, d_in, seed, provider,
-                                           max_steps=max_steps, bdec_batches=bdec_batches,
-                                           microbatch_tokens=microbatch_tokens or MICROBATCH_TOKENS,
-                                           resume_from=layer_resume, push=push,
-                                           activation_norm_ref=activation_norm_ref,
-                                           cpu=cpu)
-        finally:
-            provider.close()
+        # Group-SAE: decide whether this layer joins the current group (reuse the
+        # anchor's SAE) or opens a new one (train it as the next anchor). The
+        # signature comes from one already-produced pool shard, so no extra pass.
+        share_anchor = None
+        if group_similarity is not None:
+            sig = mean_activation_signature(_read_shard(dst_dir, 0))
+            if group_anchor_sig is not None and should_share_with_anchor(
+                    sig, group_anchor_sig, group_similarity):
+                share_anchor = group_anchor_layer
+            else:
+                group_anchor_layer, group_anchor_sig = L, sig
+
+        if share_anchor is not None:
+            print(f"  [group-sae] L{L} reuses anchor L{share_anchor}'s SAE "
+                  f"(cos>={group_similarity:.3f}); skipping training")
+            res = _reuse_sae_for_layer(share_anchor, L, seed)
+        else:
+            provider = RollingActivationProvider(dst_dir, device, seed=seed)
+            try:
+                # Determine resume checkpoint for this layer
+                layer_resume = None
+                if resume_from:
+                    # Only apply the explicit resume to the layer the checkpoint belongs to.
+                    # The orchestrator skips earlier layers via resume_layer / walk_start above.
+                    layer_resume = resume_from
+                res = train_sae_on_activations(L, d_in, seed, provider,
+                                               max_steps=max_steps, bdec_batches=bdec_batches,
+                                               microbatch_tokens=microbatch_tokens or MICROBATCH_TOKENS,
+                                               resume_from=layer_resume, push=push,
+                                               activation_norm_ref=activation_norm_ref,
+                                               cpu=cpu)
+            finally:
+                provider.close()
         results[f"layer_{L:02d}"] = res
         if activation_norm_ref is None:
             probe_norm = res.get("activation_norm_probe") if isinstance(res, dict) else None
@@ -3717,6 +3782,10 @@ def main():
     p.add_argument("--pool-retention", type=int, default=3,
                    help="previous layers' pools kept on disk as rollback insulation "
                         "(default 3; use 1 on disk-tight pods -- each pool costs its full disk size)")
+    p.add_argument("--group-similarity", type=float, default=None,
+                   help="opt-in Group-SAE: cosine floor in [-1,1]. Contiguous layers whose "
+                        "residual-stream signature stays within this floor of their group's "
+                        "anchor reuse the anchor's SAE (one SAE per group). Off by default.")
     p.set_defaults(use_pretok=True, push=True, evict_model=True, cpu=False)
     args = p.parse_args()
 
@@ -3735,7 +3804,7 @@ def main():
         target_l0=args.target_l0, cpu=args.cpu, norm_ref=args.norm_ref,
         corpus=args.corpus, corpus_text_field=args.corpus_text_field,
         corpus_prefix=args.corpus_prefix, trust_remote_code=args.trust_remote_code,
-        pool_retention=args.pool_retention)
+        pool_retention=args.pool_retention, group_similarity=args.group_similarity)
     print(f"\nDone. {res}")
 
 
