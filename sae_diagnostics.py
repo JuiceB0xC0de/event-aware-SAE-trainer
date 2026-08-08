@@ -11,19 +11,29 @@ atoms d_i, the reconstruction x_hat = D z satisfies
 
 so the l2-norm of the *sparse feature vector* z tracks the l2-norm of the
 reconstruction, and (to the extent the SAE reconstructs well) of the dense input
-embedding x. The gap between ||z|| and ||x_hat|| is exactly the off-diagonal
-Gram mass -- co-activated features whose decoder directions are not orthogonal.
+embedding x. That collapse holds only for *unit-norm* decoder atoms: the trainer
+renormalizes the decoder columns to unit norm every optimizer step (see
+`_normalize_decoder`), matching the reference, so ||d_i|| = 1 and a lone active
+feature gives ||x_hat|| = |z_i| = ||z||. Were the atoms not renormalized, the gap
+would track decoder-norm scale rather than dictionary geometry. The relative gap
+| ||z|| - ||x_hat|| | / ||x_hat|| (qo_gap) is therefore a proxy for the
+off-diagonal Gram mass -- it grows with co-activated features whose decoder
+directions are not orthogonal.
 
 This is a signal none of the trainer's existing per-log quality numbers capture:
 EV measures reconstruction fidelity, dead%/fire_rate measure usage, but neither
 sees whether the *active* dictionary atoms are actually quasi-orthogonal. A
-qo_ratio far from 1, or a growing qo_gap, flags feature redundancy / dictionary
-degeneracy even while EV still looks healthy.
+growing qo_gap flags feature redundancy / dictionary degeneracy even while EV
+still looks healthy.
 
 Deliberately NOT ported: the paper's second contribution (top-AFA activation) --
 as a replacement activation it would displace the trainer's augmented-Lagrangian
-L0 controller, and the paper's offline benchmark suite, which belongs downstream.
-This module is a read-only diagnostic over tensors the log step already holds.
+L0 controller; the paper's afa norm-matching loss term, afa_coeff * (||z|| -
+||x||)^2, which is what actually drives ||z|| toward ||x|| during training (this
+module only *observes* the ||z||/||x|| ratio, it does not add the loss, so it
+never displaces the trainer's AL-L0 / JumpReLU objective); and the paper's
+offline benchmark suite, which belongs downstream. This module is a read-only
+diagnostic over tensors the log step already holds.
 """
 from __future__ import annotations
 
@@ -57,9 +67,11 @@ def quasi_orthogonality_signal(
         eps: floor on norm denominators to avoid divide-by-zero on silent tokens.
 
     Returns a dict of python floats (or ``None`` when there are no tokens):
-        qo_ratio: mean over tokens of ||z||_2 / ||x||_2. The paper's closed form
-            predicts ~= 1 when features carry the embedding's energy and the
-            active dictionary is quasi-orthogonal.
+        qo_ratio: mean over tokens of ||z||_2 / ||x||_2. The paper drives this
+            toward 1 with a trained norm-matching loss, afa_coeff * (||z|| -
+            ||x||)^2; this diagnostic only observes the ratio and does not add
+            that loss, so nothing in the trainer's objective pins it to 1 -- it
+            is a descriptive signal, not a predicted value.
         qo_gap:   mean of | ||z||_2 - ||x_hat||_2 | / ||x_hat||_2. This isolates
             the dictionary geometry from reconstruction error (it compares z to
             x_hat, not x): 0 means the active atoms are orthogonal, larger means

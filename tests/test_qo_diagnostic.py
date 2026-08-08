@@ -38,9 +38,9 @@ def test_single_active_feature_has_zero_gap(tiny_sae):
 
 
 def test_redundant_features_raise_gap(tiny_sae):
-    # Two co-activated features sharing a decoder direction is exactly the
-    # off-diagonal Gram mass the paper's diagnostic surfaces: ||z||=sqrt(2)
-    # but ||x_hat||=2, so the gap is well above zero.
+    # Two co-activated features sharing a (unit-norm) decoder direction load
+    # the off-diagonal Gram mass that qo_gap proxies: ||z||=sqrt(2) but
+    # ||x_hat||=2, so the gap is well above zero.
     with torch.no_grad():
         tiny_sae.W_dec.weight[:, 1] = tiny_sae.W_dec.weight[:, 0]
     z = torch.zeros(1, 8)
