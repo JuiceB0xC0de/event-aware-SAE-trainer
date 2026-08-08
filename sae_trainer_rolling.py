@@ -2035,6 +2035,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     import torch
     import torch.nn as nn
     from sae_scheduler import SAEAECSConfig, SAEEventControlScheduler
+    from sae_diagnostics import _c_qo, quasi_orthogonality_signal
 
     def _autocast():
         if device.type == "cuda":
@@ -2328,7 +2329,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         provider = _ActivationDoubleBuffer(provider, device)
 
     metrics = {"recon_loss": [], "mean_l0": [], "dead_pct": [], "resampled": [],
-               "ev": [], "nonlinear_err": [], "linear_err": []}
+               "ev": [], "nonlinear_err": [], "linear_err": [], "qo_gap": []}
     log_window_start = time.time()
     log_window_tokens = 0
 
@@ -2832,10 +2833,14 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 # high-magnitude residual dims (Qwen-style outlier channels)
                 # can't dominate the score like they do in global-variance EV.
                 # Probed on the last microbatch; logging-only signal.
-                xh_p, _ = sae(acts_mb)
+                xh_p, z_p = sae(acts_mb)
                 res_var_d = (acts_mb.float() - xh_p.float()).pow(2).mean(dim=0)
                 var_d = acts_mb.float().var(dim=0)
                 ev_perdim = 1.0 - (res_var_d / var_d.clamp_min(1e-6)).mean().item()
+                # Quasi-orthogonality diagnostic (arXiv:2503.24277): ||z|| should
+                # track ||x_hat||/||x|| when the active dictionary is orthogonal.
+                # Reuses the probe forward above -- three norms, no extra pass.
+                qo = quasi_orthogonality_signal(z_p, xh_p, acts_mb)
                 # Ultra-active count is read here rather than down in the print
                 # block because the PIN feature-tail guard consumes it inside
                 # scheduler.step(), which runs first. reset_fire_counts() still
@@ -2883,7 +2888,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         f"state in the last {len(dead_state_buf)} windows")
                 scheduler.should_stop = True
         else:
-            dead = None; ev = None; ev_perdim = None
+            dead = None; ev = None; ev_perdim = None; qo = None
 
         # Everything downstream that makes a DECISION about the run reads this,
         # not `ev`. `ev` stays raw for display so the spread is still visible.
@@ -3065,13 +3070,15 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             metrics["dead_pct"].append(round(dead, 2))
             metrics["resampled"].append(revival.total_resampled)
             metrics["ev"].append(ev)
+            metrics["qo_gap"].append(round(qo["qo_gap"], 4))
             print(f"  step={_c(f'{step:>5}', '1;97')} mode={scheduler.mode:<9s} "
                   f"phase={_c(f'{scheduler.phase:<8s}', '96')} "
                   f"recon={recon_val:.5f} "
                   f"L0={_c_l0(l0_val, sae_cfg.target_l0)} "
                   f"dead={_c_dead(dead, dead_stop_pct)} "
                   f"ev={_c_ev(ev)} evs={_c_ev(ev_s)} "
-                  f"evd={ev_perdim:.3f} thr={thr.mean().item():.3f} "
+                  f"evd={ev_perdim:.3f} qo={_c_qo(qo['qo_gap'])} "
+                  f"thr={thr.mean().item():.3f} "
                   f"ultra={int(ultra_active):>4d} lr={scheduler.optimizer.param_groups[0]['lr']:.2e} "
                   f"lam={scheduler.lambda_l0:.2e} tok/s={tokens_per_sec/1e3:.1f}k "
                   f"tokens={step*BATCH_TOKENS/1e6:.1f}M")
@@ -3081,6 +3088,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                            "train/explained_variance_smooth": ev_s,
                            "features/ultra_active_frac": ultra_frac,
                            "train/ev_perdim": ev_perdim,
+                           "diag/qo_gap": qo["qo_gap"],
+                           "diag/qo_ratio": qo["qo_ratio"],
                            "train/lr": scheduler.optimizer.param_groups[0]["lr"],
                            "train/lambda_l0": scheduler.lambda_l0,
                            "train/activation_norm": activation_norm_step,
