@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+title: "event-aware-SAE-trainer: self-tuning sparse autoencoder training for every layer of a language model"
+version: 0.8.0
+date-released: "2026-06-05"
+authors:
+  - name: "Rick (JuiceB0xC0de)"
+url: "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
+repository-code: "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
+license: MIT
+keywords:
+  - sparse autoencoder
+  - mechanistic interpretability
+  - dictionary learning
+  - augmented Lagrangian
+  - language models
