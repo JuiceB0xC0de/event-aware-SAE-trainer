@@ -1091,8 +1091,15 @@ class SAEEventControlScheduler:
                 # The floor is the opposite case and stays valid: lambda == 0 with
                 # L0 inside the band is complementary slackness, i.e. the sparsity
                 # constraint is simply inactive. Only the ceiling is disqualifying.
+                # Only meaningful while the dual is free to move. _dual_update
+                # early-returns on phase == "PIN", so in PIN lambda is frozen by
+                # design and its flatness -- at any value, ceiling included --
+                # carries no information about convergence. Applying the check
+                # there would permanently block stopping for any run that entered
+                # PIN with a saturated dual.
                 ceiling = self.config.lambda_l0_max
-                if ceiling > 0 and all(l >= ceiling * (1.0 - 1e-6) for l in recent):
+                if (self.phase != "PIN" and ceiling > 0
+                        and all(l >= ceiling * (1.0 - 1e-6) for l in recent)):
                     lambda_converged = False
                     if not self._lambda_ceiling_warned:
                         self._lambda_ceiling_warned = True

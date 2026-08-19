@@ -105,3 +105,25 @@ def test_short_windows_never_converge(window):
 def test_l0_outside_band_blocks_convergence():
     """Even a perfect plateau must not stop while L0 is off target."""
     assert _verdict([5e-4] * 4, l0=TARGET_L0 * 2) is False
+
+
+def _verdict_in_pin(lambdas, lambda_max=5e-3):
+    sched = _make_scheduler(target_l0=TARGET_L0, lambda_l0_max=lambda_max)
+    for _ in range(4):
+        sched.buffer.push_sae(l0=TARGET_L0)
+    sched.phase = "PIN"
+    lambdas = list(lambdas)
+    sched._lambda_history = lambdas[:-1]
+    sched.lambda_l0 = lambdas[-1]
+    before = sched._ev_above_floor_count
+    sched._check_early_stop(ev=0.99)
+    return sched._ev_above_floor_count > before
+
+
+def test_ceiling_check_does_not_apply_in_pin():
+    """PIN freezes the dual (_dual_update early-returns), so lambda is constant
+    there by design and its value carries no convergence signal. Applying the
+    saturation rule in PIN would strand any run that entered PIN pinned high --
+    it could never satisfy the gate and would burn to max_steps."""
+    assert _verdict([5e-3] * 4, lambda_max=5e-3) is False        # DESCENT: blocked
+    assert _verdict_in_pin([5e-3] * 4, lambda_max=5e-3) is True  # PIN: allowed
