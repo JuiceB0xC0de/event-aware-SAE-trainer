@@ -47,9 +47,9 @@ def _verdict(lambdas, lambda_max=5e-3, l0=None):
     else:
         sched._lambda_history = []
         sched.lambda_l0 = 0.0
-    before = sched._ev_above_floor_count
+    before = sched._al_converged_window_count
     sched._check_early_stop(ev=0.99)
-    return sched._ev_above_floor_count > before
+    return sched._al_converged_window_count > before
 
 
 def test_l0_gate_alone_is_not_enough():
@@ -115,9 +115,9 @@ def _verdict_in_pin(lambdas, lambda_max=5e-3):
     lambdas = list(lambdas)
     sched._lambda_history = lambdas[:-1]
     sched.lambda_l0 = lambdas[-1]
-    before = sched._ev_above_floor_count
+    before = sched._al_converged_window_count
     sched._check_early_stop(ev=0.99)
-    return sched._ev_above_floor_count > before
+    return sched._al_converged_window_count > before
 
 
 def test_ceiling_check_does_not_apply_in_pin():

@@ -409,7 +409,7 @@ class SAEEventControlScheduler:
 
         # EV tracking
         self._ev_below_floor_count: int = 0
-        self._ev_above_floor_count: int = 0
+        self._al_converged_window_count: int = 0
 
         # Dead feature tracking
         self._dead_emergency_last_step: int = 0
@@ -1109,11 +1109,11 @@ class SAEEventControlScheduler:
                               f"target.")
 
         if l0_in_target and lambda_converged:
-            self._ev_above_floor_count += 1
+            self._al_converged_window_count += 1
         else:
-            self._ev_above_floor_count = 0
+            self._al_converged_window_count = 0
 
-        if self._ev_above_floor_count >= self.config.ev_stop_patience:
+        if self._al_converged_window_count >= self.config.ev_stop_patience:
             # PIN stop gate (Branch 6 / Task 6B): AL convergence alone must not
             # end the run the moment sparsity locks -- PIN exists to let EV catch
             # up with lambda frozen. Hold the stop until PIN reports EV-ready
@@ -1626,7 +1626,12 @@ class SAEEventControlScheduler:
             "transitions": len(self.transition_log),
             "event_counter": self.event_counter,
             "ev_below_floor": self._ev_below_floor_count,
-            "ev_above_floor": self._ev_above_floor_count,
+            # Counts consecutive windows where the AL gates (L0 in band AND the
+            # dual plateaued) both held. It has never had anything to do with EV
+            # being above a floor. `ev_above_floor` is kept as a deprecated alias
+            # so existing W&B charts keep resolving; prefer al_converged_windows.
+            "al_converged_windows": self._al_converged_window_count,
+            "ev_above_floor": self._al_converged_window_count,
             "activation_norm_ema": self._activation_norm_ema,
             "activation_norm_preflight": self._activation_norm_preflight,
             "effective_slingshot_gain": self._effective_slingshot_gain(),
