@@ -223,6 +223,45 @@ if _USE_TRITON_ENV:
     print("[TRITON] SAE_USE_TRITON=1 ignored: current kernel is disabled (see sae_trainer_rolling.py)")
 
 
+def _dead_feature_aux_recon(pre, dead_indices, eff_k, w_dec_weight):
+    """Reconstruct the residual from the top-k dead features only.
+
+    Mathematically identical to the dense formulation:
+
+        pre_dead   = pre[:, dead_indices].relu()          # [B, n_dead]
+        vals, idx  = pre_dead.topk(eff_k, dim=-1)
+        aux_acts   = zeros_like(pre_dead).scatter_(-1, idx, vals)
+        x_aux      = aux_acts @ w_dec_weight.t()[dead_indices]
+
+    but the aux term is top-k sparse by construction (AUX_K entries per token),
+    so the dense buffer and the dense matmul are both avoidable. This gathers
+    the eff_k selected decoder rows instead, which skips:
+
+      * the [B, n_dead] zeros buffer and its scatter
+      * the [n_dead, d] decoder-row gather, re-done every microbatch
+      * a [B, n_dead] x [n_dead, d] matmul whose inputs are almost all zero
+
+    At B=32768 with 10% of a 73,728-wide dictionary dead that is roughly a
+    gigabyte of allocation per microbatch.
+
+    `per_sample_weights` must match the weight dtype, which is not automatic
+    under bf16 autocast, hence the explicit cast.
+    """
+    import torch
+
+    pre_dead = pre.index_select(1, dead_indices).relu_()
+    topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
+    # topk_idx indexes into the dead subset; map back to global feature ids.
+    global_idx = dead_indices[topk_idx]
+    weight = w_dec_weight.t()  # [F, d] view; no contiguous copy
+    return torch.nn.functional.embedding_bag(
+        global_idx,
+        weight,
+        mode="sum",
+        per_sample_weights=topk_vals.to(weight.dtype),
+    )
+
+
 def _aggressive_k_aux_k(target_l0: int) -> int:
     """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
     to a fraction of the target so the aux loss doesn't fight the sparsity budget."""
@@ -2614,12 +2653,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
                     # Aux loss for dead features (scaled by accum_steps)
                     if n_dead > 0:
-                        pre_dead = pre[:, dead_indices].relu()
-                        topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
-                        aux_acts = torch.zeros_like(pre_dead)
-                        aux_acts.scatter_(-1, topk_idx, topk_vals)
-                        W_dec_dead = sae.W_dec.weight.t()[dead_indices]
-                        x_aux = aux_acts @ W_dec_dead
+                        # Gather-sum over the eff_k selected dead features rather
+                        # than a dense [B, n_dead] scatter and matmul. Identical
+                        # values and gradients (tests/test_aux_recon.py).
+                        x_aux = _dead_feature_aux_recon(
+                            pre, dead_indices, eff_k, sae.W_dec.weight)
                         residual_target = residual_float.detach()
                         aux_loss = ((residual_target - x_aux.float()).pow(2).mean() * AUX_COEFF) / accum_steps
                     else:
