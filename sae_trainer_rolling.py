@@ -2474,8 +2474,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         # Gradient accumulation: accumulate over microbatches before stepping
         optimizer.zero_grad()
-        accum_recon_loss = 0.0
-        accum_l0 = 0.0
+        # Accumulate on device. Reading these per microbatch costs a synchronous
+        # D2H copy each time, and nothing consumes them until after the loop
+        # (current_step_l0 below, then recon_val / l0_val). One stacked read at
+        # the end turns 2*accum_steps syncs per step into one.
+        accum_recon_t = torch.zeros((), device=device, dtype=torch.float32)
+        accum_l0_t = torch.zeros((), device=device, dtype=torch.float32)
         fired_accum = torch.zeros(N_FEATURES, device=device, dtype=torch.bool)
 
         # Get full batch and split into microbatches for accumulation. The double-buffer
@@ -2626,8 +2630,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # l0_val feeds the W_enc dampener plus the scheduler, both every step. The
             # sparsity/aux accumulators were write-only, so their .item() calls cost a
             # synchronous D2H copy per microbatch for values nothing consumed.
-            accum_recon_loss += recon_loss.detach().item() * accum_steps
-            accum_l0 += l0_mb.detach().item()
+            accum_recon_t += recon_loss.detach().float() * accum_steps
+            accum_l0_t += l0_mb.detach().float()
             with torch.no_grad():
                 if triton_ok_this_step:
                     # The fused kernel does not return gate, so recompute it cheaply
@@ -2675,6 +2679,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # the encoder from "inflating" to keep features on while sparsity pressure
         # is trying to push them off.  Use the current step's accumulated L0 for
         # immediate responsiveness.
+        # One stacked device read for the accumulators instead of one .item() per
+        # value per microbatch: 2*accum_steps syncs per step becomes 1.
+        #
+        # grad_norm is deliberately NOT folded in here. It is read separately below
+        # via its own .item(), and tests/test_grad_norm_signal.py guards that line
+        # by source text -- deferring or synthesising grad_norm shipped once before
+        # and silently killed the gradient-spike detector. Folding it in would save
+        # exactly one sync per step, which is not worth spending that tripwire on.
+        accum_recon_loss, accum_l0 = torch.stack(
+            (accum_recon_t, accum_l0_t)
+        ).tolist()
+
         current_step_l0 = accum_l0 / max(accum_steps, 1)
         wenc_factor = scheduler.wenc_dampen_factor(current_step_l0)
         if wenc_factor < 1.0:
@@ -2705,9 +2721,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 timing["evt_norm_end"].record()
             timing["_last_opt_norm"] = time.perf_counter() - t_opt_start
 
-        # accum_recon_loss / accum_l0 are already Python floats (summed from the
-        # microbatch .item() calls); use them directly instead of bouncing through
-        # a GPU tensor and back, which forced two extra device syncs per step.
+        # accum_recon_loss / accum_l0 / grad_norm_val are Python floats produced by
+        # the single stacked device read above; use them directly.
 
         # Dead/fired bookkeeping reuses the fired mask gathered during the forward
         # passes above -- no extra encode of the full batch.
