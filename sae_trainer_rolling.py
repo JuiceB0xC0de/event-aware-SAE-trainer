@@ -813,13 +813,19 @@ def _ensure_sae_classes():
             # Zero-value bridge: value is unchanged, but gives the gate tensor a
             # grad_fn linked to log_threshold so its hook captures grad_gate.
             bridge = (threshold - threshold.detach()).view(1, -1) * 0.0
-            # In-place. `gate_hard + bridge` broadcasts a [1, F] row of zeros into
-            # a second full [B, F] tensor purely to carry the grad_fn -- 4.5 GiB at
-            # B=32768, F=73728. add_ writes into gate_hard's existing storage for
-            # identical values and an identical graph node. Safe because gate_hard
-            # is freshly built from a comparison and carries no autograd history of
-            # its own, so nothing can depend on its pre-mutation value.
-            gate = gate_hard.add_(bridge)
+            # NB: this add is deliberately out-of-place, and deliberately promotes.
+            #
+            # gate_hard is pre.dtype (bf16 under autocast) and bridge is the fp32
+            # threshold, so `gate_hard + bridge` type-promotes to fp32, and that
+            # fp32-ness carries through feat_acts = pre * gate into the whole
+            # feature path. Rewriting this as gate_hard.add_(bridge) writes into
+            # bf16 storage instead, which looks like a free saving -- it removes a
+            # [B, F] allocation -- but silently halves the precision of every
+            # downstream activation AND measured ~21% slower on an H100
+            # (17.3k -> 13.6k tok/s at d_in 2304, expansion 32, microbatch 8192).
+            # Measured 2026-08-19; see bench/bench_sae_core.py. Do not "optimise"
+            # this line.
+            gate = gate_hard + bridge
             # feat_acts uses the bridge gate so log_threshold participates in the
             # graph and the parameter hook fires. The gate hook will receive the
             # combined gradient (pre * grad_feat + grad_gate) when both paths are
@@ -2665,11 +2671,22 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
                     # Aux loss for dead features (scaled by accum_steps)
                     if n_dead > 0:
-                        # Gather-sum over the eff_k selected dead features rather
-                        # than a dense [B, n_dead] scatter and matmul. Identical
-                        # values and gradients (tests/test_aux_recon.py).
-                        x_aux = _dead_feature_aux_recon(
-                            pre, dead_indices, eff_k, sae.W_dec.weight)
+                        # Dense on purpose. _dead_feature_aux_recon does the same
+                        # thing as a gather-sum over the eff_k selected features
+                        # and allocates ~0.5 GB less, but measured ~21% slower on
+                        # an H100 (17.3k -> 13.7k tok/s at d_in 2304, expansion 32,
+                        # microbatch 8192, n_dead 7372): embedding_bag performs
+                        # ~1M uncoalesced row-gathers of d_in floats, while this
+                        # "wasteful" matmul over a mostly-zero matrix runs on
+                        # tensor cores. The sparse helper is kept, and proven
+                        # equivalent by tests/test_aux_recon.py, in case the
+                        # crossover moves on other hardware or at other n_dead.
+                        pre_dead = pre[:, dead_indices].relu()
+                        topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
+                        aux_acts = torch.zeros_like(pre_dead)
+                        aux_acts.scatter_(-1, topk_idx, topk_vals)
+                        W_dec_dead = sae.W_dec.weight.t()[dead_indices]
+                        x_aux = aux_acts @ W_dec_dead
                         residual_target = residual_float.detach()
                         aux_loss = ((residual_target - x_aux.float()).pow(2).mean() * AUX_COEFF) / accum_steps
                     else:
