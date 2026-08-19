@@ -95,8 +95,19 @@ def run(args):
             sparsity_loss = (lambda_l0 * slack + 0.5 * al_mu * slack * slack) / accum_steps
 
             if n_dead > 0:
-                x_aux = T._dead_feature_aux_recon(
-                    pre, dead_indices, eff_k, sae.W_dec.weight)
+                # Ref-agnostic: use the sparse helper when the checkout has it,
+                # otherwise reproduce the dense formulation so the same benchmark
+                # runs against main and against the optimisation branch.
+                if hasattr(T, "_dead_feature_aux_recon"):
+                    x_aux = T._dead_feature_aux_recon(
+                        pre, dead_indices, eff_k, sae.W_dec.weight)
+                else:
+                    pre_dead = pre[:, dead_indices].relu()
+                    topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
+                    aux_acts = torch.zeros_like(pre_dead)
+                    aux_acts.scatter_(-1, topk_idx, topk_vals)
+                    W_dec_dead = sae.W_dec.weight.t()[dead_indices]
+                    x_aux = aux_acts @ W_dec_dead
                 residual_target = residual_float.detach()
                 aux_loss = ((residual_target - x_aux.float()).pow(2).mean()
                             * T.AUX_COEFF) / accum_steps
