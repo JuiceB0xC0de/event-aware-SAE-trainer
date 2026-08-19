@@ -418,6 +418,7 @@ class SAEEventControlScheduler:
         self.should_stop: bool = False
         self.stop_reason: str = ""
         self._lambda_history: list = []     # rolling lambda readings for plateau detection
+        self._lambda_ceiling_warned = False  # warn once when the dual saturates high
         self._activation_norm_ema: Optional[float] = None
         # Frozen preflight activation norm — drives the deterministic slingshot
         # gain scaling. Distinct from the live EMA (which is for LR adaptation).
@@ -1071,9 +1072,34 @@ class SAEEventControlScheduler:
         lambda_converged = False
         if len(self._lambda_history) >= 4:
             recent = self._lambda_history[-4:]
-            if recent[0] > 1e-12:
-                rel_growth = max(recent) / recent[0] - 1.0
-                lambda_converged = rel_growth < self.config.al_convergence_rel_tol
+            lo, hi = min(recent), max(recent)
+            mid = sum(recent) / len(recent)
+            if mid > 1e-12:
+                # Two-sided. The previous test was max(recent)/recent[0] - 1, which
+                # only sees growth: a monotonically DECREASING lambda gives
+                # max == recent[0], hence rel_growth == 0, and a collapsing dual was
+                # reported as a plateau. Spread across the window catches both
+                # directions and is still scaled by the same tolerance knob.
+                lambda_converged = (hi - lo) / mid < self.config.al_convergence_rel_tol
+
+            if lambda_converged:
+                # A dual pinned to its ceiling is flat because it ran out of
+                # authority, not because it found its value -- the constraint is
+                # being held by force and would spring back if pressure were
+                # removed. That is not a KKT point, so do not stop on it.
+                #
+                # The floor is the opposite case and stays valid: lambda == 0 with
+                # L0 inside the band is complementary slackness, i.e. the sparsity
+                # constraint is simply inactive. Only the ceiling is disqualifying.
+                ceiling = self.config.lambda_l0_max
+                if ceiling > 0 and all(l >= ceiling * (1.0 - 1e-6) for l in recent):
+                    lambda_converged = False
+                    if not self._lambda_ceiling_warned:
+                        self._lambda_ceiling_warned = True
+                        print(f"  [AL] lambda pinned at lambda_l0_max={ceiling:.3e} "
+                              f"for {len(recent)} windows: treating as saturated, not "
+                              f"converged. Raise lambda_l0_max if L0 is still above "
+                              f"target.")
 
         if l0_in_target and lambda_converged:
             self._ev_above_floor_count += 1
@@ -1097,9 +1123,17 @@ class SAEEventControlScheduler:
             pin_note = ("PIN EV-ready" if pin_ev_ready
                         else f"PIN timeout after {pin_elapsed} steps")
             self.should_stop = True
+            # Report the band the gate actually enforces. l0_in_target above uses
+            # al_slingshot_overshoot_rel for the lower bound and target_l0 itself
+            # for the upper bound -- it is one-sided (sparse side only), not a
+            # +/- tolerance, and it is NOT l0_tolerance. Quoting l0_tolerance here
+            # told operators to tune a knob that does not affect stopping.
+            _lo = self.config.target_l0 * (1.0 - self.config.al_slingshot_overshoot_rel)
             self.stop_reason = (
-                f"AL converged: L0 {l0_mean:.1f} in target +/-{self.config.l0_tolerance*100:.0f}% of "
-                f"{self.config.target_l0}, lambda plateaued at {self.lambda_l0:.3e} "
+                f"AL converged: L0 {l0_mean:.1f} within [{_lo:.1f}, "
+                f"{self.config.target_l0:.1f}] "
+                f"(-{self.config.al_slingshot_overshoot_rel*100:.0f}% of target, sparse side "
+                f"only), lambda plateaued at {self.lambda_l0:.3e} "
                 f"({self.config.ev_stop_patience} windows of stability); {pin_note}. "
                 f"Final EV={ev:.3f}."
             )
