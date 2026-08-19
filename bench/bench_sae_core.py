@@ -123,7 +123,11 @@ def run(args):
                 # Ref-agnostic: use the sparse helper when the checkout has it,
                 # otherwise reproduce the dense formulation so the same benchmark
                 # runs against main and against the optimisation branch.
-                if hasattr(T, "_dead_feature_aux_recon") and not args.force_dense_aux:
+                # Dense by default because that is what the trainer ships. The
+                # sparse helper stays importable and is opt-in via --sparse-aux,
+                # so its presence in the module does not silently change what
+                # this harness measures.
+                if args.sparse_aux and hasattr(T, "_dead_feature_aux_recon"):
                     x_aux = T._dead_feature_aux_recon(
                         pre, dead_indices, eff_k, sae.W_dec.weight)
                 else:
@@ -219,7 +223,9 @@ def run(args):
         "sparse_decode_calls": getattr(sae, "_sparse_decode_calls", 0),
         "sparse_decode_fallbacks": getattr(sae, "_sparse_decode_fallbacks", 0),
         # Marks which checkout produced the row, so A/B results are self-labelling.
-        "has_sparse_aux": hasattr(T, "_dead_feature_aux_recon"),
+        # What this row actually ran, not merely what the module exports.
+        "aux_path": "sparse" if (args.sparse_aux
+                                 and hasattr(T, "_dead_feature_aux_recon")) else "dense",
     }
     if not args.skip_clone:
         result.update(measure_state_clone(sae))
@@ -246,8 +252,10 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
-    p.add_argument("--force-dense-aux", action="store_true",
-                   help="use the dense aux formulation even when the sparse helper exists")
+    p.add_argument("--sparse-aux", action="store_true",
+                   help="use the sparse embedding_bag aux helper instead of the "
+                        "dense formulation the trainer ships (measured ~21% slower "
+                        "on H100; see the comment at the aux call site)")
     p.add_argument("--skip-clone", action="store_true",
                    help="skip the state-dict snapshot cost measurement")
     main_args = p.parse_args()
