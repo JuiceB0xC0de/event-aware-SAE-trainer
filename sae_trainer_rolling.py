@@ -1860,8 +1860,15 @@ class _ActivationDoubleBuffer:
 
     def next_batch(self):
         """Return a GPU-ready activation batch, then start transferring the next one."""
+        import torch
         self._ready_event.wait()                           # ensure H2D is done
         gpu = self._next_gpu
+        # The batch was allocated on the transfer stream but is consumed on the
+        # default stream. Without this the caching allocator may hand the block
+        # back out to a later transfer while the compute stream still has queued
+        # kernels reading it -- silent activation corruption, not a crash.
+        # record_stream tells the allocator to also wait on the consuming stream.
+        gpu.record_stream(torch.cuda.current_stream())
         # Kick off the next transfer immediately so it overlaps with the upcoming
         # optimizer/compute work on the default stream.
         self._prefetch()
