@@ -769,7 +769,13 @@ def _ensure_sae_classes():
             # Zero-value bridge: value is unchanged, but gives the gate tensor a
             # grad_fn linked to log_threshold so its hook captures grad_gate.
             bridge = (threshold - threshold.detach()).view(1, -1) * 0.0
-            gate = gate_hard + bridge
+            # In-place. `gate_hard + bridge` broadcasts a [1, F] row of zeros into
+            # a second full [B, F] tensor purely to carry the grad_fn -- 4.5 GiB at
+            # B=32768, F=73728. add_ writes into gate_hard's existing storage for
+            # identical values and an identical graph node. Safe because gate_hard
+            # is freshly built from a comparison and carries no autograd history of
+            # its own, so nothing can depend on its pre-mutation value.
+            gate = gate_hard.add_(bridge)
             # feat_acts uses the bridge gate so log_threshold participates in the
             # graph and the parameter hook fires. The gate hook will receive the
             # combined gradient (pre * grad_feat + grad_gate) when both paths are
