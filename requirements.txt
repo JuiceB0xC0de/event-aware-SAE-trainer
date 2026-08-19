@@ -1,0 +1,26 @@
+# Core PyTorch stack (CUDA 12.4). Install with:
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124
+torch>=2.6.0,<2.8.0
+torchvision>=0.21.0,<0.23.0
+torchaudio>=2.6.0,<2.8.0
+
+# Gemma-4 and Qwen3 require transformers 5.x.
+transformers>=5.0.0
+accelerate>=1.6.0
+datasets>=3.0.0
+numpy>=1.26.0,<3.0.0
+tqdm>=4.65.0
+
+# Tokenizer backends (Gemma-4 E2B/E4B, Qwen3, etc.)
+sentencepiece>=0.2.0
+protobuf>=3.20.0
+
+# Hub upload + faster downloads
+huggingface_hub>=0.30.0
+hf_transfer>=0.1.9
+
+# Optional: metrics logging (training runs fine without it; gated on WANDB_API_KEY)
+wandb>=0.19.0
+
+# Fast JSON for census/metadata I/O (dropped during the zarr migration, needed again)
+orjson>=3.10

@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-aware-sae-trainer"
+version = "0.8.0"
+description = "Self-tuning sparse autoencoder trainer for language model interpretability research"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Rick", email = "rick@example.com" }
+]
+keywords = [
+    "sparse-autoencoder",
+    "interpretability",
+    "language-models",
+    "pytorch",
+    "huggingface",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Coherent PyTorch stack. Install from https://download.pytorch.org/whl/cu124
+    # on CUDA pods, or from the default index on CPU/MPS Macs. These versions
+    # are ABI-matched and support Gemma-4 (multimodal) and Qwen3/Qwen3.5 models.
+    "torch>=2.6.0,<2.8.0",
+    "torchvision>=0.21.0,<0.23.0",
+    "torchaudio>=2.6.0,<2.8.0",
+    # Gemma-4 and Qwen3 require transformers 5.x. Pin lower bound to the first
+    # release that includes both model families.
+    "transformers>=5.0.0",
+    "accelerate>=1.6.0",
+    "datasets>=3.0.0",
+    # numpy 2.x is fine with recent torch; numpy 3.x is not.
+    "numpy>=1.26.0,<3.0.0",
+    "tqdm>=4.65.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=3.20.0",
+    "huggingface_hub>=0.30.0",
+    "hf_transfer>=0.1.9",
+    "wandb>=0.19.0",
+    # Fast JSON for census/metadata I/O (dropped during the zarr migration, needed again).
+    "orjson>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+sae-train = "sae_trainer_rolling:main"
+
+[project.urls]
+Homepage = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
+Repository = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
+
+[tool.setuptools]
+py-modules = ["sae_trainer_rolling", "sae_scheduler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: marks tests as requiring CUDA GPU",
+    "slow: marks tests as slow (may require network/model download)",
+]

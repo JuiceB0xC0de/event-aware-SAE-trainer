@@ -1,0 +1,38 @@
+# Trained SAE weights / checkpoints
+*.npz
+*.pt
+*.safetensors
+checkpoint*.pt
+
+# Data, activations, corpora
+*.jsonl
+*.parquet
+rollcache/
+atlas_download/
+data/
+
+# Run outputs & local tooling state
+# (NOTE: do not re-add a global "*.json" here -- it silently swallows
+#  config files. Ignore generated JSON by location instead.)
+artifacts/
+.claude/
+**/live_tune.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+.env
+*.token
+notebooks/train_deepseek_1.5b_sae.ipynb

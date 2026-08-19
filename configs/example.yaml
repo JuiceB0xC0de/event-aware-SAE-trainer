@@ -1,0 +1,91 @@
+# Example SAE atlas config -- copy this to add a model.
+#
+#   cp configs/example.yaml configs/my-model.yaml
+#   python run_atlas.py --model my-model
+#
+# Every field here is optional except model_id, and every field can be
+# overridden on the command line (CLI > config > trainer default):
+#
+#   python run_atlas.py --model my-model --target-l0 100 --max-steps 8000
+#
+# You can also skip configs entirely and drive it with flags:
+#
+#   python run_atlas.py --config configs/example.yaml --model-id Qwen/Qwen3-8B
+#
+# The defaults below are the values used for the verified small-model runs
+# and are a reasonable starting point for any Llama-style decoder.
+
+# HF model id. The only required field.
+model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+
+# Where trained SAEs are uploaded. Leave null and set SAE_HUB_ID=org/name
+# (or SAE_HUB_ORG=org to derive it) in the environment instead -- upload
+# targets are never guessed for you.
+hf_sae_repo: null
+
+# W&B project. null -> "<model_slug>-sae".
+wandb_project: null
+
+architecture:
+  # null -> read from the model's own AutoConfig.num_hidden_layers, which
+  # is what lets one config cover a whole model family. Pin it only if
+  # auto-detection fails.
+  n_layers: null
+  # null -> auto-detected by the trainer. Informational only.
+  d_in: null
+
+defaults:
+  # Capture backend. This is the field that actually varies between models:
+  #   auto             any AutoModelForCausalLM. Slowest, always works.
+  #   rolling-hf       Llama-style decoders (SmolLM2, Qwen3, MiniCPM5,
+  #                    Llama, Mistral...). Big speedup. Start here.
+  #   rolling-hf-float same, but keeps only 1-2 blocks in GPU memory --
+  #                    use when VRAM is tight.
+  #   rolling          Gemma-3n/4 only (see gemma4.yaml). Not interchangeable
+  #                    with rolling-hf.
+  capture: rolling-hf
+
+  # SAE dictionary size = expansion * d_in.
+  expansion: 32
+
+  # Activation batches cached per layer. Drives disk usage, which scales
+  # with d_in: 500 batches measured ~74GB at d_in=1024, ~111GB at d_in=1536.
+  # Size SAE_SCRATCH_DIR before starting a pod.
+  pool_batches: 500
+
+  # Training steps per layer.
+  max_steps: 5000
+
+  # Target sparsity. The scheduler converges L0 here on its own; there is
+  # no per-layer hyperparameter retuning.
+  target_l0: 50
+
+  # Gradient accumulation. Lower this to cut VRAM (e.g. 8192 for ~4x less).
+  microbatch_tokens: 32768
+
+  # Rolling modes only: how many previous layers' pools stay on disk as
+  # rollback insulation (default 3). Retraining L-k needs pool[L-k] present;
+  # anything deeper re-enters via the hooked bootstrap (one full capture
+  # pass). Each pool costs its full disk size -- set 1 on disk-tight pods.
+  # Ignored under `auto` capture.
+  pool_retention: 3
+
+# Extra environment variables, applied with setdefault before training.
+env:
+  # Step-level timing output every N steps.
+  SAE_TIMING: "1"
+
+# Free text. Printed as a banner at startup -- a good place to record
+# model-specific gotchas, measured throughput, or disk requirements.
+notes: |
+  Llama-style decoder, so the rolling-hf fast path applies as written.
+
+  SmolLM2-135M is the verified pipeline baseline (EV 0.949) and the
+  cheapest full atlas -- use it to smoke-test before committing a big pod.
+
+# Optional. Merged into the run_summary.json uploaded alongside the
+# weights, so caveats travel with the released artifact.
+caveats: {}
+  # corpus_note: >
+  #   English-only probe corpus on a bilingual model
+  #   (stated caveat, not a defect)
