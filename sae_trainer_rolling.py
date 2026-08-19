@@ -2408,8 +2408,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # Ceiling of 1.0% never fires on layers that behave (0-12 here peaked at 0.58%),
     # so this is inert on healthy runs.
     dead_stop_pct = 1.0
-    dead_rollback_slots = 4
-    dead_state_buf = []  # list of dicts: step / dead / ev / l0 / state (CPU tensors)
+    # Single-slot rollback buffer: holds the most recent log window whose dead_pct
+    # was at or under dead_stop_pct, with its CPU state dict reused in place.
+    # _pick_dead_rollback returns the newest under-ceiling entry, so nothing older
+    # is ever selectable and extra slots only cost host RAM.
+    dead_state_buf = []  # 0 or 1 dict: step / dead / ev / l0 / state (CPU tensors)
     ev_decline_margin = 0.035
     ev_decline_floor = 0.95
     ev_decline_patience = 8
@@ -2883,12 +2886,30 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # the newest buffered state still under it and stop there. Runs before
             # anything downstream reads dead/ev/l0_val, so the printed line, the W&B
             # row, meta.json and sae.pt all describe the SAME weights.
-            dead_state_buf.append({
-                "step": step, "dead": dead, "ev": ev, "l0": l0_val,
-                "state": {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()},
-            })
-            if len(dead_state_buf) > dead_rollback_slots:
-                dead_state_buf.pop(0)
+            # Only windows at or under the ceiling are ever selectable:
+            # _pick_dead_rollback scans newest-first and returns the first entry
+            # with dead <= ceiling, so an over-ceiling entry is never the answer,
+            # and any entry older than the newest under-ceiling one is unreachable.
+            # Keeping a single under-ceiling snapshot is therefore identical in
+            # behaviour to keeping four mixed ones, at a quarter of the host RAM
+            # (a full state dict is ~1.36 GB at EXPANSION=32 on a 2304-dim model),
+            # and it is strictly more robust: over-ceiling windows can no longer
+            # evict the fallback.
+            if dead is not None and dead <= dead_stop_pct:
+                if dead_state_buf:
+                    # Reuse the existing pinned-free CPU storage instead of
+                    # allocating a fresh ~1.36 GB dict every log window.
+                    _slot = dead_state_buf[0]
+                    with torch.no_grad():
+                        for _k, _v in sae.state_dict().items():
+                            _slot["state"][_k].copy_(_v.detach())
+                    _slot.update(step=step, dead=dead, ev=ev, l0=l0_val)
+                else:
+                    dead_state_buf.append({
+                        "step": step, "dead": dead, "ev": ev, "l0": l0_val,
+                        "state": {k: v.detach().cpu().clone()
+                                  for k, v in sae.state_dict().items()},
+                    })
             if dead > dead_stop_pct:
                 _pick = _pick_dead_rollback(dead_state_buf, dead_stop_pct)
                 if _pick is not None:
@@ -2912,8 +2933,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                           f"{dead_stop_pct:.2f}% ceiling and no buffered window is under it; "
                           f"stopping without rollback")
                     scheduler.stop_reason = (
-                        f"dead-feature ceiling: breached {dead_stop_pct:.2f}% with no clean "
-                        f"state in the last {len(dead_state_buf)} windows")
+                        f"dead-feature ceiling: breached {dead_stop_pct:.2f}% and no log "
+                        f"window has been observed at or under it, so there is no clean "
+                        f"state to roll back to")
                 scheduler.should_stop = True
         else:
             dead = None; ev = None; ev_perdim = None; qo = None
@@ -3034,6 +3056,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # persisting whatever state happened to coincide with a lucky measurement.
             if ev_s > best_ev:
                 best_ev = ev_s; best_ev_step = step; best_ev_l0 = l0_val
+                # Deliberately a fresh clone, NOT reused storage. The persist path
+                # below hands this dict to a background daemon thread for
+                # torch.save, so copying into it in place would let a later EV
+                # improvement mutate tensors mid-serialisation and write a torn
+                # checkpoint. The dead-rollback buffer can reuse its slot because
+                # it is only ever read synchronously by load_state_dict.
                 best_state_in_memory = {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()}
                 best_state_pending = True
             elif best_state_pending and ev_s < best_ev - best_ev_persist_margin:
