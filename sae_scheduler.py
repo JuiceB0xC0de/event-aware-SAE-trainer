@@ -239,7 +239,14 @@ class SAEAECSConfig:
     # authoritative for stopping until FINETUNE is implemented.
     pin_l0_band_abs: float = 0.5        # |L0 - target| <= this -> DESCENT enters PIN
     pin_l0_release_frac: float = 0.25   # |L0 - target| > this*target while PINned -> back to DESCENT
-    pin_timeout_steps: int = 2000       # max steps in PIN before bailing back to DESCENT
+    # Steps in PIN after which PIN is considered to have had its chance.
+    # NOTE: this does NOT return the phase to DESCENT. _maybe_update_phase logs
+    # "PIN would timeout ... [observe-only: no return to DESCENT yet]" and takes
+    # no action -- the bail is staged but unwired. The knob's only live effect is
+    # in _check_early_stop, where a timed-out PIN satisfies the stop gate that
+    # otherwise waits for PIN EV-readiness. So raising it does not give PIN more
+    # time before bailing; it delays the run's stop.
+    pin_timeout_steps: int = 2000
     pin_ev_thresh: float = 0.95         # EV window counts toward PIN success above this
     pin_ev_patience: int = 3            # consecutive good EV windows -> ready for FINETUNE
     # Feature-tail guard. PIN's premise is "sparsity is locked, let EV catch up".
