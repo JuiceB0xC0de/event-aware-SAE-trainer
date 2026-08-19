@@ -2436,6 +2436,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     ev_hist = deque(maxlen=EV_SMOOTH_N)
     ultra_frac = None  # last log window's ultra-active fraction, for the PIN guard
     best_state_in_memory = None; best_state_pending = False
+    # Step of the last event that discontinuously changed the weights: threshold
+    # reset, dead-neuron resample, or dead-ceiling rollback. ev_s is smoothed over
+    # EV_SMOOTH_N log windows, so for that long afterwards the smoothed EV still
+    # reflects the pre-event model while state_dict() is already post-event.
+    # Capturing "best" in that gap persists weights that were never evaluated.
+    last_weight_perturb_step = -(10 ** 9)
+    best_state_cooldown_steps = EV_SMOOTH_N * LOG_EVERY
     best_ev_persist_margin = 0.005
     # Dead-feature ceiling with rollback. Deep layers starve their feature tail the
     # moment PIN freezes the dual: observed MiniCPM5-1B L13 going 0.8% -> 8.8% dead in
@@ -2787,6 +2794,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     print(f"  [RESET @ {step}] theta->{float(_rev.exp()):.4f} "
                           f"(live median) for {n_reset} dead")
                 revival.record_reset(n_reset)
+                if n_reset > 0:
+                    last_weight_perturb_step = step
 
         if buffer_err_this_step:
             if do_timing:
@@ -2822,6 +2831,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         state["exp_avg"][dead_mask] = 0.0; state["exp_avg_sq"][dead_mask] = 0.0
                 revival.clear_silence(dead_mask)
             revival.record_resample(n_dead, n_res)
+            if n_res > 0:
+                last_weight_perturb_step = step
             print(f"  [RESAMPLE @ {step}] reinit {n_res}/{n_dead} dead")
             err_buffer = []
 
@@ -2952,6 +2963,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 _pick = _pick_dead_rollback(dead_state_buf, dead_stop_pct)
                 if _pick is not None:
                     sae.load_state_dict(_pick["state"])
+                    last_weight_perturb_step = step
                     _tag = _c(f"  [DEAD ROLLBACK @ {step}]", "1;95")
                     _bad = _c(f"{dead:.2f}%", "1;91")
                     _pd = _c(f"{_pick['dead']:.2f}%", "1;92")
@@ -3092,7 +3104,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # the best single batch it ever drew. The saved weights lag the true
             # peak by up to half a window; that is the correct trade against
             # persisting whatever state happened to coincide with a lucky measurement.
-            if ev_s > best_ev:
+            # Do not capture a "best" during the smoother's blind spot. ev_s is an
+            # average over EV_SMOOTH_N log windows, so for that long after a
+            # reset / resample / rollback it still describes the pre-event model
+            # while state_dict() is already post-event -- the captured weights
+            # would be a pairing that was never actually evaluated.
+            _in_perturb_cooldown = (
+                step - last_weight_perturb_step < best_state_cooldown_steps)
+            if _in_perturb_cooldown and ev_s > best_ev:
+                print(f"  [BEST HOLD @ {step}] ev_s={ev_s:.4f} > best={best_ev:.4f} but "
+                      f"weights were perturbed at step {last_weight_perturb_step}; "
+                      f"waiting {best_state_cooldown_steps} steps for the EV smoother")
+            if ev_s > best_ev and not _in_perturb_cooldown:
                 best_ev = ev_s; best_ev_step = step; best_ev_l0 = l0_val
                 # Deliberately a fresh clone, NOT reused storage. The persist path
                 # below hands this dict to a background daemon thread for
