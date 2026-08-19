@@ -38,6 +38,31 @@ def _sync():
         torch.cuda.synchronize()
 
 
+def measure_state_clone(sae, reps=3):
+    """Cost of snapshotting the whole SAE to host.
+
+    The dead-feature rollback buffer used to hold four of these and refresh one
+    every log window; it now holds one and reuses its storage. The copy is
+    unpinned, so it blocks. Reported per clone so the buffer-size choice can be
+    priced directly.
+    """
+    sd = sae.state_dict()
+    n_bytes = sum(v.numel() * v.element_size() for v in sd.values())
+    _sync()
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        snapshot = {k: v.detach().cpu().clone() for k, v in sd.items()}
+        del snapshot
+    _sync()
+    per_clone_ms = (time.perf_counter() - t0) / reps * 1000
+    return {
+        "state_clone_gb": round(n_bytes / 1024 ** 3, 3),
+        "state_clone_ms": round(per_clone_ms, 1),
+        "host_ram_legacy_gb": round(n_bytes * 4 / 1024 ** 3, 3),   # 4 rollback slots
+        "host_ram_single_gb": round(n_bytes / 1024 ** 3, 3),       # 1 reused slot
+    }
+
+
 def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
@@ -193,7 +218,11 @@ def run(args):
         "opt_ms_per_step": round(agg["opt_ms"] / args.steps, 2),
         "sparse_decode_calls": getattr(sae, "_sparse_decode_calls", 0),
         "sparse_decode_fallbacks": getattr(sae, "_sparse_decode_fallbacks", 0),
+        # Marks which checkout produced the row, so A/B results are self-labelling.
+        "has_sparse_aux": hasattr(T, "_dead_feature_aux_recon"),
     }
+    if not args.skip_clone:
+        result.update(measure_state_clone(sae))
 
     print(json.dumps(result, indent=2))
     if args.json:
@@ -217,6 +246,8 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
+    p.add_argument("--skip-clone", action="store_true",
+                   help="skip the state-dict snapshot cost measurement")
     main_args = p.parse_args()
     run(main_args)
 
