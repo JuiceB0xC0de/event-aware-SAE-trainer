@@ -246,6 +246,11 @@ def _dead_feature_aux_recon(pre, dead_indices, eff_k, w_dec_weight):
 
     `per_sample_weights` must match the weight dtype, which is not automatic
     under bf16 autocast, hence the explicit cast.
+
+    Requires torch >= 2.6 when the decoder is detached: earlier versions
+    internal-assert in embedding_bag if per_sample_weights requires grad and the
+    weight does not. requirements.txt pins torch >= 2.6, and in training the
+    decoder is a live parameter, so neither condition arises.
     """
     import torch
 

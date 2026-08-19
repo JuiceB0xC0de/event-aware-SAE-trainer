@@ -123,7 +123,7 @@ def run(args):
                 # Ref-agnostic: use the sparse helper when the checkout has it,
                 # otherwise reproduce the dense formulation so the same benchmark
                 # runs against main and against the optimisation branch.
-                if hasattr(T, "_dead_feature_aux_recon"):
+                if hasattr(T, "_dead_feature_aux_recon") and not args.force_dense_aux:
                     x_aux = T._dead_feature_aux_recon(
                         pre, dead_indices, eff_k, sae.W_dec.weight)
                 else:
@@ -246,6 +246,8 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None)
+    p.add_argument("--force-dense-aux", action="store_true",
+                   help="use the dense aux formulation even when the sparse helper exists")
     p.add_argument("--skip-clone", action="store_true",
                    help="skip the state-dict snapshot cost measurement")
     main_args = p.parse_args()

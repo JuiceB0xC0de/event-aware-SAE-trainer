@@ -70,10 +70,19 @@ def test_gradients_match_dense():
 
 
 def test_gradient_reaches_only_dead_features():
-    """Live features must receive no gradient from the aux term."""
+    """Live features must receive no gradient from the aux term.
+
+    w_dec requires grad here because that is how the trainer calls it -- it is a
+    live parameter. It also matters mechanically: on torch < 2.6, embedding_bag
+    internal-asserts when per_sample_weights requires grad and the weight does
+    not (isDifferentiableType INTERNAL ASSERT FAILED). requirements.txt pins
+    torch >= 2.6, so the trainer never hits that, but do not call this helper
+    with a detached decoder on an older runtime.
+    """
     pre, w_dec, dead_indices, eff_k = _setup()
     pre_b = pre.clone().requires_grad_(True)
-    T._dead_feature_aux_recon(pre_b, dead_indices, eff_k, w_dec).pow(2).sum().backward()
+    w_b = w_dec.clone().requires_grad_(True)
+    T._dead_feature_aux_recon(pre_b, dead_indices, eff_k, w_b).pow(2).sum().backward()
 
     live = torch.ones(N_FEATURES, dtype=torch.bool)
     live[dead_indices] = False
