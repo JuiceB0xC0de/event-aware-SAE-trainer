@@ -1,0 +1,341 @@
+│ Event-Aware SAE Trainer — VRAM, Convergence, and Throughput Optimization           │
+│                                                                                    │
+│ Context                                                                            │
+│                                                                                    │
+│ Rick wants the trainer to be the fastest, leanest SAE trainer available: minimum   │
+│ VRAM, fastest convergence, highest weight quality, well-tuned Lagrangian control,  │
+│ correct nudges, a kill-run that fires at the smartest moment, and dead features    │
+│ kept low.                                                                          │
+│                                                                                    │
+│ Two inputs shaped this plan. First, an ultra review on ultra-audit produced ten    │
+│ verified findings, seven of them in the stopping path. Second, a direct read of    │
+│ sae_trainer_rolling.py (3,752 lines) and sae_scheduler.py (1,597 lines) turned     │
+│ up several things the review did not look for, because the review was scoped to    │
+│ correctness rather than performance.                                               │
+│                                                                                    │
+│ The most important finding reframes the VRAM question. Rick's premise is that      │
+│ VRAM is dominated by keeping only 2 LLM layers resident. That is true during       │
+│ activation capture, but during SAE training the LLM is not resident at all.        │
+│ There, VRAM is dominated by [B, F] intermediates: at the default                   │
+│ BATCH_TOKENS=32768 and EXPANSION=32 (F = 73,728 on a 2304-dim model), a single     │
+│ [B, F] bf16 tensor is 4.8 GB, and the live path holds three of them in             │
+│ forward plus roughly four more transients in backward. That is where the headroom  │
+│ is, and it is a much bigger lever than the layer window.                           │
+│                                                                                    │
+│ Second-most important: _JumpReLUWithGate, a custom autograd Function with an       │
+│ explicit fused backward, exists in the file and is never called. The live path     │
+│ is the hook-based _jumprelu_forward, which allocates a full [B, F] tensor          │
+│ purely to attach a grad_fn.                                                        │
+│                                                                                    │
+│ This plan is ordered by (impact x confidence) / risk, and it is measurement-first. │
+│ That ordering is not a stylistic preference: the atlasing census speedup was found │
+│ by telemetry showing the GPU at 0% util starved by CPU-side work, not by reading   │
+│ code. The same discipline applies here.                                            │
+│                                                                                    │
+│ Ground rules                                                                       │
+│                                                                                    │
+│ - All work on a new branch off main. Do not touch ultra-audit or audit-base        │
+│   (review scaffolding). Note main is currently ahead of origin by 2 doc commits.   │
+│ - Every performance claim needs a before/after number from the same GPU, same      │
+│   config, same seed. No claim ships on reasoning alone.                            │
+│ - Correctness fixes and performance changes land in separate commits so a          │
+│   regression can be bisected to one or the other.                                  │
+│ - Do not change control-policy behavior (Lagrangian gains, stop thresholds)        │
+│   without an explicit sign-off — those change what the SAE is, not just how        │
+│   fast it trains.                                                                  │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Phase 0 — Instrument before optimizing                                             │
+│                                                                                    │
+│ Nothing else in this plan is trustworthy without this. Cheap, no policy change.    │
+│                                                                                    │
+│ Files: sae_trainer_rolling.py (the timing dict already exists around               │
+│ line 2360 and is wired to W&B).                                                    │
+│                                                                                    │
+│ 1. Add per-phase VRAM telemetry alongside the existing timing counters:            │
+│    torch.cuda.max_memory_allocated() and max_memory_reserved() sampled at          │
+│    forward end, backward end, and optimizer end, reset each log window. The gap    │
+│    between allocated and reserved is reclaimable fragmentation; the gap between    │
+│    reserved and NVML is everything else.                                           │
+│ 2. Log the existing _sparse_decode_calls / _sparse_decode_fallbacks counters       │
+│    (they are already maintained in decode, ~line 830, but never surfaced). A       │
+│    high fallback rate means the gather overhead is being paid for nothing — this   │
+│    directly answers the open "sparse-decode default unbenchmarked" question.       │
+│ 3. Record a baseline at two configs: default (microbatch=32768, accum 1) and       │
+│    --microbatch-tokens 8192 (accum 4). Capture peak VRAM, tok/s, and the           │
+│    existing t_fwd_bwd / t_cpu_post split.                                          │
+│                                                                                    │
+│ Verification: baseline table committed to the branch before any optimization.      │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Phase 1 — Correctness fixes that gate everything else                              │
+│                                                                                    │
+│ These change what the numbers mean, so they land before any tuning.                │
+│                                                                                    │
+│ 1a. Cross-stream allocator hazard in the activation double buffer                  │
+│                                                                                    │
+│ File: sae_trainer_rolling.py, _ActivationDoubleBuffer.next_batch (~1866)           │
+│                                                                                    │
+│ The batch is allocated on self._transfer_stream and consumed on the default        │
+│ stream. There is no record_stream call anywhere in the repo (verified by           │
+│ grep). When the training loop drops its reference, the allocator may return that   │
+│ block to the transfer stream's pool while the default stream still has queued      │
+│ kernels reading it. That is silent activation corruption, and it would present as  │
+│ unexplained run-to-run quality variance rather than a crash.                       │
+│                                                                                    │
+│ Fix: call gpu.record_stream(torch.cuda.current_stream()) before returning.         │
+│ One line. Highest severity-to-effort ratio in the plan.                            │
+│                                                                                    │
+│ 1b. Early-stop EV is computed on the training batch                                │
+│                                                                                    │
+│ File: sae_trainer_rolling.py, ~2827-2839; consumed at ~2899                        │
+│                                                                                    │
+│ total_var comes from full_batch and recon_val is the loss from the step just       │
+│ optimized on that same batch. ev_perdim probes acts_mb, also training data.        │
+│ This EV reaches scheduler.step and drives pin_ev_count, which gates                │
+│ termination through pin_ev_patience — so an optimistically biased EV stops runs    │
+│ early on flattering numbers.                                                       │
+│                                                                                    │
+│ Fix: hold out a fixed slice of activations the optimizer never consumes; compute   │
+│ the control EV there. Keep the training-batch EV for logging under a distinct      │
+│ name. Assert held-out indices never enter a training microbatch.                   │
+│                                                                                    │
+│ (Note: the ultra review cited line 3260 for this. That is a config block. The      │
+│ real site is 2830-2831.)                                                           │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Phase 2 — VRAM (the big lever)                                                     │
+│                                                                                    │
+│ 2a. Wire up the dead fused JumpReLU Function                                       │
+│                                                                                    │
+│ File: sae_trainer_rolling.py; _JumpReLUWithGate (597-640) is defined and           │
+│ never used. jumprelu_with_gate (808) routes to _jumprelu_forward (752).            │
+│                                                                                    │
+│ The live path builds:                                                              │
+│                                                                                    │
+│ gate_hard = (pre > threshold).to(pre.dtype)          # [B, F]                      │
+│ bridge    = (threshold - threshold.detach()).view(1, -1) * 0.0                     │
+│ gate      = gate_hard + bridge                        # [B, F]  <- broadcast alloc │
+│ feat_acts = pre * gate                                # [B, F]                     │
+│                                                                                    │
+│ bridge is a [1, F] zero tensor whose only job is to give gate a grad_fn so         │
+│ the registered hooks fire. Broadcasting it costs a full [B, F] allocation —        │
+│ 4.8 GB at default config — for graph plumbing. It also relies on mutable instance  │
+│ state (self._saved_pre, _saved_grad_feat, _saved_grad_gate), which is              │
+│ fragile under gradient accumulation.                                               │
+│                                                                                    │
+│ _JumpReLUWithGate already does this with explicit save_for_backward and no         │
+│ hooks. Switch jumprelu_with_gate to it.                                            │
+│                                                                                    │
+│ Risk: tests/test_sae_model.py::test_fused_jumprelu_matches_separate currently      │
+│ exercises the hook path, so it validates the thing being replaced, not the         │
+│ replacement. Extend it to assert both paths agree on feat, gate, grad_pre,         │
+│ and grad_log_threshold before switching the default. Keep the hook path behind     │
+│ a flag for one release so a regression can be A/B'd.                               │
+│                                                                                    │
+│ 2b. Recompute gate in backward instead of holding it                               │
+│                                                                                    │
+│ _JumpReLUWithGate.forward does ctx.save_for_backward(pre, threshold, gate).        │
+│ gate is exactly pre > threshold and is trivially recomputed. Dropping it from      │
+│ the saved set frees a [B, F] tensor for the whole forward-to-backward window.      │
+│                                                                                    │
+│ 2c. Chunk the STE threshold reduction over the batch                               │
+│                                                                                    │
+│ Both the hook path (_log_threshold_hook, 719-751) and the Function's backward      │
+│ materialize several [B, F] transients to produce a [F] result:                     │
+│                                                                                    │
+│ in_band = (pre - threshold).abs() < eps      # 3 intermediates                     │
+│ masked  = torch.where(in_band, combined, 0.0)                                      │
+│ grad_threshold = -(masked.sum(dim=sum_dims) / (2 * eps))                           │
+│                                                                                    │
+│ The output is [F]. Chunk over the batch dimension and accumulate, bounding peak    │
+│ memory to chunk x F. Reuse the pattern already proven in this file —               │
+│ _SparseDecode.backward (549-570) chunks exactly this way with                      │
+│ SAE_SPARSE_DECODE_CHUNK. Also do combined.masked_fill_(~in_band, 0.0) in place     │
+│ rather than allocating masked, and order the backward so grad_feat is reused       │
+│ in place for grad_pre after combined is computed.                                  │
+│                                                                                    │
+│ 2d. Stop cloning the whole SAE every log step                                      │
+│                                                                                    │
+│ File: sae_trainer_rolling.py, ~2858-2862 (dead_state_buf) and ~3009                │
+│ (best_state_in_memory)                                                             │
+│                                                                                    │
+│ Both do {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()}. At     │
+│ EXPANSION=32 on a 2304-dim model the SAE is ~340 M params — ~1.36 GB per           │
+│ clone in fp32. dead_rollback_slots = 4 means ~5.4 GB of host RAM for rollback      │
+│ alone, plus another 1.36 GB for best-state, plus an unpinned (therefore blocking)  │
+│ D2H copy of that size every LOG_EVERY = 250 steps.                                 │
+│                                                                                    │
+│ Three fixes, in order of value:                                                    │
+│                                                                                    │
+│ 1. Only buffer when rollback is plausible. dead_stop_pct = 1.0; if dead is         │
+│    far below the ceiling no rollback will ever select that entry. Gate the clone   │
+│    on dead > dead_stop_pct * threshold_fraction. In a healthy run this             │
+│    eliminates nearly all clones.                                                   │
+│ 2. Preallocate pinned host buffers once and copy into them with                    │
+│    non_blocking=True, instead of allocating 1.36 GB per log step.                  │
+│ 3. Store bf16 in the rollback buffer. It is a fallback checkpoint, not the         │
+│    final artifact.                                                                 │
+│                                                                                    │
+│ 2e. Make the aux (dead-feature) loss sparse                                        │
+│                                                                                    │
+│ File: sae_trainer_rolling.py, ~2595-2605                                           │
+│                                                                                    │
+│ pre_dead   = pre[:, dead_indices].relu()          # [B, n_dead]                    │
+│ topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)                                 │
+│ aux_acts   = torch.zeros_like(pre_dead)           # [B, n_dead]                    │
+│ aux_acts.scatter_(-1, topk_idx, topk_vals)                                         │
+│ W_dec_dead = sae.W_dec.weight.t()[dead_indices]   # [n_dead, d] gather, per microbatch                                                                         │
+│ x_aux      = aux_acts @ W_dec_dead                                                 │
+│                                                                                    │
+│ The aux loss is top-k sparse by construction (AUX_K = 128), but is computed        │
+│ densely over all n_dead features. With thousands of dead features this             │
+│ allocates three [B, n_dead] tensors and re-gathers the decoder weight every        │
+│ microbatch.                                                                        │
+│                                                                                    │
+│ Replace with an embedding_bag gather-sum over dead_indices[topk_idx] and           │
+│ topk_vals — the same primitive _SparseDecode.forward (536-547) already uses.       │
+│ That eliminates aux_acts, the dense matmul, and the W_dec_dead gather. Add         │
+│ .relu_() in place on the gathered pre_dead.                                        │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Phase 3 — Throughput                                                               │
+│                                                                                    │
+│ 3a. Remove per-microbatch CUDA syncs                                               │
+│                                                                                    │
+│ File: ~2578, ~2616-2617                                                            │
+│                                                                                    │
+│ - active_max = int(gate_counts.max().item()) (2578) is a hard sync between         │
+│   encode and decode, stalling mid-forward. Only used when SAE_SPARSE_DECODE=1      │
+│   (default off). Phase 0's fallback-rate telemetry decides whether sparse decode   │
+│   earns its place at all; if it does, consider a bounded-estimate scheme with a    │
+│   correctness fallback rather than a per-microbatch sync.                          │
+│ - accum_recon_loss += recon_loss.item() and accum_l0 += l0_mb.item()               │
+│   (2616-2617) sync per microbatch, but the only consumer (current_step_l0 for      │
+│   wenc_dampen_factor) runs after the accumulation loop. Accumulate into GPU        │
+│   scalars and do one .item() on a stacked 2-element tensor after the loop:         │
+│   2 syncs per step instead of 2 x accum_steps.                                     │
+│                                                                                    │
+│ 3b. Replace the sparse-decode weight-gradient Python loop                          │
+│                                                                                    │
+│ File: _SparseDecode.backward (549-570)                                             │
+│                                                                                    │
+│ grad_w_t = torch.zeros_like(weight.t())        # [F, d] alloc every backward       │
+│ for s in range(0, B, step):                                                        │
+│     contrib = go[s:e].unsqueeze(1) * val[s:e].unsqueeze(2)                         │
+│     grad_w_t.index_add_(0, idx[s:e].reshape(-1), ...)                              │
+│                                                                                    │
+│ At EXPANSION=32 the zeros_like is a ~1 GB allocation on every backward, and        │
+│ the Python loop launches several kernels per chunk.                                │
+│                                                                                    │
+│ The whole loop is one sparse-dense matmul: build a [F, B] sparse COO matrix with   │
+│ val at (idx, token) and compute S @ go. Single fused kernel, no Python loop,       │
+│ no chunk tuning. Benchmark against the current loop before adopting — and cache    │
+│ the grad_w_t buffer across calls either way.                                       │
+│                                                                                    │
+│ 3c. Halve PCIe traffic in the layer window                                         │
+│                                                                                    │
+│ File: FloatingLayerWindow (1321-1405)                                              │
+│                                                                                    │
+│ deactivate() does self.decoder_layers[layer].to("cpu") — a D2H copy of             │
+│ weights that never changed. The LLM is frozen during capture, so the CPU copy is   │
+│ already authoritative. Each layer visit pays H2D and D2H when only H2D is needed.  │
+│                                                                                    │
+│ - Keep a persistent (pinned) CPU master copy; on deactivate, release the GPU       │
+│   copy without copying back.                                                       │
+│ - Pin the master so to(device, non_blocking=True) can actually overlap.            │
+│ - Prefetch layer n+1 on a side stream while layer n computes, rather than the      │
+│   current serial deactivate-then-activate in set_active (1381-1389).               │
+│                                                                                    │
+│ This is the one place Rick's "2 layers resident" framing does apply, and the win   │
+│ is transfer cost, not residency.                                                   │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Phase 4 — Stopping policy and Lagrangian control                                   │
+│                                                                                    │
+│ These are the verified ultra-review findings. Full detail, with per-item           │
+│ instructions and verification steps, is already written up in                      │
+│ /Users/chiggy/sae-trainer-fixlist.md — that file is the execution reference for    │
+│ this phase and should not be duplicated here.                                      │
+│                                                                                    │
+│ Land in this order:                                                                │
+│                                                                                    │
+│ 1. A3 — stop_reason advertises l0_tolerance, the gate enforces                     │
+│    al_slingshot_overshoot_rel (sae_scheduler.py 1058-1064, 1101). Message-only.    │
+│ 2. A10 — _ev_above_floor_count is incremented on AL convergence, not EV            │
+│    (1078). Rename plus a reset-on-transition audit.                                │
+│ 3. A6 — pin_timeout_steps drives both a PIN→DESCENT bail (621) and a run           │
+│    stop (1093). Make precedence explicit rather than emergent from call order.     │
+│ 4. A2 — plateau test is max(recent)/recent[0] - 1.0 (1071-1076), so a              │
+│    monotonically declining lambda reads as converged. Switch to a two-sided        │
+│    dispersion measure, same knob, same window.                                     │
+│ 5. A1 — lambda is clipped to [lambda_l0_min, lambda_l0_max] (761, 1027), so        │
+│    a saturated dual is perfectly flat and reads as converged. Treat saturation as  │
+│    disqualifying and warn naming the bound hit. Depends on item 4 (same block).    │
+│ 6. A8 — best-EV checkpoint can capture weights mid-resample (3007-3010),           │
+│    because ev_s is smoothed while state_dict() is instantaneous. Suppress          │
+│    capture for a cooldown derived from the smoothing window.                       │
+│                                                                                    │
+│ Decisions, not patches — write up options and get sign-off, do not implement:      │
+│                                                                                    │
+│ - A5 / mode exits. _maybe_transition is only called when final_event is            │
+│   truthy (710), and every event string in the codebase is a key in                 │
+│   event_mode_map, so the "BASELINE" default (1213) is unreachable dead code.       │
+│   The only real exit is RECOVERY hitting recovery_max_steps (1201) —               │
+│   EXPLORE and STABILIZE are effectively terminal, and explore_lr_factor            │
+│   keeps distorting the LR for the rest of the run. Note the re-entry guard (1219)  │
+│   covers RECOVERY, STABILIZE and omits EXPLORE.                                    │
+│ - B2 / uncoordinated controllers. The dual (_dual_update, 727) and the             │
+│   direct threshold nudge (compute_threshold_nudge, 868) both drive L0 during       │
+│   DESCENT with nothing coordinating them; they can sum or oppose. PIN freezes      │
+│   both, so the problem is confined to DESCENT.                                     │
+│                                                                                    │
+│ Both bear directly on "is convergence as fast as it can be" and neither should be  │
+│ resolved unilaterally.                                                             │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Phase 5 — Dead features                                                            │
+│                                                                                    │
+│ - B4 — tests/test_revival.py does not cover optimizer-state consistency            │
+│   after resample. Add a test asserting Adam moments are zeroed for revived rows    │
+│   and untouched elsewhere. If it fails, report before fixing.                      │
+│ - Phase 2e changes the aux-loss computation; confirm dead-feature recovery rate    │
+│   is unchanged by it (same seed, same schedule, compare dead% trajectory).         │
+│ - RESAMPLE_STEPS = (K_CURRICULUM_STEPS, 12_000) is a fixed schedule while          │
+│   RevivalController already computes adaptive policies                             │
+│   (_aggressive_k_resample_steps, 302). Worth asking whether the fixed tuple        │
+│   should defer to the adaptive path — flag as a question, not a change.            │
+│                                                                                    │
+│ ---                                                                                │
+│                                                                                    │
+│ Verification                                                                       │
+│                                                                                    │
+│ Per-phase gates. Nothing merges without the matching check.                        │
+│                                                                                    │
+│ 1. Unit — python -m pytest -q green at every commit. Baseline is 16 passing.       │
+│ 2. Numerical equivalence (Phase 2a/2b/2c/2e) — for each changed path, assert       │
+│    old vs new agree on forward output and on gradients w.r.t. pre,                 │
+│    log_threshold, W_enc, and W_dec within tolerance, on a tiny SAE with a          │
+│    fixed seed. These are the changes most likely to silently alter training.       │
+│ 3. VRAM — Phase 0 telemetry, same config before and after. Target: report          │
+│    actual peak-allocated reduction per item, not an estimate.                      │
+│ 4. Throughput — tok/s over a fixed step count, same GPU, same seed, plus the       │
+│    t_fwd_bwd / t_cpu_post split to confirm the win came from where predicted.      │
+│ 5. Quality (the one that matters) — a full single-layer run on a real model,       │
+│    same seed, before and after the whole stack. Compare final EV, final L0, dead%  │
+│    trajectory, and step count to stop. Phase 1b changes when runs stop, so any     │
+│    comparison spanning it must be re-baselined.                                    │
+│ 6. Convergence speed — steps-to-target-L0 and steps-to-EV-plateau, before and      │
+│    after Phase 4. This is the number that answers "converging as fast as it can."  │
+│                                                                                    │
+│ Open question to settle before Phase 0: where do we benchmark? The A100-80GB       │
+│ pod is currently running the Ling atlas, and contending for it would corrupt both  │
+│ sets of numbers. Options are waiting for the atlas to finish, standing up a second │
+│ pod (costs money — needs approval), or running Phases 0-2 correctness and          │
+│ equivalence checks on the Mac and deferring only the throughput numbers to GPU.    │
