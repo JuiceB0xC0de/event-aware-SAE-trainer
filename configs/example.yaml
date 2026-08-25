@@ -73,7 +73,7 @@ defaults:
 # Extra environment variables, applied with setdefault before training.
 env:
   # Step-level timing output every N steps.
-  SAE_TIMING: "1"
+  SAE_TIMING: "250"
 
 # Free text. Printed as a banner at startup -- a good place to record
 # model-specific gotchas, measured throughput, or disk requirements.

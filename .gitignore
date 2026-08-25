@@ -36,3 +36,6 @@ venv/
 .env
 *.token
 notebooks/train_deepseek_1.5b_sae.ipynb
+
+# Planning docs
+│ Event-Aware SAE Trainer*

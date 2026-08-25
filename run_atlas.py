@@ -201,6 +201,8 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--capture", type=str, default=None, choices=CAPTURE_CHOICES)
     ov.add_argument("--expansion", type=int, default=None)
     ov.add_argument("--pool-batches", type=int, default=None)
+    ov.add_argument("--pool-forward-fusion", type=int, default=None,
+                    help="pool-production shards fused per model forward; default 1")
     ov.add_argument("--max-steps", type=int, default=None)
     ov.add_argument("--target-l0", type=int, default=None)
     ov.add_argument("--microbatch-tokens", type=int, default=None)
@@ -252,6 +254,10 @@ def main():
         return fallback if v is None else v
 
     model_id = args.model_id or cfg["model_id"]
+    # Gemma-4 on Transformers 5.5.4 needs the kernel package's compatibility
+    # patch before AutoConfig imports the Gemma configuration module.
+    from gemma_attention import prepare_gemma4_attention
+    prepare_gemma4_attention(model_id)
     push = not args.no_push
     hub_id = args.hf_sae_repo or resolve_hub_id(cfg.get("hf_sae_repo"), model_id, push)
     wandb_project = args.wandb_project or cfg.get("wandb_project") or f"{_slug(model_id)}-sae"
@@ -259,6 +265,9 @@ def main():
     capture = pick(args.capture, "capture", "auto")
     expansion = pick(args.expansion, "expansion", 32)
     pool_batches = pick(args.pool_batches, "pool_batches", 500)
+    pool_forward_fusion = pick(args.pool_forward_fusion, "pool_forward_fusion", 1)
+    if pool_forward_fusion < 1:
+        raise SystemExit("--pool-forward-fusion must be >= 1")
     max_steps = pick(args.max_steps, "max_steps", 5000)
     target_l0 = pick(args.target_l0, "target_l0", None)
     microbatch = pick(args.microbatch_tokens, "microbatch_tokens", None)
@@ -284,7 +293,7 @@ def main():
     os.environ.setdefault("SAE_MICROBATCH_TOKENS", str(microbatch or 32768))
     # The Triton path is dead (measured ~100x slower than PyTorch); keep it off.
     os.environ.setdefault("SAE_USE_TRITON", "0")
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     # hf_transfer is retired; Xet is the current fast-download path.
     # (HF_HUB_ENABLE_HF_TRANSFER is deprecated and now only emits a warning.)
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
@@ -321,12 +330,16 @@ def main():
         print("  Remote code: trusted")
     print(f"  Expansion:   {expansion}x")
     print(f"  Pool batches:{pool_batches}")
+    print(f"  Pool fusion: {pool_forward_fusion}x")
     print(f"  Max steps:   {max_steps}")
     print(f"  Target L0:   {target_l0}")
     print(f"  Microbatch:  {microbatch} tokens")
     print(f"  SAE dir:     {sae_dir}")
     print(f"  HF repo:     {hub_id or '(push disabled)'}")
-    print(f"  W&B project: {wandb_project}")
+    wandb_disabled = os.environ.get("WANDB_MODE", "").lower() == "disabled"
+    print(f"  W&B project: {wandb_project}{' (disabled)' if wandb_disabled else ''}")
+    if not wandb_disabled:
+        print("  W&B auth:    checked when each layer run starts")
     if cfg.get("notes"):
         print(f"{'-' * 68}")
         for line in str(cfg["notes"]).rstrip().splitlines():
@@ -345,6 +358,7 @@ def main():
         end_layer=end,
         seed=args.seed,
         pool_batches=pool_batches,
+        pool_forward_fusion=pool_forward_fusion,
         microbatch_tokens=microbatch,
         use_pretok=not args.no_pretok,
         max_steps=max_steps,
@@ -378,6 +392,7 @@ def main():
             "capture": capture,
             "expansion": expansion,
             "pool_batches": pool_batches,
+            "pool_forward_fusion": pool_forward_fusion,
             "max_steps": max_steps,
             "target_l0": target_l0,
             "results": results,

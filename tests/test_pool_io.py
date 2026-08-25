@@ -6,6 +6,45 @@ import torch
 import sae_trainer_rolling as t
 
 
+def test_pool_forward_groups_keep_odd_tail():
+    assert list(t._pool_forward_groups(5, 2)) == [(0, 1), (2, 3), (4,)]
+
+
+def test_fused_shards_split_back_exactly():
+    shards = [torch.randn(2, 3, 4), torch.randn(3, 3, 4)]
+    fused, sizes = t._fuse_shards(shards)
+    restored = t._split_fused_shards(fused, sizes)
+
+    assert sizes == [2, 3]
+    assert len(restored) == len(shards)
+    for expected, actual in zip(shards, restored):
+        assert torch.equal(actual, expected)
+        assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
+
+
+def test_shared_kv_fuse_split_roundtrip_owns_storage():
+    pairs = [
+        (torch.randn(2, 1, 3, 4), torch.randn(2, 1, 3, 4)),
+        (torch.randn(3, 1, 3, 4), torch.randn(3, 1, 3, 4)),
+    ]
+    fused, sizes = t._fuse_shared_kv_shards(pairs)
+    restored = t._split_shared_kv_shards(fused, sizes)
+
+    assert sizes == [2, 3]
+    for expected_pair, actual_pair in zip(pairs, restored):
+        for expected, actual in zip(expected_pair, actual_pair):
+            assert torch.equal(actual, expected)
+            assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
+
+
+def test_shared_kv_disk_roundtrip(tmp_path):
+    pair = (torch.randn(2, 1, 3, 4), torch.randn(2, 1, 3, 4))
+    t._write_shared_kv_shard(tmp_path, 7, pair)
+    restored = t._read_shared_kv_shard(tmp_path, 7)
+
+    assert all(torch.equal(a.to(torch.bfloat16), b) for a, b in zip(pair, restored))
+
+
 def test_write_read_roundtrip_is_bf16(tmp_path):
     d = Path(tmp_path) / "pool"
     original = torch.randn(2, 3)
@@ -50,6 +89,17 @@ def test_pool_dir_composes_under_rollcache():
     pd = t._pool_dir("tokens_s0")
     assert pd.name == "tokens_s0"
     assert str(pd).startswith(str(t.ROLLCACHE))
+
+
+def test_async_shard_writer_flushes_and_bounds_pending(tmp_path):
+    d = Path(tmp_path) / "pool"
+    with t._AsyncShardWriter(max_workers=2, max_pending=2) as writer:
+        for i in range(5):
+            writer.submit(d, i, torch.full((2, 3), float(i)))
+            assert writer.pending_count <= 2
+
+    assert len(t._shard_paths(d)) == 5
+    assert torch.equal(t._read_shard(d, 4), torch.full((2, 3), 4.0, dtype=torch.bfloat16))
 
 
 def test_save_and_find_resume_pool(monkeypatch, tmp_path):

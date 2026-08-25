@@ -46,6 +46,7 @@ import math
 import os
 import statistics
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 class IterableDataset:
@@ -91,7 +92,8 @@ PRETOK_DIR = str(DATA_DIR / "pretok" / "fineweb-edu")        # optional pre-toke
 # Activation pools are large and ephemeral -- point this at the fastest local disk
 # you have. Pools are deleted incrementally during a run (we hold ~one pool at a time).
 ROLLCACHE  = os.environ.get("SAE_SCRATCH_DIR", str(DATA_DIR / "rollcache"))
-HARD_STOP_LAYER = 15                       # exclusive upper bound; never touch 15+
+GEMMA_KV_SHARE_START = 15                  # first layer that consumes shared KV
+HARD_STOP_LAYER = 15                       # Gemma rolling-path stop before the unsupported deep blocks
 
 # -- Corpus + model loading (set via CLI/config only, no env) ---------------
 CORPUS_ID         = "HuggingFaceFW/fineweb-edu"
@@ -223,10 +225,84 @@ if _USE_TRITON_ENV:
     print("[TRITON] SAE_USE_TRITON=1 ignored: current kernel is disabled (see sae_trainer_rolling.py)")
 
 
+def _dead_feature_aux_recon(pre, dead_indices, eff_k, w_dec_weight):
+    """Reconstruct the residual from the top-k dead features only.
+
+    Mathematically identical to the dense formulation:
+
+        pre_dead   = pre[:, dead_indices].relu()          # [B, n_dead]
+        vals, idx  = pre_dead.topk(eff_k, dim=-1)
+        aux_acts   = zeros_like(pre_dead).scatter_(-1, idx, vals)
+        x_aux      = aux_acts @ w_dec_weight.t()[dead_indices]
+
+    but the aux term is top-k sparse by construction (AUX_K entries per token),
+    so the dense buffer and the dense matmul are both avoidable. This gathers
+    the eff_k selected decoder rows instead, which skips:
+
+      * the [B, n_dead] zeros buffer and its scatter
+      * the [n_dead, d] decoder-row gather, re-done every microbatch
+      * a [B, n_dead] x [n_dead, d] matmul whose inputs are almost all zero
+
+    At B=32768 with 10% of a 73,728-wide dictionary dead that is roughly a
+    gigabyte of allocation per microbatch.
+
+    `per_sample_weights` must match the weight dtype, which is not automatic
+    under bf16 autocast, hence the explicit cast.
+
+    Requires torch >= 2.6 when the decoder is detached: earlier versions
+    internal-assert in embedding_bag if per_sample_weights requires grad and the
+    weight does not. requirements.txt pins torch >= 2.6, and in training the
+    decoder is a live parameter, so neither condition arises.
+    """
+    import torch
+
+    pre_dead = pre.index_select(1, dead_indices).relu_()
+    topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
+    # topk_idx indexes into the dead subset; map back to global feature ids.
+    global_idx = dead_indices[topk_idx]
+    weight = w_dec_weight.t()  # [F, d] view; no contiguous copy
+    return torch.nn.functional.embedding_bag(
+        global_idx,
+        weight,
+        mode="sum",
+        per_sample_weights=topk_vals.to(weight.dtype),
+    )
+
+
 def _aggressive_k_aux_k(target_l0: int) -> int:
     """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
     to a fraction of the target so the aux loss doesn't fight the sparsity budget."""
     return max(8, min(AUX_K, target_l0 // 2))
+
+
+def _ev_plateau_ready(history, target_l0, best_ev, *, window=6,
+                      l0_rel=0.15, dead_ceiling=1.0, max_gain=0.005,
+                      max_span=0.015, best_gap=0.01):
+    """Detect a quality plateau only after sparsity and feature health stabilize.
+
+    Each history entry is ``(smoothed_ev, l0, dead_pct)``. Comparing the best
+    values in each half makes the gate robust to one noisy validation batch while
+    still rejecting a layer whose attainable EV is continuing to rise.
+    """
+    recent = list(history)[-int(window):]
+    detail = {"gain": float("inf"), "span": float("inf")}
+    if len(recent) < window or target_l0 <= 0:
+        return False, detail
+
+    evs = [float(row[0]) for row in recent]
+    l0s = [float(row[1]) for row in recent]
+    deads = [float(row[2]) for row in recent]
+    half = window // 2
+    gain = max(evs[half:]) - max(evs[:half])
+    span = max(evs) - min(evs)
+    detail = {"gain": gain, "span": span, "ev": evs[-1],
+              "l0_min": min(l0s), "l0_max": max(l0s),
+              "dead_max": max(deads)}
+    l0_ok = all(abs(l0 - target_l0) / target_l0 <= l0_rel for l0 in l0s)
+    dead_ok = max(deads) <= dead_ceiling
+    near_best = evs[-1] >= float(best_ev) - best_gap
+    ready = l0_ok and dead_ok and near_best and gain <= max_gain and span <= max_span
+    return ready, detail
 
 
 # --- console colour -----------------------------------------------------------
@@ -769,6 +845,18 @@ def _ensure_sae_classes():
             # Zero-value bridge: value is unchanged, but gives the gate tensor a
             # grad_fn linked to log_threshold so its hook captures grad_gate.
             bridge = (threshold - threshold.detach()).view(1, -1) * 0.0
+            # NB: this add is deliberately out-of-place, and deliberately promotes.
+            #
+            # gate_hard is pre.dtype (bf16 under autocast) and bridge is the fp32
+            # threshold, so `gate_hard + bridge` type-promotes to fp32, and that
+            # fp32-ness carries through feat_acts = pre * gate into the whole
+            # feature path. Rewriting this as gate_hard.add_(bridge) writes into
+            # bf16 storage instead, which looks like a free saving -- it removes a
+            # [B, F] allocation -- but silently halves the precision of every
+            # downstream activation AND measured ~21% slower on an H100
+            # (17.3k -> 13.6k tok/s at d_in 2304, expansion 32, microbatch 8192).
+            # Measured 2026-08-19; see bench/bench_sae_core.py. Do not "optimise"
+            # this line.
             gate = gate_hard + bridge
             # feat_acts uses the bridge gate so log_threshold participates in the
             # graph and the parameter hook fires. The gate hook will receive the
@@ -1024,7 +1112,7 @@ def _find_text_model(model, n_layers):
     raise RuntimeError(f"Cannot find decoder ModuleList of length {n_layers}")
 
 
-def _make_invariants(text_model, tcfg, ids):
+def _make_invariants(text_model, tcfg, ids, static=None):
     """Per-batch quantities that are CONSTANT across layers for these tokens:
     per_layer_inputs [B,S,n_layers,ple], per-type causal masks, per-type rotary,
     position_ids. Mirrors the head of Gemma4TextModel.forward."""
@@ -1043,34 +1131,90 @@ def _make_invariants(text_model, tcfg, ids):
         ple_raw = text_model.get_per_layer_inputs(ids, None)
         per_layer_inputs = text_model.project_per_layer_inputs(inputs_embeds0, ple_raw)
         S = inputs_embeds0.shape[1]
-        position_ids = torch.arange(S, device=inputs_embeds0.device).unsqueeze(0)
-        mask_kwargs = {
-            "config": tcfg, "inputs_embeds": inputs_embeds0,
-            "attention_mask": None, "past_key_values": None,
-            "position_ids": position_ids,
-        }
-        masks = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
-        pos_emb = {lt: text_model.rotary_emb(inputs_embeds0, position_ids, lt)
-                   for lt in unique_layer_types}
+        cache_key = (S, inputs_embeds0.device, inputs_embeds0.dtype)
+        if static is None or static.get("cache_key") != cache_key:
+            position_ids = torch.arange(S, device=inputs_embeds0.device).unsqueeze(0)
+            mask_kwargs = {
+                "config": tcfg, "inputs_embeds": inputs_embeds0,
+                "attention_mask": None, "past_key_values": None,
+                "position_ids": position_ids,
+            }
+            masks = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+            pos_emb = {lt: text_model.rotary_emb(inputs_embeds0, position_ids, lt)
+                       for lt in unique_layer_types}
+            if static is not None:
+                static.clear()
+                static.update(
+                    cache_key=cache_key,
+                    position_ids=position_ids,
+                    masks=masks,
+                    pos_emb=pos_emb,
+                )
+        else:
+            position_ids = static["position_ids"]
+            masks = static["masks"]
+            pos_emb = static["pos_emb"]
     return {
         "inputs_embeds0": inputs_embeds0, "per_layer_inputs": per_layer_inputs,
         "masks": masks, "pos_emb": pos_emb, "position_ids": position_ids,
     }
 
 
-def _run_block(decoder_layers, tcfg, layer, hidden, inv):
+class _AsyncShardWriter:
+    """Bounded pool that overlaps CPU shard serialization with GPU forwards."""
+
+    def __init__(self, max_workers=2, max_pending=4):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._pending = deque()
+        self._max_pending = max(1, int(max_pending))
+
+    @property
+    def pending_count(self):
+        return len(self._pending)
+
+    def submit(self, dst_dir, i, tensor):
+        self._pending.append(self._executor.submit(_write_shard, dst_dir, i, tensor))
+        if len(self._pending) >= self._max_pending:
+            self._pending.popleft().result()
+
+    def close(self):
+        try:
+            while self._pending:
+                self._pending.popleft().result()
+        finally:
+            self._executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def _gemma_kv_source_layer(decoder_layers, layer):
+    """Return the non-shared layer whose KV `layer` consumes, if any."""
+    attn = getattr(decoder_layers[layer], "self_attn", None)
+    if attn is None or not getattr(attn, "is_kv_shared_layer", False):
+        return None
+    return int(attn.kv_shared_layer_index)
+
+
+def _run_block(decoder_layers, tcfg, layer, hidden, inv, shared_kv_states=None):
     """Run ONLY block `layer` on `hidden`, exactly as Gemma4TextModel.forward's
     loop does. layers 0..14 are kv-own, so a fresh empty shared_kv dict is fine."""
     import torch
     lt = tcfg.layer_types[layer]
+    if shared_kv_states is None:
+        shared_kv_states = {}
     with torch.no_grad():
         out = decoder_layers[layer](
             hidden,
             inv["per_layer_inputs"][:, :, layer, :],
-            shared_kv_states={},  # nobody reads it in 0..14; storers 13/14 write harmlessly
+            shared_kv_states=shared_kv_states,
             position_embeddings=inv["pos_emb"][lt],
             attention_mask=inv["masks"][lt],
             position_ids=inv["position_ids"],
@@ -1642,6 +1786,69 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
 #    _produce_pool         -- Gemma-3n/4 single-block walk (opt-in, --capture rolling)
 # ===========================================================================
 
+def _pool_forward_groups(n_shards, fusion):
+    """Yield shard-index groups fused only along the independent batch axis."""
+    fusion = int(fusion)
+    if fusion < 1:
+        raise ValueError(f"pool_forward_fusion must be >= 1, got {fusion}")
+    for start in range(0, int(n_shards), fusion):
+        yield tuple(range(start, min(start + fusion, int(n_shards))))
+
+
+def _fuse_shards(shards):
+    """Concatenate ordinary pool shards and retain their batch sizes for splitting."""
+    import torch
+    if not shards:
+        raise ValueError("cannot fuse an empty shard group")
+    sizes = [int(shard.shape[0]) for shard in shards]
+    return torch.cat(shards, dim=0), sizes
+
+
+def _split_fused_shards(fused, sizes):
+    """Restore the existing one-file-per-shard pool format after a fused forward."""
+    # torch.save serializes a view's entire backing storage. Clone each split so
+    # fusion does not multiply every output file by the fusion factor.
+    return [shard.clone() for shard in fused.split(sizes, dim=0)]
+
+
+def _fuse_shared_kv_shards(pairs):
+    """Fuse per-shard (key, value) pairs along their independent batch axis."""
+    if not pairs:
+        raise ValueError("cannot fuse an empty shared-KV group")
+    keys, key_sizes = _fuse_shards([pair[0] for pair in pairs])
+    values, value_sizes = _fuse_shards([pair[1] for pair in pairs])
+    if key_sizes != value_sizes:
+        raise RuntimeError("shared-KV key/value batch sizes differ")
+    return (keys, values), key_sizes
+
+
+def _split_shared_kv_shards(pair, sizes):
+    """Split fused K/V and force each shard to own its serialized storage."""
+    keys = _split_fused_shards(pair[0], sizes)
+    values = _split_fused_shards(pair[1], sizes)
+    return list(zip(keys, values))
+
+
+def _write_shared_kv_shard(dst_dir, i, pair):
+    """Persist one BF16 (key, value) pair in the ordinary shard index scheme."""
+    import torch
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    payload = tuple(tensor.detach().to(dtype=torch.bfloat16, device="cpu").clone()
+                    for tensor in pair)
+    torch.save(payload, dst_dir / f"shard_{i:05d}.pt")
+
+
+def _read_shared_kv_shard(src_dir, i):
+    """Load and validate one persisted shared-KV pair."""
+    import torch
+    pair = torch.load(Path(src_dir) / f"shard_{i:05d}.pt", map_location="cpu",
+                      weights_only=True)
+    if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+        raise RuntimeError(f"invalid shared-KV shard {i} in {src_dir}")
+    return tuple(pair)
+
+
 def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device):
     """Model-agnostic capture: run the model forward over the token pool and record
     the residual-stream output of decoder block `layer`.
@@ -1700,8 +1907,80 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
+def _produce_shared_kv_pool(text_model, decoder_layers, tcfg, source_layer, tok_dir,
+                            anchor_dir, dst_dir, device, forward_fusion=1):
+    """Materialize invariant Gemma shared K/V once for all downstream consumers."""
+    import json
+    import time
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = len(_shard_paths(tok_dir))
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if len(_shard_paths(dst_dir)) >= n:
+        print(f"  [shared KV L{source_layer}] already present ({n} shards) -- skip")
+        return
+
+    groups = list(_pool_forward_groups(n, forward_fusion))
+    print(f"  [shared KV L{source_layer}] producing {n} shards "
+          f"(fusion={forward_fusion}, {len(groups)} forwards) ...")
+    t0 = time.time()
+    static_by_batch = {}
+    sample_pair = None
+    pending = []
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sae-kv-writer") as writer:
+        produced = 0
+        for group in groups:
+            ids, split_sizes = _fuse_shards([_read_shard(tok_dir, i) for i in group])
+            ids = ids.to(device)
+            static = static_by_batch.setdefault(int(ids.shape[0]), {})
+            inv = _make_invariants(text_model, tcfg, ids, static=static)
+            anchor, anchor_sizes = _fuse_shards(
+                [_read_shard(anchor_dir, i) for i in group])
+            if anchor_sizes != split_sizes:
+                raise RuntimeError("shared-KV anchor and token shard batch sizes differ")
+            anchor = anchor.to(device, dtype=inv["inputs_embeds0"].dtype)
+            shared = {}
+            _run_block(decoder_layers, tcfg, source_layer, anchor, inv,
+                       shared_kv_states=shared)
+            cpu_pair = tuple(tensor.to(dtype=torch.bfloat16, device="cpu")
+                             for tensor in shared[source_layer])
+            split_pairs = _split_shared_kv_shards(cpu_pair, split_sizes)
+            if sample_pair is None:
+                sample_pair = split_pairs[0]
+            for i, pair in zip(group, split_pairs):
+                pending.append(writer.submit(_write_shared_kv_shard, dst_dir, i, pair))
+                if len(pending) >= 4:
+                    pending.pop(0).result()
+            produced += len(group)
+            if produced % max(1, n // 10) == 0 or produced == n:
+                tok_s = produced * BATCH_TOKENS / (time.time() - t0)
+                print(f"    shared KV {produced}/{n} ({tok_s/1e3:.1f}k tok/s)")
+        for future in pending:
+            future.result()
+
+    shard_bytes = sum(t.numel() * t.element_size() for t in sample_pair)
+    manifest = {
+        "model_id": MODEL_ID,
+        "source_layer": int(source_layer),
+        "attention_type": tcfg.layer_types[source_layer],
+        "shard_count": n,
+        "shapes": [list(t.shape) for t in sample_pair],
+        "dtype": str(sample_pair[0].dtype),
+        "bytes_per_shard": shard_bytes,
+        "projected_gb": shard_bytes * n / 1e9,
+        "token_pool": str(tok_dir),
+        "anchor_pool": str(anchor_dir),
+    }
+    (dst_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"  [shared KV L{source_layer}] done in {(time.time()-t0)/60:.1f}min; "
+          f"{manifest['projected_gb']:.2f} GB -> {dst_dir}")
+
+
 def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_dir,
-                  dst_dir, device):
+                  dst_dir, device, kv_source_dir=None, kv_cache_dir=None,
+                  forward_fusion=1):
     """Gemma-3n/4 single-block walk. Produce pool[layer] (block-L output for every batch).
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
@@ -1712,6 +1991,7 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     retention is managed by the orchestrator (keeps last 3 pools, deletes older ones).
     """
     import time
+    import torch
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -1720,20 +2000,76 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     if len(_shard_paths(dst_dir)) >= n:
         print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
         return
-    print(f"  [produce L{layer}] running block {layer} over {n} batches ...")
-    t0 = time.time()
-    for i in range(n):
-        ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
-        inv = _make_invariants(text_model, tcfg, ids)
-        if layer == 0:
-            hidden = inv["inputs_embeds0"]                  # scaled word embeds
+    print(f"  [produce L{layer}] running block {layer} over {n} batches "
+          "(cached invariants, async writes) ...")
+    kv_source_layer = _gemma_kv_source_layer(decoder_layers, layer)
+    use_kv_cache = (kv_source_layer is not None and kv_cache_dir is not None
+                    and len(_shard_paths(kv_cache_dir)) >= n)
+    if kv_source_layer is not None and kv_source_dir is None:
+        if not use_kv_cache:
+            raise RuntimeError(
+                f"Gemma layer {layer} consumes shared KV from layer {kv_source_layer}; "
+                f"pool L{kv_source_layer - 1} or a complete KV sidecar is required")
+    if kv_source_layer is not None:
+        if use_kv_cache:
+            print(f"  [produce L{layer}] loading cached shared KV from L{kv_source_layer}")
         else:
-            hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds0"].dtype)
-        out = _run_block(decoder_layers, tcfg, layer, hidden, inv)
-        _write_shard(dst_dir, i, out)
-        if (i + 1) % max(1, n // 10) == 0:
-            tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
-            print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
+            print(f"  [produce L{layer}] rebuilding shared KV from L{kv_source_layer} "
+                  f"using pool L{kv_source_layer - 1}")
+    t0 = time.time()
+    groups = list(_pool_forward_groups(n, forward_fusion))
+    print(f"  [produce L{layer}] pool-forward fusion={forward_fusion} "
+          f"({len(groups)} forwards for {n} shards)")
+    static_by_batch = {}
+    produced = 0
+    with _AsyncShardWriter(max_workers=2, max_pending=4) as writer:
+        for group in groups:
+            ids, split_sizes = _fuse_shards(
+                [_read_shard(tok_dir, i) for i in group])
+            ids = ids.to(device)                           # [fusion*n_seqs, SEQ_LEN]
+            static = static_by_batch.setdefault(int(ids.shape[0]), {})
+            inv = _make_invariants(text_model, tcfg, ids, static=static)
+            shared_kv_states = {}
+            if kv_source_layer is not None:
+                if use_kv_cache:
+                    pair, kv_sizes = _fuse_shared_kv_shards(
+                        [_read_shared_kv_shard(kv_cache_dir, i) for i in group])
+                    if kv_sizes != split_sizes:
+                        raise RuntimeError("shared-KV and token shard batch sizes differ")
+                    shared_kv_states[kv_source_layer] = tuple(
+                        tensor.to(device) for tensor in pair)
+                else:
+                    kv_hidden, kv_sizes = _fuse_shards(
+                        [_read_shard(kv_source_dir, i) for i in group])
+                    if kv_sizes != split_sizes:
+                        raise RuntimeError("anchor and token shard batch sizes differ")
+                    kv_hidden = kv_hidden.to(
+                        device, dtype=inv["inputs_embeds0"].dtype)
+                    _run_block(
+                        decoder_layers, tcfg, kv_source_layer, kv_hidden, inv,
+                        shared_kv_states=shared_kv_states,
+                    )
+            if layer == 0:
+                hidden = inv["inputs_embeds0"]             # scaled word embeds
+            else:
+                hidden, hidden_sizes = _fuse_shards(
+                    [_read_shard(src_dir, i) for i in group])
+                if hidden_sizes != split_sizes:
+                    raise RuntimeError("source and token shard batch sizes differ")
+                hidden = hidden.to(
+                    device, dtype=inv["inputs_embeds0"].dtype)
+            out = _run_block(
+                decoder_layers, tcfg, layer, hidden, inv,
+                shared_kv_states=shared_kv_states,
+            )
+            # Finish D2H before handing the CPU tensor to background serializers.
+            cpu_out = out.to(dtype=torch.bfloat16, device="cpu")
+            for i, shard_out in zip(group, _split_fused_shards(cpu_out, split_sizes)):
+                writer.submit(dst_dir, i, shard_out)
+            produced += len(group)
+            if produced % max(1, n // 10) == 0 or produced == n:
+                tok_s = produced * BATCH_TOKENS / (time.time() - t0)
+                print(f"    produced {produced}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
@@ -1860,8 +2196,15 @@ class _ActivationDoubleBuffer:
 
     def next_batch(self):
         """Return a GPU-ready activation batch, then start transferring the next one."""
+        import torch
         self._ready_event.wait()                           # ensure H2D is done
         gpu = self._next_gpu
+        # The batch was allocated on the transfer stream but is consumed on the
+        # default stream. Without this the caching allocator may hand the block
+        # back out to a later transfer while the compute stream still has queued
+        # kernels reading it -- silent activation corruption, not a crash.
+        # record_stream tells the allocator to also wait on the consuming stream.
+        gpu.record_stream(torch.cuda.current_stream())
         # Kick off the next transfer immediately so it overlaps with the upcoming
         # optimizer/compute work on the default stream.
         self._prefetch()
@@ -2098,7 +2441,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # -- wandb ----------------------------------------------------------------
     use_wandb = False
     wandb = None
-    if WANDB_PROJECT and os.environ.get("WANDB_API_KEY"):
+    if WANDB_PROJECT and os.environ.get("WANDB_MODE", "").lower() != "disabled":
         try:
             import wandb as _wandb
             try:
@@ -2384,6 +2727,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     ev_hist = deque(maxlen=EV_SMOOTH_N)
     ultra_frac = None  # last log window's ultra-active fraction, for the PIN guard
     best_state_in_memory = None; best_state_pending = False
+    # Step of the last event that discontinuously changed the weights: threshold
+    # reset, dead-neuron resample, or dead-ceiling rollback. ev_s is smoothed over
+    # EV_SMOOTH_N log windows, so for that long afterwards the smoothed EV still
+    # reflects the pre-event model while state_dict() is already post-event.
+    # Capturing "best" in that gap persists weights that were never evaluated.
+    last_weight_perturb_step = -(10 ** 9)
+    best_state_cooldown_steps = EV_SMOOTH_N * LOG_EVERY
     best_ev_persist_margin = 0.005
     # Dead-feature ceiling with rollback. Deep layers starve their feature tail the
     # moment PIN freezes the dual: observed MiniCPM5-1B L13 going 0.8% -> 8.8% dead in
@@ -2395,8 +2745,11 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # Ceiling of 1.0% never fires on layers that behave (0-12 here peaked at 0.58%),
     # so this is inert on healthy runs.
     dead_stop_pct = 1.0
-    dead_rollback_slots = 4
-    dead_state_buf = []  # list of dicts: step / dead / ev / l0 / state (CPU tensors)
+    # Single-slot rollback buffer: holds the most recent log window whose dead_pct
+    # was at or under dead_stop_pct, with its CPU state dict reused in place.
+    # _pick_dead_rollback returns the newest under-ceiling entry, so nothing older
+    # is ever selectable and extra slots only cost host RAM.
+    dead_state_buf = []  # 0 or 1 dict: step / dead / ev / l0 / state (CPU tensors)
     ev_decline_margin = 0.035
     ev_decline_floor = 0.95
     ev_decline_patience = 8
@@ -2461,8 +2814,12 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
         # Gradient accumulation: accumulate over microbatches before stepping
         optimizer.zero_grad()
-        accum_recon_loss = 0.0
-        accum_l0 = 0.0
+        # Accumulate on device. Reading these per microbatch costs a synchronous
+        # D2H copy each time, and nothing consumes them until after the loop
+        # (current_step_l0 below, then recon_val / l0_val). One stacked read at
+        # the end turns 2*accum_steps syncs per step into one.
+        accum_recon_t = torch.zeros((), device=device, dtype=torch.float32)
+        accum_l0_t = torch.zeros((), device=device, dtype=torch.float32)
         fired_accum = torch.zeros(N_FEATURES, device=device, dtype=torch.bool)
 
         # Get full batch and split into microbatches for accumulation. The double-buffer
@@ -2594,6 +2951,16 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
                     # Aux loss for dead features (scaled by accum_steps)
                     if n_dead > 0:
+                        # Dense on purpose. _dead_feature_aux_recon does the same
+                        # thing as a gather-sum over the eff_k selected features
+                        # and allocates ~0.5 GB less, but measured ~21% slower on
+                        # an H100 (17.3k -> 13.7k tok/s at d_in 2304, expansion 32,
+                        # microbatch 8192, n_dead 7372): embedding_bag performs
+                        # ~1M uncoalesced row-gathers of d_in floats, while this
+                        # "wasteful" matmul over a mostly-zero matrix runs on
+                        # tensor cores. The sparse helper is kept, and proven
+                        # equivalent by tests/test_aux_recon.py, in case the
+                        # crossover moves on other hardware or at other n_dead.
                         pre_dead = pre[:, dead_indices].relu()
                         topk_vals, topk_idx = pre_dead.topk(eff_k, dim=-1)
                         aux_acts = torch.zeros_like(pre_dead)
@@ -2613,8 +2980,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # l0_val feeds the W_enc dampener plus the scheduler, both every step. The
             # sparsity/aux accumulators were write-only, so their .item() calls cost a
             # synchronous D2H copy per microbatch for values nothing consumed.
-            accum_recon_loss += recon_loss.detach().item() * accum_steps
-            accum_l0 += l0_mb.detach().item()
+            accum_recon_t += recon_loss.detach().float() * accum_steps
+            accum_l0_t += l0_mb.detach().float()
             with torch.no_grad():
                 if triton_ok_this_step:
                     # The fused kernel does not return gate, so recompute it cheaply
@@ -2662,6 +3029,18 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         # the encoder from "inflating" to keep features on while sparsity pressure
         # is trying to push them off.  Use the current step's accumulated L0 for
         # immediate responsiveness.
+        # One stacked device read for the accumulators instead of one .item() per
+        # value per microbatch: 2*accum_steps syncs per step becomes 1.
+        #
+        # grad_norm is deliberately NOT folded in here. It is read separately below
+        # via its own .item(), and tests/test_grad_norm_signal.py guards that line
+        # by source text -- deferring or synthesising grad_norm shipped once before
+        # and silently killed the gradient-spike detector. Folding it in would save
+        # exactly one sync per step, which is not worth spending that tripwire on.
+        accum_recon_loss, accum_l0 = torch.stack(
+            (accum_recon_t, accum_l0_t)
+        ).tolist()
+
         current_step_l0 = accum_l0 / max(accum_steps, 1)
         wenc_factor = scheduler.wenc_dampen_factor(current_step_l0)
         if wenc_factor < 1.0:
@@ -2692,9 +3071,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                 timing["evt_norm_end"].record()
             timing["_last_opt_norm"] = time.perf_counter() - t_opt_start
 
-        # accum_recon_loss / accum_l0 are already Python floats (summed from the
-        # microbatch .item() calls); use them directly instead of bouncing through
-        # a GPU tensor and back, which forced two extra device syncs per step.
+        # accum_recon_loss / accum_l0 / grad_norm_val are Python floats produced by
+        # the single stacked device read above; use them directly.
 
         # Dead/fired bookkeeping reuses the fired mask gathered during the forward
         # passes above -- no extra encode of the full batch.
@@ -2718,6 +3096,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                     print(f"  [RESET @ {step}] theta->{float(_rev.exp()):.4f} "
                           f"(live median) for {n_reset} dead")
                 revival.record_reset(n_reset)
+                if n_reset > 0:
+                    last_weight_perturb_step = step
 
         if buffer_err_this_step:
             if do_timing:
@@ -2753,6 +3133,8 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         state["exp_avg"][dead_mask] = 0.0; state["exp_avg_sq"][dead_mask] = 0.0
                 revival.clear_silence(dead_mask)
             revival.record_resample(n_dead, n_res)
+            if n_res > 0:
+                last_weight_perturb_step = step
             print(f"  [RESAMPLE @ {step}] reinit {n_res}/{n_dead} dead")
             err_buffer = []
 
@@ -2855,16 +3237,35 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # the newest buffered state still under it and stop there. Runs before
             # anything downstream reads dead/ev/l0_val, so the printed line, the W&B
             # row, meta.json and sae.pt all describe the SAME weights.
-            dead_state_buf.append({
-                "step": step, "dead": dead, "ev": ev, "l0": l0_val,
-                "state": {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()},
-            })
-            if len(dead_state_buf) > dead_rollback_slots:
-                dead_state_buf.pop(0)
+            # Only windows at or under the ceiling are ever selectable:
+            # _pick_dead_rollback scans newest-first and returns the first entry
+            # with dead <= ceiling, so an over-ceiling entry is never the answer,
+            # and any entry older than the newest under-ceiling one is unreachable.
+            # Keeping a single under-ceiling snapshot is therefore identical in
+            # behaviour to keeping four mixed ones, at a quarter of the host RAM
+            # (a full state dict is ~1.36 GB at EXPANSION=32 on a 2304-dim model),
+            # and it is strictly more robust: over-ceiling windows can no longer
+            # evict the fallback.
+            if dead is not None and dead <= dead_stop_pct:
+                if dead_state_buf:
+                    # Reuse the existing pinned-free CPU storage instead of
+                    # allocating a fresh ~1.36 GB dict every log window.
+                    _slot = dead_state_buf[0]
+                    with torch.no_grad():
+                        for _k, _v in sae.state_dict().items():
+                            _slot["state"][_k].copy_(_v.detach())
+                    _slot.update(step=step, dead=dead, ev=ev, l0=l0_val)
+                else:
+                    dead_state_buf.append({
+                        "step": step, "dead": dead, "ev": ev, "l0": l0_val,
+                        "state": {k: v.detach().cpu().clone()
+                                  for k, v in sae.state_dict().items()},
+                    })
             if dead > dead_stop_pct:
                 _pick = _pick_dead_rollback(dead_state_buf, dead_stop_pct)
                 if _pick is not None:
                     sae.load_state_dict(_pick["state"])
+                    last_weight_perturb_step = step
                     _tag = _c(f"  [DEAD ROLLBACK @ {step}]", "1;95")
                     _bad = _c(f"{dead:.2f}%", "1;91")
                     _pd = _c(f"{_pick['dead']:.2f}%", "1;92")
@@ -2884,8 +3285,9 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                           f"{dead_stop_pct:.2f}% ceiling and no buffered window is under it; "
                           f"stopping without rollback")
                     scheduler.stop_reason = (
-                        f"dead-feature ceiling: breached {dead_stop_pct:.2f}% with no clean "
-                        f"state in the last {len(dead_state_buf)} windows")
+                        f"dead-feature ceiling: breached {dead_stop_pct:.2f}% and no log "
+                        f"window has been observed at or under it, so there is no clean "
+                        f"state to roll back to")
                 scheduler.should_stop = True
         else:
             dead = None; ev = None; ev_perdim = None; qo = None
@@ -3004,8 +3406,25 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             # the best single batch it ever drew. The saved weights lag the true
             # peak by up to half a window; that is the correct trade against
             # persisting whatever state happened to coincide with a lucky measurement.
-            if ev_s > best_ev:
+            # Do not capture a "best" during the smoother's blind spot. ev_s is an
+            # average over EV_SMOOTH_N log windows, so for that long after a
+            # reset / resample / rollback it still describes the pre-event model
+            # while state_dict() is already post-event -- the captured weights
+            # would be a pairing that was never actually evaluated.
+            _in_perturb_cooldown = (
+                step - last_weight_perturb_step < best_state_cooldown_steps)
+            if _in_perturb_cooldown and ev_s > best_ev:
+                print(f"  [BEST HOLD @ {step}] ev_s={ev_s:.4f} > best={best_ev:.4f} but "
+                      f"weights were perturbed at step {last_weight_perturb_step}; "
+                      f"waiting {best_state_cooldown_steps} steps for the EV smoother")
+            if ev_s > best_ev and not _in_perturb_cooldown:
                 best_ev = ev_s; best_ev_step = step; best_ev_l0 = l0_val
+                # Deliberately a fresh clone, NOT reused storage. The persist path
+                # below hands this dict to a background daemon thread for
+                # torch.save, so copying into it in place would let a later EV
+                # improvement mutate tensors mid-serialisation and write a torn
+                # checkpoint. The dead-rollback buffer can reuse its slot because
+                # it is only ever read synchronously by load_state_dict.
                 best_state_in_memory = {k: v.detach().cpu().clone() for k, v in sae.state_dict().items()}
                 best_state_pending = True
             elif best_state_pending and ev_s < best_ev - best_ev_persist_margin:
@@ -3043,8 +3462,29 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             else:
                 ev_below_peak_streak = 0
 
-            # -- Aggressive-K early stop: when K is small, high EV + L0 near target
-            #    is the real convergence signal. Stop before feature death sets in.
+            # -- Plateau-aware low-K stop. A fixed EV floor is inappropriate across
+            # depth: later residual streams can converge cleanly below 0.90. Once
+            # sparsity and feature health have stayed settled for 500 steps, stop
+            # when smoothed EV is no longer buying meaningful improvement.
+            if aggressive_k:
+                if not hasattr(sae, "_ev_plateau_history"):
+                    sae._ev_plateau_history = deque(maxlen=6)
+                sae._ev_plateau_history.append((ev_s, l0_val, dead))
+                plateau_ready, plateau = _ev_plateau_ready(
+                    sae._ev_plateau_history, target_l0=K, best_ev=best_ev)
+                if step >= 1500 and plateau_ready:
+                    scheduler.should_stop = True
+                    scheduler.stop_reason = (
+                        f"EV plateau convergence: EV={plateau['ev']:.3f}, "
+                        f"gain={plateau['gain']:+.4f}, span={plateau['span']:.4f} "
+                        f"over 500 steps; L0 stayed "
+                        f"{plateau['l0_min']:.1f}-{plateau['l0_max']:.1f} around "
+                        f"K={K}; dead<={plateau['dead_max']:.2f}%"
+                    )
+                    print(f"  [EV PLATEAU STOP @ {step}] {scheduler.stop_reason}")
+
+            # -- Aggressive-K high-quality stop: retain the fast path for layers
+            # that clear the absolute EV floor before the plateau gate matures.
             if aggressive_k and step >= 750:
                 l0_rel_err = abs(l0_val - K) / max(K, 1.0)
                 K_STOP_L0_REL = float(os.environ.get("SAE_STOP_L0_REL", K_STOP_L0_REL_DEFAULT))
@@ -3208,6 +3648,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
 def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFAULT_SEED,
                       pool_batches: int = POOL_BATCHES_DEFAULT, microbatch_tokens: int = None,
+                      pool_forward_fusion: int = 1,
                       use_pretok: bool = True, max_steps: int = N_STEPS,
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
@@ -3267,17 +3708,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     assert capture in ("auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
                        "rolling-generic"), \
         f"unknown --capture {capture!r}"
-    if capture in ("rolling", "rolling-float") and end_layer > HARD_STOP_LAYER:
-        print(f"  [scope] rolling clamps end_layer {end_layer} -> {HARD_STOP_LAYER} "
-              f"(Gemma KV-share boundary)")
-        end_layer = HARD_STOP_LAYER
-
     hf_token = _resolve_hf_token()
     device = torch.device("cpu" if cpu else "cuda")
     torch.manual_seed(seed)
 
     # -- load model ONCE (generic loader: CausalLM, multimodal fallback) -------
     print(f"Loading {MODEL_ID} ...")
+    from gemma_attention import prepare_gemma4_attention, select_gemma4_attention
+    gemma_attention_enabled = prepare_gemma4_attention(MODEL_ID)
     from transformers import AutoTokenizer
     # Detect if MODEL_ID is a local path
     is_local = os.path.isdir(MODEL_ID)
@@ -3306,6 +3744,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         if TRUST_REMOTE_CODE:
             model_kwargs["trust_remote_code"] = True
         model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **model_kwargs)
+    select_gemma4_attention(model, gemma_attention_enabled)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -3345,6 +3784,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         model.to(device)
 
     end_layer = min(end_layer, n_layers - 1)
+    if capture in ("rolling", "rolling-float"):
+        # Gemma shared-KV walk is only proven correct up to HARD_STOP_LAYER; deeper
+        # blocks consume shared KV states this single-block path does not model.
+        end_layer = min(end_layer, HARD_STOP_LAYER)
     assert 0 <= start_layer <= end_layer < n_layers, \
         f"bad layer range [{start_layer},{end_layer}] for a {n_layers}-layer model"
     layers = list(range(start_layer, end_layer + 1))
@@ -3412,6 +3855,37 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         # the same width would train on the wrong stream with no error at all.
         return _pool_dir(f"pool_{_slug(MODEL_ID)}_L{L:02d}_s{seed}")
 
+    def gemma_production_args(L):
+        """Resolve the layer/pool dependency closure for one Gemma block."""
+        source_layer = _gemma_kv_source_layer(decoder_layers, L)
+        if source_layer is None:
+            return None, None, {L}
+        anchor_layer = source_layer - 1
+        preserved = _pool_dir(
+            f"kv_anchor_{_slug(MODEL_ID)}_L{anchor_layer:02d}_s{seed}")
+        source_dir = preserved if len(_shard_paths(preserved)) >= pool_batches \
+            else pool_dir_for(anchor_layer)
+        cache_dir = _pool_dir(
+            f"kv_shared_{_slug(MODEL_ID)}_L{source_layer:02d}_s{seed}")
+        if len(_shard_paths(cache_dir)) < pool_batches:
+            if use_floating_window:
+                floating_window.set_active({source_layer})
+            _produce_shared_kv_pool(
+                text_model, decoder_layers, tcfg, source_layer, tok_dir,
+                source_dir, cache_dir, device,
+                forward_fusion=pool_forward_fusion,
+            )
+        return source_dir, cache_dir, {L}
+
+    # Shared-KV producers read their own input activations at every post-boundary
+    # layer. Keep those compact hidden-state pools; materialized KV sidecars are
+    # substantially larger.
+    kv_anchor_pools = {
+        source_layer - 1
+        for L in range(start_layer, end_layer + 1)
+        if (source_layer := _gemma_kv_source_layer(decoder_layers, L)) is not None
+    } if capture in ("rolling", "rolling-float") else set()
+
     results = {}
     # The slingshot gain and LR multipliers scale by probe/ref norm ratio. The ref
     # must be the norm of the chain's FIRST layer (L0), not whichever layer this
@@ -3470,6 +3944,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # here and the retention loop only ever walks down to walk_start, so
                 # these would sit on disk for the whole run.
                 for _stale in range(0, walk_start):
+                    if _stale in kv_anchor_pools:
+                        continue
                     _sd = pool_dir_for(_stale)
                     if _sd.exists():
                         _rm_pool(_sd)
@@ -3497,6 +3973,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # Pools below the resume point are pre-crash leftovers the retention
                 # loop can never reach (it only walks down to walk_start).
                 for _stale in range(0, walk_start):
+                    if _stale in kv_anchor_pools:
+                        continue
                     _sd = pool_dir_for(_stale)
                     if _sd.exists():
                         _rm_pool(_sd)
@@ -3546,11 +4024,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # Do not consume it -- it stays on disk until the next layer finishes.
                 src_dir = _resume_pool_dir(seed)
                 consume_src = False
-            if use_floating_window:
-                floating_window.activate(L)
             if capture in ("rolling", "rolling-float"):
+                kv_source_dir, kv_cache_dir, active_layers = gemma_production_args(L)
+                if use_floating_window:
+                    floating_window.set_active(active_layers)
                 _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
-                              dst_dir, device)
+                              dst_dir, device, kv_source_dir=kv_source_dir,
+                              kv_cache_dir=kv_cache_dir,
+                              forward_fusion=pool_forward_fusion)
             elif capture == "rolling-generic":
                 _produce_pool_generic_rolling(model, text_model, decoder_layers, L, tok_dir,
                                               src_dir, dst_dir, device)
@@ -3564,11 +4045,15 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 next_dir = pool_dir_for(L + 1)
                 if len(_shard_paths(next_dir)) < pool_batches:
                     print(f"  [pipeline] pre-producing pool L{L+1} while model hot ...")
-                    if use_floating_window:
-                        floating_window.activate(L + 1)
                     if capture in ("rolling", "rolling-float"):
+                        kv_source_dir, kv_cache_dir, active_layers = gemma_production_args(L + 1)
+                        if use_floating_window:
+                            floating_window.set_active(active_layers)
                         _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
-                                      dst_dir, next_dir, device)
+                                      dst_dir, next_dir, device,
+                                      kv_source_dir=kv_source_dir,
+                                      kv_cache_dir=kv_cache_dir,
+                                      forward_fusion=pool_forward_fusion)
                     elif capture == "rolling-generic":
                         _produce_pool_generic_rolling(model, text_model, decoder_layers, L + 1,
                                                       tok_dir, dst_dir, next_dir, device)
@@ -3643,6 +4128,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             for old_L in range(cutoff, walk_start - 1, -1):
                 if old_L < 0:
                     continue
+                if old_L in kv_anchor_pools:
+                    continue
                 old_dir = pool_dir_for(old_L)
                 if old_dir.exists():
                     _rm_pool(old_dir)
@@ -3689,6 +4176,8 @@ def main():
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--pool-batches", type=int, default=POOL_BATCHES_DEFAULT,
                    help="Activation batches cached per layer. Default=4000 (~400GB). Use 500-1000 for limited disk (~50-100GB).")
+    p.add_argument("--pool-forward-fusion", type=int, default=1,
+                   help="pool-production shards fused per model forward; default 1")
     p.add_argument("--microbatch-tokens", type=int, default=MICROBATCH_TOKENS,
                    help=f"Tokens per microbatch for gradient accumulation. Default={MICROBATCH_TOKENS//1024}k (no accum). Use 8192 for 4x VRAM savings.")
     p.add_argument("--resume-from", type=str, default=None,
@@ -3702,7 +4191,7 @@ def main():
     p.add_argument("--hub-id", default=None,
                    help="HF repo to upload SAEs to. No default -- upload is skipped unless set.")
     p.add_argument("--wandb-project", default=None,
-                   help="wandb project name. Off unless set (also needs WANDB_API_KEY).")
+                   help="wandb project name. Uses credentials from wandb login or the environment.")
     p.add_argument("--no-push", dest="push", action="store_false",
                    help="skip the HuggingFace upload even if --hub-id is set")
     p.add_argument("--no-model-evict", dest="evict_model", action="store_false",
@@ -3737,6 +4226,7 @@ def main():
     res = run_atlas_rolling(
         start_layer=args.start_layer, end_layer=args.end_layer, seed=args.seed,
         pool_batches=args.pool_batches, microbatch_tokens=args.microbatch_tokens,
+        pool_forward_fusion=args.pool_forward_fusion,
         use_pretok=args.use_pretok, max_steps=args.max_steps, bdec_batches=args.bdec_batches,
         resume_from=args.resume_from, push=args.push, capture=args.capture,
         model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,

@@ -239,7 +239,14 @@ class SAEAECSConfig:
     # authoritative for stopping until FINETUNE is implemented.
     pin_l0_band_abs: float = 0.5        # |L0 - target| <= this -> DESCENT enters PIN
     pin_l0_release_frac: float = 0.25   # |L0 - target| > this*target while PINned -> back to DESCENT
-    pin_timeout_steps: int = 2000       # max steps in PIN before bailing back to DESCENT
+    # Steps in PIN after which PIN is considered to have had its chance.
+    # NOTE: this does NOT return the phase to DESCENT. _maybe_update_phase logs
+    # "PIN would timeout ... [observe-only: no return to DESCENT yet]" and takes
+    # no action -- the bail is staged but unwired. The knob's only live effect is
+    # in _check_early_stop, where a timed-out PIN satisfies the stop gate that
+    # otherwise waits for PIN EV-readiness. So raising it does not give PIN more
+    # time before bailing; it delays the run's stop.
+    pin_timeout_steps: int = 2000
     pin_ev_thresh: float = 0.95         # EV window counts toward PIN success above this
     pin_ev_patience: int = 3            # consecutive good EV windows -> ready for FINETUNE
     # Feature-tail guard. PIN's premise is "sparsity is locked, let EV catch up".
@@ -409,7 +416,7 @@ class SAEEventControlScheduler:
 
         # EV tracking
         self._ev_below_floor_count: int = 0
-        self._ev_above_floor_count: int = 0
+        self._al_converged_window_count: int = 0
 
         # Dead feature tracking
         self._dead_emergency_last_step: int = 0
@@ -418,6 +425,7 @@ class SAEEventControlScheduler:
         self.should_stop: bool = False
         self.stop_reason: str = ""
         self._lambda_history: list = []     # rolling lambda readings for plateau detection
+        self._lambda_ceiling_warned = False  # warn once when the dual saturates high
         self._activation_norm_ema: Optional[float] = None
         # Frozen preflight activation norm — drives the deterministic slingshot
         # gain scaling. Distinct from the live EMA (which is for LR adaptation).
@@ -1071,16 +1079,48 @@ class SAEEventControlScheduler:
         lambda_converged = False
         if len(self._lambda_history) >= 4:
             recent = self._lambda_history[-4:]
-            if recent[0] > 1e-12:
-                rel_growth = max(recent) / recent[0] - 1.0
-                lambda_converged = rel_growth < self.config.al_convergence_rel_tol
+            lo, hi = min(recent), max(recent)
+            mid = sum(recent) / len(recent)
+            if mid > 1e-12:
+                # Two-sided. The previous test was max(recent)/recent[0] - 1, which
+                # only sees growth: a monotonically DECREASING lambda gives
+                # max == recent[0], hence rel_growth == 0, and a collapsing dual was
+                # reported as a plateau. Spread across the window catches both
+                # directions and is still scaled by the same tolerance knob.
+                lambda_converged = (hi - lo) / mid < self.config.al_convergence_rel_tol
+
+            if lambda_converged:
+                # A dual pinned to its ceiling is flat because it ran out of
+                # authority, not because it found its value -- the constraint is
+                # being held by force and would spring back if pressure were
+                # removed. That is not a KKT point, so do not stop on it.
+                #
+                # The floor is the opposite case and stays valid: lambda == 0 with
+                # L0 inside the band is complementary slackness, i.e. the sparsity
+                # constraint is simply inactive. Only the ceiling is disqualifying.
+                # Only meaningful while the dual is free to move. _dual_update
+                # early-returns on phase == "PIN", so in PIN lambda is frozen by
+                # design and its flatness -- at any value, ceiling included --
+                # carries no information about convergence. Applying the check
+                # there would permanently block stopping for any run that entered
+                # PIN with a saturated dual.
+                ceiling = self.config.lambda_l0_max
+                if (self.phase != "PIN" and ceiling > 0
+                        and all(l >= ceiling * (1.0 - 1e-6) for l in recent)):
+                    lambda_converged = False
+                    if not self._lambda_ceiling_warned:
+                        self._lambda_ceiling_warned = True
+                        print(f"  [AL] lambda pinned at lambda_l0_max={ceiling:.3e} "
+                              f"for {len(recent)} windows: treating as saturated, not "
+                              f"converged. Raise lambda_l0_max if L0 is still above "
+                              f"target.")
 
         if l0_in_target and lambda_converged:
-            self._ev_above_floor_count += 1
+            self._al_converged_window_count += 1
         else:
-            self._ev_above_floor_count = 0
+            self._al_converged_window_count = 0
 
-        if self._ev_above_floor_count >= self.config.ev_stop_patience:
+        if self._al_converged_window_count >= self.config.ev_stop_patience:
             # PIN stop gate (Branch 6 / Task 6B): AL convergence alone must not
             # end the run the moment sparsity locks -- PIN exists to let EV catch
             # up with lambda frozen. Hold the stop until PIN reports EV-ready
@@ -1097,9 +1137,17 @@ class SAEEventControlScheduler:
             pin_note = ("PIN EV-ready" if pin_ev_ready
                         else f"PIN timeout after {pin_elapsed} steps")
             self.should_stop = True
+            # Report the band the gate actually enforces. l0_in_target above uses
+            # al_slingshot_overshoot_rel for the lower bound and target_l0 itself
+            # for the upper bound -- it is one-sided (sparse side only), not a
+            # +/- tolerance, and it is NOT l0_tolerance. Quoting l0_tolerance here
+            # told operators to tune a knob that does not affect stopping.
+            _lo = self.config.target_l0 * (1.0 - self.config.al_slingshot_overshoot_rel)
             self.stop_reason = (
-                f"AL converged: L0 {l0_mean:.1f} in target +/-{self.config.l0_tolerance*100:.0f}% of "
-                f"{self.config.target_l0}, lambda plateaued at {self.lambda_l0:.3e} "
+                f"AL converged: L0 {l0_mean:.1f} within [{_lo:.1f}, "
+                f"{self.config.target_l0:.1f}] "
+                f"(-{self.config.al_slingshot_overshoot_rel*100:.0f}% of target, sparse side "
+                f"only), lambda plateaued at {self.lambda_l0:.3e} "
                 f"({self.config.ev_stop_patience} windows of stability); {pin_note}. "
                 f"Final EV={ev:.3f}."
             )
@@ -1585,7 +1633,12 @@ class SAEEventControlScheduler:
             "transitions": len(self.transition_log),
             "event_counter": self.event_counter,
             "ev_below_floor": self._ev_below_floor_count,
-            "ev_above_floor": self._ev_above_floor_count,
+            # Counts consecutive windows where the AL gates (L0 in band AND the
+            # dual plateaued) both held. It has never had anything to do with EV
+            # being above a floor. `ev_above_floor` is kept as a deprecated alias
+            # so existing W&B charts keep resolving; prefer al_converged_windows.
+            "al_converged_windows": self._al_converged_window_count,
+            "ev_above_floor": self._al_converged_window_count,
             "activation_norm_ema": self._activation_norm_ema,
             "activation_norm_preflight": self._activation_norm_preflight,
             "effective_slingshot_gain": self._effective_slingshot_gain(),
