@@ -93,6 +93,7 @@ PRETOK_DIR = str(DATA_DIR / "pretok" / "fineweb-edu")        # optional pre-toke
 # you have. Pools are deleted incrementally during a run (we hold ~one pool at a time).
 ROLLCACHE  = os.environ.get("SAE_SCRATCH_DIR", str(DATA_DIR / "rollcache"))
 GEMMA_KV_SHARE_START = 15                  # first layer that consumes shared KV
+HARD_STOP_LAYER = 15                       # Gemma rolling-path stop before the unsupported deep blocks
 
 # -- Corpus + model loading (set via CLI/config only, no env) ---------------
 CORPUS_ID         = "HuggingFaceFW/fineweb-edu"
@@ -3783,6 +3784,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         model.to(device)
 
     end_layer = min(end_layer, n_layers - 1)
+    if capture in ("rolling", "rolling-float"):
+        # Gemma shared-KV walk is only proven correct up to HARD_STOP_LAYER; deeper
+        # blocks consume shared KV states this single-block path does not model.
+        end_layer = min(end_layer, HARD_STOP_LAYER)
     assert 0 <= start_layer <= end_layer < n_layers, \
         f"bad layer range [{start_layer},{end_layer}] for a {n_layers}-layer model"
     layers = list(range(start_layer, end_layer + 1))
