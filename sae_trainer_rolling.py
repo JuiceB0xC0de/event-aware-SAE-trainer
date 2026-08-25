@@ -46,6 +46,7 @@ import math
 import os
 import statistics
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 class IterableDataset:
@@ -91,7 +92,7 @@ PRETOK_DIR = str(DATA_DIR / "pretok" / "fineweb-edu")        # optional pre-toke
 # Activation pools are large and ephemeral -- point this at the fastest local disk
 # you have. Pools are deleted incrementally during a run (we hold ~one pool at a time).
 ROLLCACHE  = os.environ.get("SAE_SCRATCH_DIR", str(DATA_DIR / "rollcache"))
-HARD_STOP_LAYER = 15                       # exclusive upper bound; never touch 15+
+GEMMA_KV_SHARE_START = 15                  # first layer that consumes shared KV
 
 # -- Corpus + model loading (set via CLI/config only, no env) ---------------
 CORPUS_ID         = "HuggingFaceFW/fineweb-edu"
@@ -271,6 +272,36 @@ def _aggressive_k_aux_k(target_l0: int) -> int:
     """At very low L0, reviving 128 dead features per token is nonsensical; cap AUX_K
     to a fraction of the target so the aux loss doesn't fight the sparsity budget."""
     return max(8, min(AUX_K, target_l0 // 2))
+
+
+def _ev_plateau_ready(history, target_l0, best_ev, *, window=6,
+                      l0_rel=0.15, dead_ceiling=1.0, max_gain=0.005,
+                      max_span=0.015, best_gap=0.01):
+    """Detect a quality plateau only after sparsity and feature health stabilize.
+
+    Each history entry is ``(smoothed_ev, l0, dead_pct)``. Comparing the best
+    values in each half makes the gate robust to one noisy validation batch while
+    still rejecting a layer whose attainable EV is continuing to rise.
+    """
+    recent = list(history)[-int(window):]
+    detail = {"gain": float("inf"), "span": float("inf")}
+    if len(recent) < window or target_l0 <= 0:
+        return False, detail
+
+    evs = [float(row[0]) for row in recent]
+    l0s = [float(row[1]) for row in recent]
+    deads = [float(row[2]) for row in recent]
+    half = window // 2
+    gain = max(evs[half:]) - max(evs[:half])
+    span = max(evs) - min(evs)
+    detail = {"gain": gain, "span": span, "ev": evs[-1],
+              "l0_min": min(l0s), "l0_max": max(l0s),
+              "dead_max": max(deads)}
+    l0_ok = all(abs(l0 - target_l0) / target_l0 <= l0_rel for l0 in l0s)
+    dead_ok = max(deads) <= dead_ceiling
+    near_best = evs[-1] >= float(best_ev) - best_gap
+    ready = l0_ok and dead_ok and near_best and gain <= max_gain and span <= max_span
+    return ready, detail
 
 
 # --- console colour -----------------------------------------------------------
@@ -1080,7 +1111,7 @@ def _find_text_model(model, n_layers):
     raise RuntimeError(f"Cannot find decoder ModuleList of length {n_layers}")
 
 
-def _make_invariants(text_model, tcfg, ids):
+def _make_invariants(text_model, tcfg, ids, static=None):
     """Per-batch quantities that are CONSTANT across layers for these tokens:
     per_layer_inputs [B,S,n_layers,ple], per-type causal masks, per-type rotary,
     position_ids. Mirrors the head of Gemma4TextModel.forward."""
@@ -1099,34 +1130,90 @@ def _make_invariants(text_model, tcfg, ids):
         ple_raw = text_model.get_per_layer_inputs(ids, None)
         per_layer_inputs = text_model.project_per_layer_inputs(inputs_embeds0, ple_raw)
         S = inputs_embeds0.shape[1]
-        position_ids = torch.arange(S, device=inputs_embeds0.device).unsqueeze(0)
-        mask_kwargs = {
-            "config": tcfg, "inputs_embeds": inputs_embeds0,
-            "attention_mask": None, "past_key_values": None,
-            "position_ids": position_ids,
-        }
-        masks = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
-        pos_emb = {lt: text_model.rotary_emb(inputs_embeds0, position_ids, lt)
-                   for lt in unique_layer_types}
+        cache_key = (S, inputs_embeds0.device, inputs_embeds0.dtype)
+        if static is None or static.get("cache_key") != cache_key:
+            position_ids = torch.arange(S, device=inputs_embeds0.device).unsqueeze(0)
+            mask_kwargs = {
+                "config": tcfg, "inputs_embeds": inputs_embeds0,
+                "attention_mask": None, "past_key_values": None,
+                "position_ids": position_ids,
+            }
+            masks = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+            pos_emb = {lt: text_model.rotary_emb(inputs_embeds0, position_ids, lt)
+                       for lt in unique_layer_types}
+            if static is not None:
+                static.clear()
+                static.update(
+                    cache_key=cache_key,
+                    position_ids=position_ids,
+                    masks=masks,
+                    pos_emb=pos_emb,
+                )
+        else:
+            position_ids = static["position_ids"]
+            masks = static["masks"]
+            pos_emb = static["pos_emb"]
     return {
         "inputs_embeds0": inputs_embeds0, "per_layer_inputs": per_layer_inputs,
         "masks": masks, "pos_emb": pos_emb, "position_ids": position_ids,
     }
 
 
-def _run_block(decoder_layers, tcfg, layer, hidden, inv):
+class _AsyncShardWriter:
+    """Bounded pool that overlaps CPU shard serialization with GPU forwards."""
+
+    def __init__(self, max_workers=2, max_pending=4):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._pending = deque()
+        self._max_pending = max(1, int(max_pending))
+
+    @property
+    def pending_count(self):
+        return len(self._pending)
+
+    def submit(self, dst_dir, i, tensor):
+        self._pending.append(self._executor.submit(_write_shard, dst_dir, i, tensor))
+        if len(self._pending) >= self._max_pending:
+            self._pending.popleft().result()
+
+    def close(self):
+        try:
+            while self._pending:
+                self._pending.popleft().result()
+        finally:
+            self._executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def _gemma_kv_source_layer(decoder_layers, layer):
+    """Return the non-shared layer whose KV `layer` consumes, if any."""
+    attn = getattr(decoder_layers[layer], "self_attn", None)
+    if attn is None or not getattr(attn, "is_kv_shared_layer", False):
+        return None
+    return int(attn.kv_shared_layer_index)
+
+
+def _run_block(decoder_layers, tcfg, layer, hidden, inv, shared_kv_states=None):
     """Run ONLY block `layer` on `hidden`, exactly as Gemma4TextModel.forward's
     loop does. layers 0..14 are kv-own, so a fresh empty shared_kv dict is fine."""
     import torch
     lt = tcfg.layer_types[layer]
+    if shared_kv_states is None:
+        shared_kv_states = {}
     with torch.no_grad():
         out = decoder_layers[layer](
             hidden,
             inv["per_layer_inputs"][:, :, layer, :],
-            shared_kv_states={},  # nobody reads it in 0..14; storers 13/14 write harmlessly
+            shared_kv_states=shared_kv_states,
             position_embeddings=inv["pos_emb"][lt],
             attention_mask=inv["masks"][lt],
             position_ids=inv["position_ids"],
@@ -1698,6 +1785,69 @@ def _capture_token_pool(hf_token, seed, pool_batches, use_pretok, tok_dir: Path,
 #    _produce_pool         -- Gemma-3n/4 single-block walk (opt-in, --capture rolling)
 # ===========================================================================
 
+def _pool_forward_groups(n_shards, fusion):
+    """Yield shard-index groups fused only along the independent batch axis."""
+    fusion = int(fusion)
+    if fusion < 1:
+        raise ValueError(f"pool_forward_fusion must be >= 1, got {fusion}")
+    for start in range(0, int(n_shards), fusion):
+        yield tuple(range(start, min(start + fusion, int(n_shards))))
+
+
+def _fuse_shards(shards):
+    """Concatenate ordinary pool shards and retain their batch sizes for splitting."""
+    import torch
+    if not shards:
+        raise ValueError("cannot fuse an empty shard group")
+    sizes = [int(shard.shape[0]) for shard in shards]
+    return torch.cat(shards, dim=0), sizes
+
+
+def _split_fused_shards(fused, sizes):
+    """Restore the existing one-file-per-shard pool format after a fused forward."""
+    # torch.save serializes a view's entire backing storage. Clone each split so
+    # fusion does not multiply every output file by the fusion factor.
+    return [shard.clone() for shard in fused.split(sizes, dim=0)]
+
+
+def _fuse_shared_kv_shards(pairs):
+    """Fuse per-shard (key, value) pairs along their independent batch axis."""
+    if not pairs:
+        raise ValueError("cannot fuse an empty shared-KV group")
+    keys, key_sizes = _fuse_shards([pair[0] for pair in pairs])
+    values, value_sizes = _fuse_shards([pair[1] for pair in pairs])
+    if key_sizes != value_sizes:
+        raise RuntimeError("shared-KV key/value batch sizes differ")
+    return (keys, values), key_sizes
+
+
+def _split_shared_kv_shards(pair, sizes):
+    """Split fused K/V and force each shard to own its serialized storage."""
+    keys = _split_fused_shards(pair[0], sizes)
+    values = _split_fused_shards(pair[1], sizes)
+    return list(zip(keys, values))
+
+
+def _write_shared_kv_shard(dst_dir, i, pair):
+    """Persist one BF16 (key, value) pair in the ordinary shard index scheme."""
+    import torch
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    payload = tuple(tensor.detach().to(dtype=torch.bfloat16, device="cpu").clone()
+                    for tensor in pair)
+    torch.save(payload, dst_dir / f"shard_{i:05d}.pt")
+
+
+def _read_shared_kv_shard(src_dir, i):
+    """Load and validate one persisted shared-KV pair."""
+    import torch
+    pair = torch.load(Path(src_dir) / f"shard_{i:05d}.pt", map_location="cpu",
+                      weights_only=True)
+    if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+        raise RuntimeError(f"invalid shared-KV shard {i} in {src_dir}")
+    return tuple(pair)
+
+
 def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device):
     """Model-agnostic capture: run the model forward over the token pool and record
     the residual-stream output of decoder block `layer`.
@@ -1756,8 +1906,80 @@ def _produce_pool_hooked(model, decoder_layers, layer, tok_dir, dst_dir, device)
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
+def _produce_shared_kv_pool(text_model, decoder_layers, tcfg, source_layer, tok_dir,
+                            anchor_dir, dst_dir, device, forward_fusion=1):
+    """Materialize invariant Gemma shared K/V once for all downstream consumers."""
+    import json
+    import time
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = len(_shard_paths(tok_dir))
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if len(_shard_paths(dst_dir)) >= n:
+        print(f"  [shared KV L{source_layer}] already present ({n} shards) -- skip")
+        return
+
+    groups = list(_pool_forward_groups(n, forward_fusion))
+    print(f"  [shared KV L{source_layer}] producing {n} shards "
+          f"(fusion={forward_fusion}, {len(groups)} forwards) ...")
+    t0 = time.time()
+    static_by_batch = {}
+    sample_pair = None
+    pending = []
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sae-kv-writer") as writer:
+        produced = 0
+        for group in groups:
+            ids, split_sizes = _fuse_shards([_read_shard(tok_dir, i) for i in group])
+            ids = ids.to(device)
+            static = static_by_batch.setdefault(int(ids.shape[0]), {})
+            inv = _make_invariants(text_model, tcfg, ids, static=static)
+            anchor, anchor_sizes = _fuse_shards(
+                [_read_shard(anchor_dir, i) for i in group])
+            if anchor_sizes != split_sizes:
+                raise RuntimeError("shared-KV anchor and token shard batch sizes differ")
+            anchor = anchor.to(device, dtype=inv["inputs_embeds0"].dtype)
+            shared = {}
+            _run_block(decoder_layers, tcfg, source_layer, anchor, inv,
+                       shared_kv_states=shared)
+            cpu_pair = tuple(tensor.to(dtype=torch.bfloat16, device="cpu")
+                             for tensor in shared[source_layer])
+            split_pairs = _split_shared_kv_shards(cpu_pair, split_sizes)
+            if sample_pair is None:
+                sample_pair = split_pairs[0]
+            for i, pair in zip(group, split_pairs):
+                pending.append(writer.submit(_write_shared_kv_shard, dst_dir, i, pair))
+                if len(pending) >= 4:
+                    pending.pop(0).result()
+            produced += len(group)
+            if produced % max(1, n // 10) == 0 or produced == n:
+                tok_s = produced * BATCH_TOKENS / (time.time() - t0)
+                print(f"    shared KV {produced}/{n} ({tok_s/1e3:.1f}k tok/s)")
+        for future in pending:
+            future.result()
+
+    shard_bytes = sum(t.numel() * t.element_size() for t in sample_pair)
+    manifest = {
+        "model_id": MODEL_ID,
+        "source_layer": int(source_layer),
+        "attention_type": tcfg.layer_types[source_layer],
+        "shard_count": n,
+        "shapes": [list(t.shape) for t in sample_pair],
+        "dtype": str(sample_pair[0].dtype),
+        "bytes_per_shard": shard_bytes,
+        "projected_gb": shard_bytes * n / 1e9,
+        "token_pool": str(tok_dir),
+        "anchor_pool": str(anchor_dir),
+    }
+    (dst_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"  [shared KV L{source_layer}] done in {(time.time()-t0)/60:.1f}min; "
+          f"{manifest['projected_gb']:.2f} GB -> {dst_dir}")
+
+
 def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_dir,
-                  dst_dir, device):
+                  dst_dir, device, kv_source_dir=None, kv_cache_dir=None,
+                  forward_fusion=1):
     """Gemma-3n/4 single-block walk. Produce pool[layer] (block-L output for every batch).
     layer 0: embed_tokens + block 0 over the token pool.
     layer>=1: block L over src_dir (= pool[L-1]).
@@ -1768,6 +1990,7 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     retention is managed by the orchestrator (keeps last 3 pools, deletes older ones).
     """
     import time
+    import torch
 
     tok_paths = _shard_paths(tok_dir)
     n = len(tok_paths)
@@ -1776,20 +1999,76 @@ def _produce_pool(model, text_model, decoder_layers, tcfg, layer, tok_dir, src_d
     if len(_shard_paths(dst_dir)) >= n:
         print(f"  [produce L{layer}] pool already present ({n} shards) -- skip")
         return
-    print(f"  [produce L{layer}] running block {layer} over {n} batches ...")
-    t0 = time.time()
-    for i in range(n):
-        ids = _read_shard(tok_dir, i).to(device)           # [n_seqs, SEQ_LEN] int
-        inv = _make_invariants(text_model, tcfg, ids)
-        if layer == 0:
-            hidden = inv["inputs_embeds0"]                  # scaled word embeds
+    print(f"  [produce L{layer}] running block {layer} over {n} batches "
+          "(cached invariants, async writes) ...")
+    kv_source_layer = _gemma_kv_source_layer(decoder_layers, layer)
+    use_kv_cache = (kv_source_layer is not None and kv_cache_dir is not None
+                    and len(_shard_paths(kv_cache_dir)) >= n)
+    if kv_source_layer is not None and kv_source_dir is None:
+        if not use_kv_cache:
+            raise RuntimeError(
+                f"Gemma layer {layer} consumes shared KV from layer {kv_source_layer}; "
+                f"pool L{kv_source_layer - 1} or a complete KV sidecar is required")
+    if kv_source_layer is not None:
+        if use_kv_cache:
+            print(f"  [produce L{layer}] loading cached shared KV from L{kv_source_layer}")
         else:
-            hidden = _read_shard(src_dir, i).to(device, dtype=inv["inputs_embeds0"].dtype)
-        out = _run_block(decoder_layers, tcfg, layer, hidden, inv)
-        _write_shard(dst_dir, i, out)
-        if (i + 1) % max(1, n // 10) == 0:
-            tok_s = (i + 1) * BATCH_TOKENS / (time.time() - t0)
-            print(f"    produced {i+1}/{n}  ({tok_s/1e3:.1f}k tok/s)")
+            print(f"  [produce L{layer}] rebuilding shared KV from L{kv_source_layer} "
+                  f"using pool L{kv_source_layer - 1}")
+    t0 = time.time()
+    groups = list(_pool_forward_groups(n, forward_fusion))
+    print(f"  [produce L{layer}] pool-forward fusion={forward_fusion} "
+          f"({len(groups)} forwards for {n} shards)")
+    static_by_batch = {}
+    produced = 0
+    with _AsyncShardWriter(max_workers=2, max_pending=4) as writer:
+        for group in groups:
+            ids, split_sizes = _fuse_shards(
+                [_read_shard(tok_dir, i) for i in group])
+            ids = ids.to(device)                           # [fusion*n_seqs, SEQ_LEN]
+            static = static_by_batch.setdefault(int(ids.shape[0]), {})
+            inv = _make_invariants(text_model, tcfg, ids, static=static)
+            shared_kv_states = {}
+            if kv_source_layer is not None:
+                if use_kv_cache:
+                    pair, kv_sizes = _fuse_shared_kv_shards(
+                        [_read_shared_kv_shard(kv_cache_dir, i) for i in group])
+                    if kv_sizes != split_sizes:
+                        raise RuntimeError("shared-KV and token shard batch sizes differ")
+                    shared_kv_states[kv_source_layer] = tuple(
+                        tensor.to(device) for tensor in pair)
+                else:
+                    kv_hidden, kv_sizes = _fuse_shards(
+                        [_read_shard(kv_source_dir, i) for i in group])
+                    if kv_sizes != split_sizes:
+                        raise RuntimeError("anchor and token shard batch sizes differ")
+                    kv_hidden = kv_hidden.to(
+                        device, dtype=inv["inputs_embeds0"].dtype)
+                    _run_block(
+                        decoder_layers, tcfg, kv_source_layer, kv_hidden, inv,
+                        shared_kv_states=shared_kv_states,
+                    )
+            if layer == 0:
+                hidden = inv["inputs_embeds0"]             # scaled word embeds
+            else:
+                hidden, hidden_sizes = _fuse_shards(
+                    [_read_shard(src_dir, i) for i in group])
+                if hidden_sizes != split_sizes:
+                    raise RuntimeError("source and token shard batch sizes differ")
+                hidden = hidden.to(
+                    device, dtype=inv["inputs_embeds0"].dtype)
+            out = _run_block(
+                decoder_layers, tcfg, layer, hidden, inv,
+                shared_kv_states=shared_kv_states,
+            )
+            # Finish D2H before handing the CPU tensor to background serializers.
+            cpu_out = out.to(dtype=torch.bfloat16, device="cpu")
+            for i, shard_out in zip(group, _split_fused_shards(cpu_out, split_sizes)):
+                writer.submit(dst_dir, i, shard_out)
+            produced += len(group)
+            if produced % max(1, n // 10) == 0 or produced == n:
+                tok_s = produced * BATCH_TOKENS / (time.time() - t0)
+                print(f"    produced {produced}/{n}  ({tok_s/1e3:.1f}k tok/s)")
     print(f"  [produce L{layer}] done in {(time.time()-t0)/60:.1f}min -> {dst_dir}")
 
 
@@ -2161,7 +2440,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
     # -- wandb ----------------------------------------------------------------
     use_wandb = False
     wandb = None
-    if WANDB_PROJECT and os.environ.get("WANDB_API_KEY"):
+    if WANDB_PROJECT and os.environ.get("WANDB_MODE", "").lower() != "disabled":
         try:
             import wandb as _wandb
             try:
@@ -3182,8 +3461,29 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
             else:
                 ev_below_peak_streak = 0
 
-            # -- Aggressive-K early stop: when K is small, high EV + L0 near target
-            #    is the real convergence signal. Stop before feature death sets in.
+            # -- Plateau-aware low-K stop. A fixed EV floor is inappropriate across
+            # depth: later residual streams can converge cleanly below 0.90. Once
+            # sparsity and feature health have stayed settled for 500 steps, stop
+            # when smoothed EV is no longer buying meaningful improvement.
+            if aggressive_k:
+                if not hasattr(sae, "_ev_plateau_history"):
+                    sae._ev_plateau_history = deque(maxlen=6)
+                sae._ev_plateau_history.append((ev_s, l0_val, dead))
+                plateau_ready, plateau = _ev_plateau_ready(
+                    sae._ev_plateau_history, target_l0=K, best_ev=best_ev)
+                if step >= 1500 and plateau_ready:
+                    scheduler.should_stop = True
+                    scheduler.stop_reason = (
+                        f"EV plateau convergence: EV={plateau['ev']:.3f}, "
+                        f"gain={plateau['gain']:+.4f}, span={plateau['span']:.4f} "
+                        f"over 500 steps; L0 stayed "
+                        f"{plateau['l0_min']:.1f}-{plateau['l0_max']:.1f} around "
+                        f"K={K}; dead<={plateau['dead_max']:.2f}%"
+                    )
+                    print(f"  [EV PLATEAU STOP @ {step}] {scheduler.stop_reason}")
+
+            # -- Aggressive-K high-quality stop: retain the fast path for layers
+            # that clear the absolute EV floor before the plateau gate matures.
             if aggressive_k and step >= 750:
                 l0_rel_err = abs(l0_val - K) / max(K, 1.0)
                 K_STOP_L0_REL = float(os.environ.get("SAE_STOP_L0_REL", K_STOP_L0_REL_DEFAULT))
@@ -3347,6 +3647,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
 
 def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFAULT_SEED,
                       pool_batches: int = POOL_BATCHES_DEFAULT, microbatch_tokens: int = None,
+                      pool_forward_fusion: int = 1,
                       use_pretok: bool = True, max_steps: int = N_STEPS,
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
@@ -3406,17 +3707,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     assert capture in ("auto", "rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
                        "rolling-generic"), \
         f"unknown --capture {capture!r}"
-    if capture in ("rolling", "rolling-float") and end_layer > HARD_STOP_LAYER:
-        print(f"  [scope] rolling clamps end_layer {end_layer} -> {HARD_STOP_LAYER} "
-              f"(Gemma KV-share boundary)")
-        end_layer = HARD_STOP_LAYER
-
     hf_token = _resolve_hf_token()
     device = torch.device("cpu" if cpu else "cuda")
     torch.manual_seed(seed)
 
     # -- load model ONCE (generic loader: CausalLM, multimodal fallback) -------
     print(f"Loading {MODEL_ID} ...")
+    from gemma_attention import prepare_gemma4_attention, select_gemma4_attention
+    gemma_attention_enabled = prepare_gemma4_attention(MODEL_ID)
     from transformers import AutoTokenizer
     # Detect if MODEL_ID is a local path
     is_local = os.path.isdir(MODEL_ID)
@@ -3445,6 +3743,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         if TRUST_REMOTE_CODE:
             model_kwargs["trust_remote_code"] = True
         model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **model_kwargs)
+    select_gemma4_attention(model, gemma_attention_enabled)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -3551,6 +3850,37 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         # the same width would train on the wrong stream with no error at all.
         return _pool_dir(f"pool_{_slug(MODEL_ID)}_L{L:02d}_s{seed}")
 
+    def gemma_production_args(L):
+        """Resolve the layer/pool dependency closure for one Gemma block."""
+        source_layer = _gemma_kv_source_layer(decoder_layers, L)
+        if source_layer is None:
+            return None, None, {L}
+        anchor_layer = source_layer - 1
+        preserved = _pool_dir(
+            f"kv_anchor_{_slug(MODEL_ID)}_L{anchor_layer:02d}_s{seed}")
+        source_dir = preserved if len(_shard_paths(preserved)) >= pool_batches \
+            else pool_dir_for(anchor_layer)
+        cache_dir = _pool_dir(
+            f"kv_shared_{_slug(MODEL_ID)}_L{source_layer:02d}_s{seed}")
+        if len(_shard_paths(cache_dir)) < pool_batches:
+            if use_floating_window:
+                floating_window.set_active({source_layer})
+            _produce_shared_kv_pool(
+                text_model, decoder_layers, tcfg, source_layer, tok_dir,
+                source_dir, cache_dir, device,
+                forward_fusion=pool_forward_fusion,
+            )
+        return source_dir, cache_dir, {L}
+
+    # Shared-KV producers read their own input activations at every post-boundary
+    # layer. Keep those compact hidden-state pools; materialized KV sidecars are
+    # substantially larger.
+    kv_anchor_pools = {
+        source_layer - 1
+        for L in range(start_layer, end_layer + 1)
+        if (source_layer := _gemma_kv_source_layer(decoder_layers, L)) is not None
+    } if capture in ("rolling", "rolling-float") else set()
+
     results = {}
     # The slingshot gain and LR multipliers scale by probe/ref norm ratio. The ref
     # must be the norm of the chain's FIRST layer (L0), not whichever layer this
@@ -3609,6 +3939,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # here and the retention loop only ever walks down to walk_start, so
                 # these would sit on disk for the whole run.
                 for _stale in range(0, walk_start):
+                    if _stale in kv_anchor_pools:
+                        continue
                     _sd = pool_dir_for(_stale)
                     if _sd.exists():
                         _rm_pool(_sd)
@@ -3636,6 +3968,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # Pools below the resume point are pre-crash leftovers the retention
                 # loop can never reach (it only walks down to walk_start).
                 for _stale in range(0, walk_start):
+                    if _stale in kv_anchor_pools:
+                        continue
                     _sd = pool_dir_for(_stale)
                     if _sd.exists():
                         _rm_pool(_sd)
@@ -3685,11 +4019,14 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 # Do not consume it -- it stays on disk until the next layer finishes.
                 src_dir = _resume_pool_dir(seed)
                 consume_src = False
-            if use_floating_window:
-                floating_window.activate(L)
             if capture in ("rolling", "rolling-float"):
+                kv_source_dir, kv_cache_dir, active_layers = gemma_production_args(L)
+                if use_floating_window:
+                    floating_window.set_active(active_layers)
                 _produce_pool(model, text_model, decoder_layers, tcfg, L, tok_dir, src_dir,
-                              dst_dir, device)
+                              dst_dir, device, kv_source_dir=kv_source_dir,
+                              kv_cache_dir=kv_cache_dir,
+                              forward_fusion=pool_forward_fusion)
             elif capture == "rolling-generic":
                 _produce_pool_generic_rolling(model, text_model, decoder_layers, L, tok_dir,
                                               src_dir, dst_dir, device)
@@ -3703,11 +4040,15 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                 next_dir = pool_dir_for(L + 1)
                 if len(_shard_paths(next_dir)) < pool_batches:
                     print(f"  [pipeline] pre-producing pool L{L+1} while model hot ...")
-                    if use_floating_window:
-                        floating_window.activate(L + 1)
                     if capture in ("rolling", "rolling-float"):
+                        kv_source_dir, kv_cache_dir, active_layers = gemma_production_args(L + 1)
+                        if use_floating_window:
+                            floating_window.set_active(active_layers)
                         _produce_pool(model, text_model, decoder_layers, tcfg, L + 1, tok_dir,
-                                      dst_dir, next_dir, device)
+                                      dst_dir, next_dir, device,
+                                      kv_source_dir=kv_source_dir,
+                                      kv_cache_dir=kv_cache_dir,
+                                      forward_fusion=pool_forward_fusion)
                     elif capture == "rolling-generic":
                         _produce_pool_generic_rolling(model, text_model, decoder_layers, L + 1,
                                                       tok_dir, dst_dir, next_dir, device)
@@ -3782,6 +4123,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
             for old_L in range(cutoff, walk_start - 1, -1):
                 if old_L < 0:
                     continue
+                if old_L in kv_anchor_pools:
+                    continue
                 old_dir = pool_dir_for(old_L)
                 if old_dir.exists():
                     _rm_pool(old_dir)
@@ -3828,6 +4171,8 @@ def main():
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--pool-batches", type=int, default=POOL_BATCHES_DEFAULT,
                    help="Activation batches cached per layer. Default=4000 (~400GB). Use 500-1000 for limited disk (~50-100GB).")
+    p.add_argument("--pool-forward-fusion", type=int, default=1,
+                   help="pool-production shards fused per model forward; default 1")
     p.add_argument("--microbatch-tokens", type=int, default=MICROBATCH_TOKENS,
                    help=f"Tokens per microbatch for gradient accumulation. Default={MICROBATCH_TOKENS//1024}k (no accum). Use 8192 for 4x VRAM savings.")
     p.add_argument("--resume-from", type=str, default=None,
@@ -3841,7 +4186,7 @@ def main():
     p.add_argument("--hub-id", default=None,
                    help="HF repo to upload SAEs to. No default -- upload is skipped unless set.")
     p.add_argument("--wandb-project", default=None,
-                   help="wandb project name. Off unless set (also needs WANDB_API_KEY).")
+                   help="wandb project name. Uses credentials from wandb login or the environment.")
     p.add_argument("--no-push", dest="push", action="store_false",
                    help="skip the HuggingFace upload even if --hub-id is set")
     p.add_argument("--no-model-evict", dest="evict_model", action="store_false",
@@ -3876,6 +4221,7 @@ def main():
     res = run_atlas_rolling(
         start_layer=args.start_layer, end_layer=args.end_layer, seed=args.seed,
         pool_batches=args.pool_batches, microbatch_tokens=args.microbatch_tokens,
+        pool_forward_fusion=args.pool_forward_fusion,
         use_pretok=args.use_pretok, max_steps=args.max_steps, bdec_batches=args.bdec_batches,
         resume_from=args.resume_from, push=args.push, capture=args.capture,
         model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
