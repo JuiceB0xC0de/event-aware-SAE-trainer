@@ -19,6 +19,7 @@ this only assembles arguments and handles upload.
 Environment:
     HF_TOKEN        required unless --no-push
     SAE_HUB_ID      full "org/name" upload target (highest precedence)
+    SAE_HUB_REPO_TYPE  upload target kind: model or dataset
     SAE_HUB_ORG     org to derive the upload target under, e.g. "myorg"
     SAE_DATA_DIR    output root, defaults to ./data
     SAE_SCRATCH_DIR activation pool scratch, defaults to $SAE_DATA_DIR/rollcache
@@ -136,7 +137,8 @@ def resolve_hub_id(cfg_repo, model_id: str, push: bool) -> str | None:
 # --------------------------------------------------------------------------
 # upload
 # --------------------------------------------------------------------------
-def push_layer(sae_dir: Path, hub_id: str, layer: int, seed: int = 0) -> bool:
+def push_layer(sae_dir: Path, hub_id: str, layer: int, seed: int = 0,
+               repo_type: str = "model") -> bool:
     from huggingface_hub import HfApi, create_repo, upload_folder
 
     token = resolve_hf_token()
@@ -150,14 +152,14 @@ def push_layer(sae_dir: Path, hub_id: str, layer: int, seed: int = 0) -> bool:
         return False
 
     try:
-        create_repo(hub_id, repo_type="model", private=False, exist_ok=True, token=token)
+        create_repo(hub_id, repo_type=repo_type, private=False, exist_ok=True, token=token)
     except Exception as e:
         print(f"  [HF push L{layer:02d}] repo creation note: {e}")
 
     upload_folder(
         folder_path=str(layer_dir),
         repo_id=hub_id,
-        repo_type="model",
+        repo_type=repo_type,
         path_in_repo=f"layer_{layer:02d}_s{seed}",
         token=token,
     )
@@ -165,7 +167,8 @@ def push_layer(sae_dir: Path, hub_id: str, layer: int, seed: int = 0) -> bool:
     return True
 
 
-def push_summary(sae_dir: Path, hub_id: str, summary: dict):
+def push_summary(sae_dir: Path, hub_id: str, summary: dict,
+                 repo_type: str = "model"):
     from huggingface_hub import HfApi
 
     sae_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +180,7 @@ def push_summary(sae_dir: Path, hub_id: str, summary: dict):
         path_or_fileobj=str(path),
         path_in_repo="run_summary.json",
         repo_id=hub_id,
-        repo_type="model",
+        repo_type=repo_type,
     )
     print("[HF] uploaded run_summary.json")
 
@@ -196,6 +199,8 @@ def build_parser() -> argparse.ArgumentParser:
     ov = p.add_argument_group("overrides (default: from config)")
     ov.add_argument("--model-id", type=str, default=None)
     ov.add_argument("--hf-sae-repo", type=str, default=None)
+    ov.add_argument("--hf-repo-type", choices=["model", "dataset"], default=None,
+                    help="Hugging Face repository kind; default from config or model")
     ov.add_argument("--wandb-project", type=str, default=None)
     ov.add_argument("--layer-range", type=str, default=None, help="inclusive 'start,end'; default 0,n_layers-1")
     ov.add_argument("--capture", type=str, default=None, choices=CAPTURE_CHOICES)
@@ -260,6 +265,7 @@ def main():
     prepare_gemma4_attention(model_id)
     push = not args.no_push
     hub_id = args.hf_sae_repo or resolve_hub_id(cfg.get("hf_sae_repo"), model_id, push)
+    hub_repo_type = args.hf_repo_type or cfg.get("hf_repo_type") or "model"
     wandb_project = args.wandb_project or cfg.get("wandb_project") or f"{_slug(model_id)}-sae"
 
     capture = pick(args.capture, "capture", "auto")
@@ -289,6 +295,7 @@ def main():
     os.environ.setdefault("SAE_MODEL_ID", model_id)
     if hub_id:
         os.environ.setdefault("SAE_HUB_ID", hub_id)
+    os.environ["SAE_HUB_REPO_TYPE"] = hub_repo_type
     os.environ.setdefault("SAE_BATCH_TOKENS", "32768")
     os.environ.setdefault("SAE_MICROBATCH_TOKENS", str(microbatch or 32768))
     # The Triton path is dead (measured ~100x slower than PyTorch); keep it off.
@@ -335,7 +342,7 @@ def main():
     print(f"  Target L0:   {target_l0}")
     print(f"  Microbatch:  {microbatch} tokens")
     print(f"  SAE dir:     {sae_dir}")
-    print(f"  HF repo:     {hub_id or '(push disabled)'}")
+    print(f"  HF repo:     {hub_id or '(push disabled)'} ({hub_repo_type})")
     wandb_disabled = os.environ.get("WANDB_MODE", "").lower() == "disabled"
     print(f"  W&B project: {wandb_project}{' (disabled)' if wandb_disabled else ''}")
     if not wandb_disabled:
@@ -368,6 +375,7 @@ def main():
         capture=capture,
         model_id=model_id,
         hub_id=hub_id,
+        hub_repo_type=hub_repo_type,
         wandb_project=wandb_project,
         expansion=expansion,
         evict_model=not args.no_model_evict,
@@ -383,7 +391,8 @@ def main():
 
     if push and hub_id:
         for layer in range(start, end + 1):
-            push_layer(sae_dir, hub_id, layer, seed=args.seed)
+            push_layer(sae_dir, hub_id, layer, seed=args.seed,
+                       repo_type=hub_repo_type)
 
         summary = {
             "model_id": model_id,
@@ -395,10 +404,11 @@ def main():
             "pool_forward_fusion": pool_forward_fusion,
             "max_steps": max_steps,
             "target_l0": target_l0,
+            "hf_repo_type": hub_repo_type,
             "results": results,
         }
         summary.update(cfg.get("caveats") or {})
-        push_summary(sae_dir, hub_id, summary)
+        push_summary(sae_dir, hub_id, summary, repo_type=hub_repo_type)
 
     print("\nTraining complete.")
     print(f"  Results: {results}")

@@ -80,6 +80,7 @@ MODEL_ID   = os.environ.get("SAE_MODEL_ID", "google/gemma-4-E2B-it")
 # HF upload target. NO default org: push happens only when set explicitly (--hub-id /
 # $SAE_HUB_ID), so a clone-and-run can never push somewhere unintended or fail on perms.
 SAE_HUB_ID = os.environ.get("SAE_HUB_ID")
+SAE_HUB_REPO_TYPE = os.environ.get("SAE_HUB_REPO_TYPE", "model")
 # wandb project. Off unless set (--wandb-project / $WANDB_PROJECT), independent of any key.
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT")
 
@@ -93,7 +94,7 @@ PRETOK_DIR = str(DATA_DIR / "pretok" / "fineweb-edu")        # optional pre-toke
 # you have. Pools are deleted incrementally during a run (we hold ~one pool at a time).
 ROLLCACHE  = os.environ.get("SAE_SCRATCH_DIR", str(DATA_DIR / "rollcache"))
 GEMMA_KV_SHARE_START = 15                  # first layer that consumes shared KV
-HARD_STOP_LAYER = 15                       # Gemma rolling-path stop before the unsupported deep blocks
+DEAD_CEILING_GRACE_STEPS = 1_000           # let revival recover warmup collapse before aborting
 
 # -- Corpus + model loading (set via CLI/config only, no env) ---------------
 CORPUS_ID         = "HuggingFaceFW/fineweb-edu"
@@ -150,6 +151,29 @@ def _ev_smoothed(hist, raw):
     if len(hist) < EV_SMOOTH_MIN:
         return raw
     return statistics.median(hist)
+
+
+def _resolve_end_layer(end_layer: int, n_layers: int, capture: str) -> int:
+    """Clamp only to the model depth; Gemma shared-KV dependencies are supported."""
+    return min(int(end_layer), int(n_layers) - 1)
+
+
+def _uses_rolling_pool_retention(capture: str) -> bool:
+    """Whether a capture backend advances a persistent layer-to-layer pool chain."""
+    return capture in (
+        "rolling", "rolling-float", "rolling-hf", "rolling-hf-float",
+        "rolling-generic",
+    )
+
+
+def _dead_ceiling_breached(
+    step: int,
+    dead_pct: float,
+    ceiling_pct: float,
+    grace_steps: int = DEAD_CEILING_GRACE_STEPS,
+) -> bool:
+    """Apply the terminal dead-feature ceiling only after revival gets a chance."""
+    return int(step) >= int(grace_steps) and float(dead_pct) > float(ceiling_pct)
 # Reassociated b_dec gradient in the encoder (see _EncoderPreBias). Exact, removes
 # one of the six equal GEMMs in a step. SAE_FAST_PREBIAS=0 falls back to plain
 # autograd, which is the reference the test compares against.
@@ -3261,7 +3285,7 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
                         "state": {k: v.detach().cpu().clone()
                                   for k, v in sae.state_dict().items()},
                     })
-            if dead > dead_stop_pct:
+            if _dead_ceiling_breached(step, dead, dead_stop_pct):
                 _pick = _pick_dead_rollback(dead_state_buf, dead_stop_pct)
                 if _pick is not None:
                     sae.load_state_dict(_pick["state"])
@@ -3620,11 +3644,13 @@ def train_sae_on_activations(layer, d_in, seed, provider, *, frozen_decoder=Fals
         hf_token = _resolve_hf_token()
         api = HfApi(token=hf_token)
         try:
-            api.create_repo(SAE_HUB_ID, repo_type="model", exist_ok=True, private=False)
+            api.create_repo(SAE_HUB_ID, repo_type=SAE_HUB_REPO_TYPE,
+                            exist_ok=True, private=False)
         except Exception:
             pass
         api.upload_folder(folder_path=str(out_dir), repo_id=SAE_HUB_ID,
-                          path_in_repo=f"layer_{layer:02d}_s{seed}", repo_type="model")
+                          path_in_repo=f"layer_{layer:02d}_s{seed}",
+                          repo_type=SAE_HUB_REPO_TYPE)
         print(f"Pushed layer_{layer:02d}_s{seed} -> {SAE_HUB_ID}")
     elif push and not SAE_HUB_ID:
         print("  [push skipped] no --hub-id / $SAE_HUB_ID set -- SAE saved locally only")
@@ -3652,7 +3678,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
                       use_pretok: bool = True, max_steps: int = N_STEPS,
                       bdec_batches: int = BDEC_INIT_BATCHES, resume_from: str = None,
                       push: bool = True, capture: str = "auto", model_id: str = None,
-                      hub_id: str = None, wandb_project: str = None, expansion: int = None,
+                      hub_id: str = None, hub_repo_type: str = None,
+                      wandb_project: str = None, expansion: int = None,
                       evict_model: bool = True, target_l0: int = None, cpu: bool = False,
                       norm_ref: float = None, corpus: str = None,
                       corpus_text_field: str = None, corpus_prefix: str = None,
@@ -3660,7 +3687,8 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     """Train one SAE per decoder layer in [start_layer, end_layer] (inclusive).
 
     capture: "auto" = model-agnostic forward-hook capture (any AutoModelForCausalLM);
-             "rolling" = Gemma-3n/4 single-block walk (layers 0..14 only, VRAM-optimized);
+             "rolling" = Gemma-3n/4 single-block walk with shared-KV sidecars;
+             "rolling-float" = rolling with only active blocks in GPU memory;
              "rolling-hf" = generic Llama/SmolLM2/Qwen single-block walk (no HARD_STOP);
              "rolling-hf-float" = same as rolling-hf but only 1-2 blocks in GPU memory at a time.
     pool_batches: activation batches cached per layer (default 4000; use 500-1000 for limited disk)
@@ -3669,14 +3697,16 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
     evict_model: move the LLM to CPU during SAE training to free VRAM (default True).
     target_l0: override the global L0 target K (default 500). Use for aggressive sparsity tests.
     cpu: force CPU training (no CUDA). Will be SLOW - for debugging only.
-    model_id/hub_id/wandb_project/expansion override module defaults; d_in is auto-detected.
+    model_id/hub_id/hub_repo_type/wandb_project/expansion override module defaults;
+    d_in is auto-detected.
     max_steps/bdec_batches/push: cap work + skip upload for smoke tests."""
     import time
     import torch
 
     # -- config bus: thread runtime overrides into the module globals that the rest of
     #    the code (train_sae_on_activations, dataset builder, paths) already reads ------
-    global MODEL_ID, SAE_DIR, SAE_HUB_ID, WANDB_PROJECT, EXPANSION, N_FEATURES, K, K_INIT
+    global MODEL_ID, SAE_DIR, SAE_HUB_ID, SAE_HUB_REPO_TYPE, WANDB_PROJECT
+    global EXPANSION, N_FEATURES, K, K_INIT
     global CORPUS_ID, CORPUS_TEXT_FIELD, CORPUS_PREFIX, TRUST_REMOTE_CODE
     if model_id:
         MODEL_ID = model_id
@@ -3702,6 +3732,10 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         print(f"  [config] target L0 overridden: K={K}")
     if hub_id is not None:
         SAE_HUB_ID = hub_id
+    if hub_repo_type is not None:
+        if hub_repo_type not in ("model", "dataset"):
+            raise ValueError("hub_repo_type must be 'model' or 'dataset'")
+        SAE_HUB_REPO_TYPE = hub_repo_type
     if wandb_project is not None:
         WANDB_PROJECT = wandb_project
 
@@ -3783,11 +3817,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         floating_window = None
         model.to(device)
 
-    end_layer = min(end_layer, n_layers - 1)
-    if capture in ("rolling", "rolling-float"):
-        # Gemma shared-KV walk is only proven correct up to HARD_STOP_LAYER; deeper
-        # blocks consume shared KV states this single-block path does not model.
-        end_layer = min(end_layer, HARD_STOP_LAYER)
+    end_layer = _resolve_end_layer(end_layer, n_layers, capture)
     assert 0 <= start_layer <= end_layer < n_layers, \
         f"bad layer range [{start_layer},{end_layer}] for a {n_layers}-layer model"
     layers = list(range(start_layer, end_layer + 1))
@@ -4112,7 +4142,7 @@ def run_atlas_rolling(start_layer: int = 0, end_layer: int = 9, seed: int = DEFA
         if evict_model and not use_floating_window:
             model.to(device)
 
-        if capture in ("rolling", "rolling-hf", "rolling-hf-float", "rolling-generic"):
+        if _uses_rolling_pool_retention(capture):
             # Persist the just-trained layer's pool as the resume checkpoint. This overwrites
             # the previous resume pool, so we keep exactly one layer on disk for restarts.
             if L >= start_layer:
@@ -4170,7 +4200,7 @@ def main():
                         "rolling-hf-float=rolling-hf with only active blocks in GPU memory")
     p.add_argument("--start-layer", type=int, default=0)
     p.add_argument("--end-layer", type=int, default=9,
-                   help="inclusive; clamped to model depth (and to 15 under --capture rolling)")
+                   help="inclusive; clamped to model depth")
     p.add_argument("--expansion", type=int, default=None,
                    help=f"SAE dict = expansion * d_in (default {EXPANSION})")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -4190,6 +4220,8 @@ def main():
     p.add_argument("--bdec-batches", type=int, default=BDEC_INIT_BATCHES)
     p.add_argument("--hub-id", default=None,
                    help="HF repo to upload SAEs to. No default -- upload is skipped unless set.")
+    p.add_argument("--hub-repo-type", choices=["model", "dataset"], default=None,
+                   help="Hugging Face repository kind (default: model or $SAE_HUB_REPO_TYPE)")
     p.add_argument("--wandb-project", default=None,
                    help="wandb project name. Uses credentials from wandb login or the environment.")
     p.add_argument("--no-push", dest="push", action="store_false",
@@ -4229,7 +4261,8 @@ def main():
         pool_forward_fusion=args.pool_forward_fusion,
         use_pretok=args.use_pretok, max_steps=args.max_steps, bdec_batches=args.bdec_batches,
         resume_from=args.resume_from, push=args.push, capture=args.capture,
-        model_id=args.model_id, hub_id=args.hub_id, wandb_project=args.wandb_project,
+        model_id=args.model_id, hub_id=args.hub_id,
+        hub_repo_type=args.hub_repo_type, wandb_project=args.wandb_project,
         expansion=args.expansion, evict_model=args.evict_model,
         target_l0=args.target_l0, cpu=args.cpu, norm_ref=args.norm_ref,
         corpus=args.corpus, corpus_text_field=args.corpus_text_field,

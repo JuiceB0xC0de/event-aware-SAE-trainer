@@ -16,8 +16,8 @@ def test_expansion_and_targets():
     assert t.SEQ_LEN == 2_048
 
 
-def test_rolling_hard_stop_only_relevant_to_gemma_path():
-    assert t.HARD_STOP_LAYER == 15
+def test_gemma_shared_kv_boundary_is_explicit():
+    assert t.GEMMA_KV_SHARE_START == 15
 
 
 def test_no_org_pii_defaults():

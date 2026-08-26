@@ -25,9 +25,11 @@ def test_encode():
 
     activations = torch.randn(5, d_in)
 
-    # Replicate the exact logic in the function to test mathematically
+    # JumpReLU preserves the pre-activation magnitude once the threshold is crossed.
+    # It is not a shifted ReLU: ReLU(pre - threshold) would subtract the threshold
+    # from every active feature and corrupt downstream reconstruction/feature ranking.
     pre_act = F.linear(activations - sae["b_dec"], sae["W_enc"], sae["b_enc"])
-    expected = F.relu(pre_act - sae["threshold"])
+    expected = pre_act * (pre_act > sae["threshold"]).to(pre_act.dtype)
 
     result = encode(activations, sae)
 

@@ -31,6 +31,7 @@ def test_defaults(monkeypatch):
     assert kw["capture"] == "auto"
     assert kw["model_id"] is None
     assert kw["hub_id"] is None
+    assert kw["hub_repo_type"] is None
     assert kw["wandb_project"] is None
     assert kw["expansion"] is None
     assert kw["evict_model"] is True
@@ -44,6 +45,7 @@ def test_flag_overrides(monkeypatch):
         "--no-pretok", "--no-push", "--no-model-evict",
         "--capture", "rolling", "--model-id", "meta-llama/Llama-3.2-1B",
         "--hub-id", "me/my-saes", "--wandb-project", "run1", "--expansion", "16",
+        "--hub-repo-type", "dataset",
         "--target-l0", "50",
     ])
     assert kw["start_layer"] == 1
@@ -58,5 +60,6 @@ def test_flag_overrides(monkeypatch):
     assert kw["capture"] == "rolling"
     assert kw["model_id"] == "meta-llama/Llama-3.2-1B"
     assert kw["hub_id"] == "me/my-saes"
+    assert kw["hub_repo_type"] == "dataset"
     assert kw["wandb_project"] == "run1"
     assert kw["expansion"] == 16

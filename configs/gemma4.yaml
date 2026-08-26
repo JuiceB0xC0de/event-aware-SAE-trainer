@@ -1,6 +1,7 @@
 model_id: google/gemma-4-E2B-it
 
 hf_sae_repo: juiceb0xc0de/gemma-4-e2b-it-SAE
+hf_repo_type: dataset
 wandb_project: gemma-4-e2b-SAE
 
 architecture:
@@ -11,6 +12,7 @@ defaults:
   capture: rolling-float
   expansion: 32
   pool_batches: 500
+  pool_forward_fusion: 2
   max_steps: 5000
   target_l0: 50
   microbatch_tokens: 32768

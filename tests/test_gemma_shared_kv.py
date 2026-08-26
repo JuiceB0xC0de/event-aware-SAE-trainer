@@ -18,3 +18,8 @@ def test_gemma_kv_dependency_starts_at_shared_layer():
 
     assert t._gemma_kv_source_layer(layers, 14) is None
     assert t._gemma_kv_source_layer(layers, 15) == 13
+
+
+def test_gemma_rolling_float_can_reach_the_full_model_depth():
+    assert t._resolve_end_layer(34, n_layers=35, capture="rolling-float") == 34
+    assert t._resolve_end_layer(34, n_layers=35, capture="rolling") == 34

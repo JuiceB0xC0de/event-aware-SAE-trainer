@@ -9,6 +9,13 @@ import torch
 import sae_trainer_rolling as t
 
 
+def test_dead_ceiling_waits_for_revival_grace_period():
+    assert not t._dead_ceiling_breached(step=250, dead_pct=7.86, ceiling_pct=1.0)
+    assert not t._dead_ceiling_breached(step=999, dead_pct=7.86, ceiling_pct=1.0)
+    assert t._dead_ceiling_breached(step=1000, dead_pct=7.86, ceiling_pct=1.0)
+    assert not t._dead_ceiling_breached(step=1000, dead_pct=0.99, ceiling_pct=1.0)
+
+
 def _rc(n_features=81920, policy="legacy"):
     return t.RevivalController(n_features, torch.device("cpu"), aux_k_policy=policy)
 

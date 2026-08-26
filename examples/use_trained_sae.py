@@ -64,7 +64,7 @@ def encode(activations: torch.Tensor, sae: dict) -> torch.Tensor:
 
     # Pre-activation: subtract decoder bias before encoder linear projection
     pre_act = F.linear(activations - b_dec, W_enc, b_enc)
-    feature_acts = F.relu(pre_act - threshold)
+    feature_acts = pre_act * (pre_act > threshold).to(pre_act.dtype)
     return feature_acts
 
 

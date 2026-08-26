@@ -32,12 +32,11 @@ classifiers = [
 ]
 
 dependencies = [
-    # Coherent PyTorch stack. Install from https://download.pytorch.org/whl/cu124
-    # on CUDA pods, or from the default index on CPU/MPS Macs. These versions
-    # are ABI-matched and support Gemma-4 (multimodal) and Qwen3/Qwen3.5 models.
-    "torch>=2.6.0,<2.8.0",
-    "torchvision>=0.21.0,<0.23.0",
-    "torchaudio>=2.6.0,<2.8.0",
+    # Select an ABI-matched stack from the wheel index for the target CUDA runtime.
+    # The published Gemma image uses torch 2.9.1 + cu128.
+    "torch>=2.6.0,<3.0.0",
+    "torchvision>=0.21.0,<0.25.0",
+    "torchaudio>=2.6.0,<3.0.0",
     # Gemma-4 and Qwen3 require transformers 5.x. Pin lower bound to the first
     # release that includes both model families.
     "transformers>=5.0.0",
@@ -46,10 +45,10 @@ dependencies = [
     # numpy 2.x is fine with recent torch; numpy 3.x is not.
     "numpy>=1.26.0,<3.0.0",
     "tqdm>=4.65.0",
+    "pyyaml>=6.0",
     "sentencepiece>=0.2.0",
     "protobuf>=3.20.0",
     "huggingface_hub>=0.30.0",
-    "hf_transfer>=0.1.9",
     "wandb>=0.19.0",
     # Fast JSON for census/metadata I/O (dropped during the zarr migration, needed again).
     "orjson>=3.10",
@@ -69,7 +68,13 @@ Homepage = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
 Repository = "https://github.com/JuiceB0xC0de/event-aware-SAE-trainer"
 
 [tool.setuptools]
-py-modules = ["sae_trainer_rolling", "sae_scheduler"]
+py-modules = [
+    "gemma_attention",
+    "run_atlas",
+    "sae_diagnostics",
+    "sae_scheduler",
+    "sae_trainer_rolling",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

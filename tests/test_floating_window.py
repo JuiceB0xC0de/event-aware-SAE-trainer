@@ -198,6 +198,10 @@ def test_rolling_float_capture_family_resume_compat(tmp_path, monkeypatch):
     assert t._find_resume_layer(0, 2, "m", "rolling-hf") == -1
 
 
+def test_rolling_float_uses_rolling_pool_retention_cleanup():
+    assert t._uses_rolling_pool_retention("rolling-float")
+
+
 def test_rolling_hf_float_production_runs_with_fake_model(tmp_path):
     """End-to-end floating-window production path on a tiny fake model."""
     d = 8
